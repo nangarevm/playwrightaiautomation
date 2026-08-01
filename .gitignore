@@ -1,0 +1,15 @@
+node_modules/
+dist/
+server/platform.db
+server/platform.db-*
+server/generated/*.spec.ts
+server/generated/*.spec.js
+server/generated/*.py
+server/generated/.git/
+server/test-results/
+server/.dev-encryption-key
+client/dist/
+.env
+*.log
+server/generated/*.cy.js
+server/generated/*.selenium.js

@@ -1,0 +1,109 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { db } from '../src/db.ts';
+import {
+  createUser,
+  listAuditLog,
+  listFlaggedForReReview,
+  listUsers,
+  logAudit,
+  routeTestCaseToOwner,
+  sampleTestCasesForReReview,
+  setCriticalPath,
+  submitSecondReviewerSignOff,
+} from '../src/services/adminService.ts';
+
+function resetData() {
+  db.prepare('DELETE FROM audit_log').run();
+  db.prepare('DELETE FROM auto_heal_actions').run();
+  db.prepare('DELETE FROM change_detections').run();
+  db.prepare('DELETE FROM execution_runs').run();
+  db.prepare('DELETE FROM review_audit_entries').run();
+  db.prepare('DELETE FROM sync_records').run();
+  db.prepare('DELETE FROM automation_scripts').run();
+  db.prepare('DELETE FROM test_cases').run();
+  db.prepare('DELETE FROM inputs').run();
+}
+
+function seedTestCase(id, title, statusOverrides = {}) {
+  const now = new Date().toISOString();
+  db.prepare('INSERT INTO inputs (id, type, content, created_at) VALUES (?, ?, ?, ?)').run(`input-${id}`, 'text', title, now);
+  db.prepare(`
+    INSERT INTO test_cases (
+      id, input_id, title, category, steps, expected_result, confidence_score, source_rationale,
+      status, authorship_type, version, priority, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    id, `input-${id}`, title, 'Smoke', JSON.stringify(['step']), 'result', 0.9, 'fixture',
+    statusOverrides.status ?? 'accepted', 'ai', 1, 'High', now, now
+  );
+}
+
+test.beforeEach(() => {
+  resetData();
+});
+
+test('seeded users exist for each SRS role', () => {
+  const users = listUsers();
+  const roles = users.map((u) => u.role);
+  assert.ok(roles.includes('QA Lead'));
+  assert.ok(roles.includes('Tester'));
+  assert.ok(roles.includes('Developer'));
+  assert.ok(roles.includes('Manager'));
+});
+
+test('createUser persists a new user', () => {
+  const user = createUser({ name: 'Test User', role: 'Tester', email: 't@example.com' });
+  assert.ok(user.id);
+  assert.equal(user.role, 'Tester');
+});
+
+test('logAudit and listAuditLog record and retrieve governance events', () => {
+  logAudit({ id: 'user-qa-lead', name: 'Priya', role: 'QA Lead' }, 'test_case_accepted', 'test_case', 'tc-1', { note: 'looks good' });
+  const entries = listAuditLog({ entityType: 'test_case', entityId: 'tc-1' });
+  assert.equal(entries.length, 1);
+  assert.equal(entries[0].action, 'test_case_accepted');
+  assert.equal(entries[0].actor_role, 'QA Lead');
+});
+
+test('routeTestCaseToOwner matches a test case to the user whose owned_modules keyword appears in the title', () => {
+  seedTestCase('tc-route', 'Login flow smoke test');
+  const result = routeTestCaseToOwner('tc-route');
+  assert.equal(result.matched, true);
+  assert.equal(result.ownerUserId, 'user-qa-lead'); // seeded with owned_modules including "login"
+
+  const row = db.prepare('SELECT owner_user_id FROM test_cases WHERE id = ?').get('tc-route');
+  assert.equal(row.owner_user_id, 'user-qa-lead');
+});
+
+test('setCriticalPath flags a test case as requiring second-reviewer sign-off', () => {
+  seedTestCase('tc-critical', 'Payments checkout flow');
+  const updated = setCriticalPath('tc-critical', true);
+  assert.equal(updated.critical_path, 1);
+  assert.equal(updated.second_reviewer_required, 1);
+  assert.equal(updated.second_reviewer_status, 'pending');
+});
+
+test('submitSecondReviewerSignOff records the decision and reviewer', () => {
+  seedTestCase('tc-signoff', 'Payments checkout flow');
+  setCriticalPath('tc-signoff', true);
+  const updated = submitSecondReviewerSignOff('tc-signoff', { id: 'user-qa-lead', name: 'Priya', role: 'QA Lead' }, 'approved');
+  assert.equal(updated.second_reviewer_status, 'approved');
+  assert.equal(updated.second_reviewer_id, 'user-qa-lead');
+});
+
+test('submitSecondReviewerSignOff rejects when the test case does not require sign-off', () => {
+  seedTestCase('tc-no-signoff', 'Ordinary flow');
+  assert.throws(() => submitSecondReviewerSignOff('tc-no-signoff', { id: 'user-qa-lead', name: 'Priya', role: 'QA Lead' }, 'approved'));
+});
+
+test('sampleTestCasesForReReview flags previously approved cases and listFlaggedForReReview returns them', () => {
+  seedTestCase('tc-1', 'Case one');
+  seedTestCase('tc-2', 'Case two');
+  const sampled = sampleTestCasesForReReview(2);
+  assert.equal(sampled.length, 2);
+
+  const flagged = listFlaggedForReReview();
+  assert.equal(flagged.length, 2);
+  assert.ok(flagged.every((row) => row.flagged_for_re_review === 1));
+});

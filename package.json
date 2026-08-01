@@ -1,0 +1,14 @@
+{
+  "name": "ai-test-automation-platform",
+  "private": true,
+  "version": "1.0.0",
+  "workspaces": [
+    "server",
+    "client"
+  ],
+  "scripts": {
+    "dev:server": "npm run dev -w server",
+    "dev:client": "npm run dev -w client",
+    "setup": "npm install && npx playwright install chromium --with-deps || npx playwright install chromium"
+  }
+}

@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Demo App - Login</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 360px; margin: 80px auto; }
+  label { display: block; margin-top: 12px; font-size: 14px; }
+  input { width: 100%; padding: 8px; margin-top: 4px; box-sizing: border-box; }
+  button { margin-top: 20px; width: 100%; padding: 10px; cursor: pointer; }
+  [role="alert"] { color: #b00020; margin-top: 12px; display: none; }
+  .welcome { display: none; }
+</style>
+</head>
+<body>
+  <h1>Sign in</h1>
+  <form id="loginForm">
+    <label for="username">Username</label>
+    <input id="username" name="username" type="text" autocomplete="username" />
+
+    <label for="password">Password</label>
+    <input id="password" name="password" type="password" autocomplete="current-password" />
+
+    <button type="submit">Log in</button>
+  </form>
+  <p role="alert" id="error">Invalid username or password</p>
+
+  <div class="welcome" id="welcome">
+    <h1>Welcome</h1>
+    <p>You are logged in.</p>
+  </div>
+
+<script>
+  document.getElementById('loginForm').addEventListener('submit', function (e) {
+    e.preventDefault();
+    const username = document.getElementById('username').value.trim();
+    const password = document.getElementById('password').value.trim();
+    const error = document.getElementById('error');
+
+    const VALID_USER = 'demo_user';
+    const VALID_PASS = 'demo_pass_123';
+
+    if (!username || !password) {
+      error.textContent = 'Username and password are required';
+      error.style.display = 'block';
+      return;
+    }
+    if (username === VALID_USER && password === VALID_PASS) {
+      document.getElementById('loginForm').style.display = 'none';
+      document.getElementById('welcome').style.display = 'block';
+      error.style.display = 'none';
+    } else {
+      error.textContent = 'Invalid username or password';
+      error.style.display = 'block';
+    }
+  });
+</script>
+</body>
+</html>
