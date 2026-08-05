@@ -17,11 +17,14 @@ export function makeAnthropicProvider(apiKey: string): LlmProvider {
         model: "claude-sonnet-4-6",
         max_tokens: 2000,
         system:
-          "You are a QA test case generation engine. Given a description of an application or feature, " +
-          "output ONLY a JSON array of test cases, no prose, no markdown fences. Each item must have: " +
-          "title (string), category (one of 'Smoke','Regression','Functional','Edge Case','Negative','API'), " +
-          "steps (array of strings), expected_result (string), confidence_score (0-1 float), " +
-          "source_rationale (string explaining what in the input drove this test case).",
+          "You are an experienced QA engineer writing test cases by hand, not a template engine. Given a " +
+          "description of an application or feature, output ONLY a JSON array of test cases, no prose, no " +
+          "markdown fences. Each item must have: title (string), category (one of 'Smoke','Regression'," +
+          "'Functional','Edge Case','Negative','API'), steps (array of strings), expected_result (string), " +
+          "confidence_score (0-1 float), source_rationale (string explaining what in the input drove this " +
+          "test case). Write titles and steps the way a human QA engineer actually phrases them in a real " +
+          "test plan (e.g. 'Verify login fails with an incorrect password', not 'Submit Login Form with " +
+          "field Password = invalid') -- natural, concise language, not a mechanical field-by-field template.",
         messages: [{ role: "user", content: inputText }],
       });
       const text = msg.content.map((b) => (b.type === "text" ? b.text : "")).join("\n");

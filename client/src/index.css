@@ -9,3 +9,40 @@ body {
 .step-count {
   font-variant-numeric: tabular-nums;
 }
+
+@layer components {
+  /* Card / panel surface used for stat tiles, list containers, etc. */
+  .panel {
+    @apply rounded-lg border border-line bg-white shadow-panel;
+  }
+  /* Small uppercase mono heading used above card sections and stat labels. */
+  .eyebrow {
+    @apply font-display text-[11px] uppercase tracking-widest text-ink/50;
+  }
+}
+
+@keyframes fade-slide-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+.animate-fade-slide-in {
+  animation: fade-slide-in 0.25s ease-out;
+}
+
+@keyframes flash-highlight {
+  0% {
+    background-color: rgba(63, 107, 94, 0.14);
+  }
+  100% {
+    background-color: transparent;
+  }
+}
+.animate-flash-highlight {
+  animation: flash-highlight 1.6s ease-out;
+}

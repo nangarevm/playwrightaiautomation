@@ -1,14 +1,33 @@
 import { Router } from "express";
 import { db } from "../db.js";
-import { logAudit } from "../services/adminService.js";
+import { logAudit, requireRole } from "../services/adminService.js";
 import {
   applySelfHealingForTestCase,
   detectChangesForTestCase,
+  getSelfHealConfidenceThreshold,
   listAutoHealActions,
   rollbackAutoHealAction,
+  setSelfHealConfidenceThreshold,
 } from "../services/selfHealingService.js";
+import { errBody } from "../errorCodes.js";
 
 export const selfHealingRouter = Router();
+
+// FR-5.4: view/edit the self-heal high-confidence threshold. Viewable by anyone (needed by
+// Testing.tsx to show the live value), edits gated to QA Lead.
+selfHealingRouter.get("/confidence-threshold", (_req, res) => {
+  res.json({ threshold: getSelfHealConfidenceThreshold() });
+});
+
+selfHealingRouter.put("/confidence-threshold", requireRole("QA Lead"), (req, res) => {
+  const { threshold } = req.body as { threshold?: number };
+  try {
+    const result = setSelfHealConfidenceThreshold(Number(threshold), req.user);
+    res.json({ threshold: result.selfHealConfidenceThreshold });
+  } catch (err: any) {
+    res.status(400).json(errBody(400, err.message));
+  }
+});
 
 // FR-5.1/FR-5.2: detect UI/API changes and record a numeric confidence score
 selfHealingRouter.post("/:testCaseId/detect", (req, res) => {
@@ -49,7 +68,7 @@ selfHealingRouter.post("/:testCaseId/heal", (req, res) => {
   };
 
   if (!detectionId || !beforeLocator || !afterLocator || typeof confidence !== "number") {
-    return res.status(400).json({ error: "detectionId, beforeLocator, afterLocator, and a numeric confidence are required" });
+    return res.status(400).json(errBody(400, "detectionId, beforeLocator, afterLocator, and a numeric confidence are required"));
   }
 
   try {
@@ -64,7 +83,7 @@ selfHealingRouter.post("/:testCaseId/heal", (req, res) => {
     logAudit(req.user, result.applied ? "auto_heal_applied" : "auto_heal_flagged_for_regeneration", "test_case", req.params.testCaseId, { confidence, healActionId: result.healActionId });
     res.status(201).json(result);
   } catch (err: any) {
-    res.status(400).json({ error: err.message });
+    res.status(400).json(errBody(400, err.message));
   }
 });
 

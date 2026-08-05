@@ -1,0 +1,16 @@
+{
+  "name": "bug-crawler",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "test": "playwright test",
+    "test:discover": "playwright test --project=discover",
+    "test:crawl": "playwright test --project=crawl",
+    "test:api-fuzz": "playwright test --project=api-fuzz",
+    "report": "playwright show-report"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.47.0"
+  }
+}

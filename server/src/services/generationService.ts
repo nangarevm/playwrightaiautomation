@@ -1,9 +1,12 @@
 import { nanoid } from "nanoid";
 import { db } from "../db.js";
 import { llm } from "../llm/index.js";
+import { GeneratedTestCase } from "../llm/types.js";
 import { deriveTraceabilityContext, buildDiffSummary } from "./testCaseFeatures.js";
 import { sanitizeForLlm } from "./safetyService.js";
 import { generateTestCasesWithDegradedMode } from "./llmResilienceService.js";
+import { withLlmGateway } from "./llmGatewayService.js";
+import { tagTestCasesToScreen } from "./screensService.js";
 
 export async function generateTestCasesForInput(inputId: string, inputText: string, businessRules?: string) {
   const traceability = deriveTraceabilityContext(inputText, { business_rules: businessRules });
@@ -18,14 +21,26 @@ export async function generateTestCasesForInput(inputId: string, inputText: stri
     );
   }
 
-  // FR-9.3: queue/retry rather than fail outright on LLM rate-limit/outage
-  const cases = await generateTestCasesWithDegradedMode(inputId, prompt);
+  // FR-9.5/9.6/9.7: route through the LLM gateway for semantic caching, prompt
+  // compression, and cost-aware model routing; FR-9.3/9.4 retry+failover happen
+  // inside generateTestCasesWithDegradedMode, which the gateway's `run` wraps.
+  // FR-9.6: capture whether prompt compression was applied to this generation call,
+  // so every resulting test case can be tagged with its compressed/uncompressed origin.
+  let wasCompressed = false;
+  const cases = await withLlmGateway<GeneratedTestCase[]>(
+    "test_case_generation",
+    { inputId, provider: llm.name, prompt, onCompressionResolved: (v) => { wasCompressed = v; } },
+    async (compressedPrompt) => {
+      const { cases: result } = await generateTestCasesWithDegradedMode(inputId, compressedPrompt);
+      return { result, outputText: JSON.stringify(result) };
+    }
+  );
   const now = new Date().toISOString();
 
   const insert = db.prepare(`
     INSERT INTO test_cases
-      (id, input_id, title, category, steps, expected_result, confidence_score, source_rationale, status, authorship_type, version, priority, traceability_context, explanation, created_at, updated_at)
-    VALUES (@id, @input_id, @title, @category, @steps, @expected_result, @confidence_score, @source_rationale, 'draft', 'ai', 1, @priority, @traceability_context, @explanation, @created_at, @updated_at)
+      (id, input_id, title, category, steps, expected_result, confidence_score, source_rationale, status, authorship_type, version, priority, traceability_context, explanation, generated_with_compression, created_at, updated_at)
+    VALUES (@id, @input_id, @title, @category, @steps, @expected_result, @confidence_score, @source_rationale, 'draft', 'ai', 1, @priority, @traceability_context, @explanation, @generated_with_compression, @created_at, @updated_at)
   `);
 
   const created = cases.map((c) => {
@@ -41,12 +56,25 @@ export async function generateTestCasesForInput(inputId: string, inputText: stri
       priority: c.priority ?? "Medium",
       traceability_context: JSON.stringify(traceability),
       explanation: `This ${c.category?.toLowerCase() ?? "test"} case focuses on the core behavior described in the input and aligns with the supplied business rules.`,
+      generated_with_compression: wasCompressed ? 1 : 0,
       created_at: now,
       updated_at: now,
     };
     insert.run(row);
     return row;
   });
+
+  // FR-2.14: tag every generated test case with the Screen its source input belongs
+  // to, so both manual cases and (once generated) their scripts can be grouped/browsed by screen
+  const linkedScreen = db.prepare("SELECT id FROM screens WHERE source_input_id = ? ORDER BY created_at ASC LIMIT 1").get(inputId) as any;
+  if (linkedScreen) {
+    tagTestCasesToScreen(created.map((c) => c.id), linkedScreen.id);
+    // tagTestCasesToScreen only updates the DB row -- these in-memory objects were
+    // built (and already returned to callers, pre-fix) before that UPDATE ran, so
+    // without this the immediate generate-response looked untagged even though the
+    // persisted row was correct. Keep the response honest.
+    for (const row of created) (row as any).screen_id = linkedScreen.id;
+  }
 
   return created;
 }
@@ -68,7 +96,15 @@ export async function regenerateTestCase(testCaseId: string) {
   ].filter(Boolean).join("\n\n");
 
   const { sanitized: prompt } = sanitizeForLlm(rawPrompt);
-  const candidates = await generateTestCasesWithDegradedMode(existing.input_id, prompt);
+  let wasCompressed = false;
+  const candidates = await withLlmGateway<GeneratedTestCase[]>(
+    "test_case_generation",
+    { inputId: existing.input_id, provider: llm.name, prompt, category: existing.category, onCompressionResolved: (v) => { wasCompressed = v; } },
+    async (compressedPrompt) => {
+      const { cases: result } = await generateTestCasesWithDegradedMode(existing.input_id, compressedPrompt);
+      return { result, outputText: JSON.stringify(result) };
+    }
+  );
   const bestMatch = candidates.find((c) => c.category === existing.category) ?? candidates[0];
   if (!bestMatch) throw new Error("Regeneration produced no candidates");
 
@@ -94,7 +130,7 @@ export async function regenerateTestCase(testCaseId: string) {
       title = @title, category = @category, steps = @steps, expected_result = @expected_result,
       confidence_score = @confidence_score, source_rationale = @source_rationale, priority = @priority,
       status = 'draft', authorship_type = 'ai', version = @version, explanation = @explanation,
-      updated_at = @updated_at
+      generated_with_compression = @generated_with_compression, updated_at = @updated_at
     WHERE id = @id
   `).run({
     id: testCaseId,
@@ -107,6 +143,7 @@ export async function regenerateTestCase(testCaseId: string) {
     priority: after.priority,
     version: existing.version + 1,
     explanation: `Regenerated: this ${after.category?.toLowerCase()} case focuses on the core behavior described in the input.`,
+    generated_with_compression: wasCompressed ? 1 : 0,
     updated_at: now,
   });
 
