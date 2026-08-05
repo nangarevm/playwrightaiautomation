@@ -7,6 +7,8 @@ export default defineConfig({
     port: 5173,
     proxy: {
       "/api": "http://localhost:4100",
+      "/uploads": "http://localhost:4100",
+      "/allure-report": "http://localhost:4100",
     },
   },
 });

@@ -1,6 +1,7 @@
 import { Router } from "express";
 import { db } from "../db.js";
-import { generateAutomationScript } from "../services/codegenService.js";
+import { generateAutomationScript, SecurityScanFailedError } from "../services/codegenService.js";
+import { errBody } from "../errorCodes.js";
 
 export const codegenRouter = Router();
 
@@ -15,6 +16,9 @@ codegenRouter.post("/:testCaseId/generate", async (req, res) => {
     const result = await generateAutomationScript(req.params.testCaseId, { framework });
     res.status(201).json(result);
   } catch (err: any) {
-    res.status(400).json({ error: err.message });
+    if (err instanceof SecurityScanFailedError) {
+      return res.status(422).json(errBody(422, err.message, { notes: err.notes }));
+    }
+    res.status(400).json(errBody(400, err.message));
   }
 });
