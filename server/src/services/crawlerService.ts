@@ -4,6 +4,7 @@
 // implements the Phase 7 test-case-management deletion cascade.
 
 import fs from "fs";
+import path from "path";
 import { nanoid } from "nanoid";
 import { db } from "../db.js";
 import { runCrawl, type CrawlRunOutput } from "../crawler/index.js";
@@ -502,11 +503,38 @@ export async function generateTestsFromScenarios(scenarioIds: string[], actorUse
     }
 
     if (scenario.generated_test_case_id) {
+      let scriptFile: string | undefined;
+      const existingScript = db
+        .prepare(
+          `SELECT id, file_path FROM automation_scripts WHERE test_case_id = ?
+           ORDER BY (CASE WHEN framework = 'playwright' AND language IN ('typescript', 'javascript') THEN 0 ELSE 1 END), created_at DESC
+           LIMIT 1`
+        )
+        .get(scenario.generated_test_case_id) as { id: string; file_path: string } | undefined;
+      if (existingScript) {
+        scriptFile = path.basename(existingScript.file_path);
+      } else {
+        try {
+          const generation = await generateAutomationScript(scenario.generated_test_case_id);
+          scriptFile = generation.artifacts[0]?.fileName;
+        } catch (err: any) {
+          results.push({
+            scenarioId,
+            ok: false,
+            testCaseId: scenario.generated_test_case_id,
+            error: err.message || "Failed to generate missing automation script for existing test case",
+          });
+          continue;
+        }
+      }
       results.push({
         scenarioId,
         ok: true,
         testCaseId: scenario.generated_test_case_id,
-        error: "Test case already generated for this scenario (skipped duplicate)",
+        scriptFile,
+        error: existingScript
+          ? "Test case already generated for this scenario (skipped duplicate)"
+          : "Regenerated missing automation script for existing test case",
       });
       continue;
     }
@@ -535,17 +563,36 @@ export async function generateTestsFromScenarios(scenarioIds: string[], actorUse
       const crawlMetaSuffix = ` CRAWL_URL=${pageUrl}${locators.length ? ` LOCATORS=${JSON.stringify(locators)}` : ""}`;
 
       // Skip if an equivalent test case already exists for this screen (title + steps match).
+      // Still ensure a runnable automation script exists -- prior security-scan failures
+      // left orphaned test cases with no script, which broke Generate+Run.
       if (screen) {
         const existingCase = db.prepare(
           "SELECT id FROM test_cases WHERE screen_id = ? AND title = ? AND steps = ? AND status != 'rejected' LIMIT 1"
         ).get(screen.id, scenario.title, JSON.stringify(steps)) as { id: string } | undefined;
         if (existingCase) {
+          let scriptFile: string | undefined;
+          const existingScript = db
+            .prepare(
+              `SELECT id, file_path FROM automation_scripts WHERE test_case_id = ?
+               ORDER BY (CASE WHEN framework = 'playwright' AND language IN ('typescript', 'javascript') THEN 0 ELSE 1 END), created_at DESC
+               LIMIT 1`
+            )
+            .get(existingCase.id) as { id: string; file_path: string } | undefined;
+          if (existingScript) {
+            scriptFile = path.basename(existingScript.file_path);
+          } else {
+            const generation = await generateAutomationScript(existingCase.id);
+            scriptFile = generation.artifacts[0]?.fileName;
+          }
           db.prepare("UPDATE crawl_scenarios SET generated_test_case_id = ?, updated_at = ? WHERE id = ?").run(existingCase.id, now, scenarioId);
           results.push({
             scenarioId,
             ok: true,
             testCaseId: existingCase.id,
-            error: "Linked to existing equivalent test case (skipped duplicate)",
+            scriptFile,
+            error: existingScript
+              ? "Linked to existing equivalent test case (skipped duplicate)"
+              : "Linked to existing test case and generated missing automation script",
           });
           continue;
         }
@@ -579,11 +626,18 @@ export async function generateTestsFromScenarios(scenarioIds: string[], actorUse
       // already catalogued for this page.
       if (screen) db.prepare("UPDATE test_cases SET screen_id = ? WHERE id = ?").run(screen.id, testCaseId);
 
-      const generation = await generateAutomationScript(testCaseId);
-      db.prepare("UPDATE crawl_scenarios SET generated_test_case_id = ?, updated_at = ? WHERE id = ?").run(testCaseId, now, scenarioId);
+      try {
+        const generation = await generateAutomationScript(testCaseId);
+        db.prepare("UPDATE crawl_scenarios SET generated_test_case_id = ?, updated_at = ? WHERE id = ?").run(testCaseId, now, scenarioId);
 
-      logAudit(actorUser, "crawl_scenario_test_generated", "crawl_scenario", scenarioId, { testCaseId, title: scenario.title });
-      results.push({ scenarioId, ok: true, testCaseId, scriptFile: generation.artifacts[0]?.fileName });
+        logAudit(actorUser, "crawl_scenario_test_generated", "crawl_scenario", scenarioId, { testCaseId, title: scenario.title });
+        results.push({ scenarioId, ok: true, testCaseId, scriptFile: generation.artifacts[0]?.fileName });
+      } catch (genErr: any) {
+        // Roll back the orphaned test case so a later Generate+Run can retry cleanly
+        // instead of linking to a case with no automation script.
+        db.prepare("DELETE FROM test_cases WHERE id = ?").run(testCaseId);
+        throw genErr;
+      }
     } catch (err: any) {
       results.push({ scenarioId, ok: false, error: err.message });
     }

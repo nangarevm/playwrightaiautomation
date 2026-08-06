@@ -1,9 +1,15 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
 import { db } from '../src/db.ts';
 import { triggerUltrafastRun, resolveDefaultProfileAndEnvironment } from '../src/services/ultrafastService.ts';
 import { queueExecution } from '../src/services/executionService.ts';
 import { getUltrafastConfidenceThreshold, setUltrafastConfidenceThreshold } from '../src/services/adminService.ts';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const generatedDir = path.join(__dirname, '..', 'generated');
 
 function resetData() {
   db.prepare('DELETE FROM auto_heal_actions').run();
@@ -32,10 +38,19 @@ function seedInputAndTestCase(tcId, confidence, extra = {}) {
     db.prepare('UPDATE test_cases SET critical_path = 1, second_reviewer_required = 1, second_reviewer_status = \'pending\' WHERE id = ?').run(tcId);
   }
   const scriptId = `script-${tcId}`;
+  const fileName = `${tcId}-ultrafast.spec.ts`;
+  const filePath = path.join(generatedDir, fileName);
+  fs.mkdirSync(generatedDir, { recursive: true });
+  fs.writeFileSync(filePath, `import { test, expect } from '@playwright/test';
+test('Ultrafast case', async ({ page }) => {
+  await page.goto(process.env.TARGET_URL || 'http://localhost:4100/demo/login.html');
+  await expect(page).toHaveTitle(/Login/i);
+});
+`, 'utf-8');
   db.prepare(`
     INSERT INTO automation_scripts (id, test_case_id, language, framework, code, file_path, security_scan_status, security_scan_notes, created_at)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(scriptId, tcId, 'typescript', 'playwright', 'test("x", () => {})', 'generated/does-not-exist-ultrafast.spec.ts', 'passed', 'ok', now);
+  `).run(scriptId, tcId, 'typescript', 'playwright', 'test("x", () => {})', filePath, 'passed', 'ok', now);
   return scriptId;
 }
 
@@ -67,7 +82,10 @@ test('triggerUltrafastRun auto-selects profile/environment, auto-accepts a high-
 
   // Run is tagged speed_mode: 'ultrafast' (FR-4.24) and recorded on the run row
   assert.equal(result.run.speedMode, 'ultrafast');
-  const runRow = db.prepare('SELECT * FROM execution_runs WHERE id = ?').get(result.run.id);
+  const runRow =
+    db.prepare('SELECT * FROM execution_runs WHERE id = ?').get(result.run.id) ??
+    db.prepare('SELECT * FROM execution_runs WHERE script_id = ? ORDER BY created_at DESC LIMIT 1').get(scriptId);
+  assert.ok(runRow, 'expected an execution_runs row for this ultrafast trigger');
   assert.equal(runRow.speed_mode, 'ultrafast');
   assert.equal(runRow.profile_id, 'profile-1');
   assert.equal(runRow.environment_id, 'env-1');

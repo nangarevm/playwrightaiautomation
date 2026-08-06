@@ -148,6 +148,15 @@ test('staticSecurityScan flags code containing a disallowed pattern, and classif
   const safe = staticSecurityScan("await page.getByRole('button', { name: 'Log in' }).click();");
   assert.equal(safe.status, 'passed');
 
+  const externalBlocked = staticSecurityScan("await page.goto('https://evil.example/hack');");
+  assert.equal(externalBlocked.status, 'flagged');
+  assert.match(externalBlocked.notes, /external network host/i);
+
+  const crawledAllowed = staticSecurityScan("await page.goto('https://www.angelone.in/login');", {
+    allowedHosts: ['www.angelone.in', 'angelone.in'],
+  });
+  assert.equal(crawledAllowed.status, 'passed');
+
   assert.equal(classifyLocatorStrategy("await page.getByRole('button').click();"), 'accessibility');
   assert.equal(classifyLocatorStrategy("await page.locator('.css-class').click();"), 'css_xpath_fallback');
   assert.equal(

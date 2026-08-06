@@ -42,16 +42,70 @@ fs.mkdirSync(GENERATED_DIR, { recursive: true });
 // Minimal static scanner. In production this would call out to a real SAST
 // tool (e.g. semgrep). Flags patterns that should never appear in
 // AI-generated Playwright automation code.
-const DANGEROUS_PATTERNS: { pattern: RegExp; reason: string }[] = [
+//
+// External-host check is allowlist-aware: crawled sites (and TARGET_URL) are
+// legitimate destinations for generated scripts. Only unexpected third-party
+// hosts should be flagged.
+const ALWAYS_DANGEROUS: { pattern: RegExp; reason: string }[] = [
   { pattern: /child_process/, reason: "spawns OS processes" },
   { pattern: /\beval\s*\(/, reason: "uses eval()" },
   { pattern: /require\(['"]fs['"]\).*(unlink|rm|rmdir)/s, reason: "deletes files from disk" },
   { pattern: /process\.env\.[A-Z_]*(SECRET|TOKEN|KEY)[A-Z_]*\s*(=|\+=)/, reason: "writes to a secret-looking env var" },
-  { pattern: /https?:\/\/(?!localhost|127\.0\.0\.1)/, reason: "references an external network host not equal to the target-under-test" },
 ];
 
-export function staticSecurityScan(code: string): { status: "passed" | "flagged"; notes: string } {
-  const hits = DANGEROUS_PATTERNS.filter((d) => d.pattern.test(code)).map((d) => d.reason);
+const DEFAULT_ALLOWED_HOSTS = new Set(["localhost", "127.0.0.1"]);
+
+export function hostFromUrl(raw: string | null | undefined): string | null {
+  if (!raw) return null;
+  try {
+    const withProtocol = /^https?:\/\//i.test(raw) ? raw : `https://${raw}`;
+    return new URL(withProtocol).hostname.toLowerCase();
+  } catch {
+    return null;
+  }
+}
+
+export function collectAllowedHosts(...candidates: Array<string | null | undefined>): Set<string> {
+  const hosts = new Set(DEFAULT_ALLOWED_HOSTS);
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+    // Pull every URL-looking token out of rationale / hints, not just a single host.
+    const matches = String(candidate).matchAll(/https?:\/\/[^\s)'"`]+/gi);
+    for (const match of matches) {
+      const host = hostFromUrl(match[0]);
+      if (host) hosts.add(host);
+    }
+    const bare = hostFromUrl(candidate);
+    if (bare) hosts.add(bare);
+  }
+  return hosts;
+}
+
+export function staticSecurityScan(
+  code: string,
+  options?: { allowedHosts?: Iterable<string> }
+): { status: "passed" | "flagged"; notes: string } {
+  const hits = ALWAYS_DANGEROUS.filter((d) => d.pattern.test(code)).map((d) => d.reason);
+
+  const allowed = new Set(DEFAULT_ALLOWED_HOSTS);
+  for (const host of options?.allowedHosts ?? []) {
+    if (host) allowed.add(String(host).toLowerCase());
+  }
+
+  const urlMatches = code.matchAll(/https?:\/\/[^\s)'"`]+/gi);
+  const disallowedHosts = new Set<string>();
+  for (const match of urlMatches) {
+    const host = hostFromUrl(match[0]);
+    if (!host) continue;
+    if (allowed.has(host)) continue;
+    disallowedHosts.add(host);
+  }
+  if (disallowedHosts.size > 0) {
+    hits.push(
+      `references an external network host not equal to the target-under-test (${Array.from(disallowedHosts).join(", ")})`
+    );
+  }
+
   if (hits.length === 0) return { status: "passed", notes: "No disallowed patterns detected." };
   return { status: "flagged", notes: `Flagged for: ${hits.join("; ")}` };
 }
@@ -193,7 +247,24 @@ export async function generateAutomationScript(
   // the whole generation call closed (nothing partially written/committed)
   // rather than being silently persisted with a 201, which is what happened
   // before this pass.
-  const scans = artifacts.map((artifact) => ({ artifact, scan: staticSecurityScan(artifact.code) }));
+  //
+  // Allow the crawled page URL / screen URL / TARGET_URL so Generate+Run against
+  // a real site is not false-flagged as "unexpected external host".
+  const screen = tc.screen_id
+    ? (db.prepare("SELECT url_or_path FROM screens WHERE id = ?").get(tc.screen_id) as { url_or_path: string | null } | undefined)
+    : undefined;
+  const crawlUrlMatch = String(tc.source_rationale || "").match(/CRAWL_URL=(\S+)/);
+  const allowedHosts = collectAllowedHosts(
+    tc.source_rationale,
+    crawlUrlMatch?.[1],
+    screen?.url_or_path,
+    process.env.TARGET_URL
+  );
+
+  const scans = artifacts.map((artifact) => ({
+    artifact,
+    scan: staticSecurityScan(artifact.code, { allowedHosts }),
+  }));
   const flagged = scans.find((s) => s.scan.status === "flagged");
   if (flagged) {
     throw new SecurityScanFailedError(flagged.scan.notes);

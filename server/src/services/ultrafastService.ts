@@ -25,10 +25,10 @@
 // needs-review-later rather than silently failing the run), exactly as it would for a human.
 
 import { db } from "../db.js";
-import { runExecution, suggestExecutionProfile } from "./executionService.js";
+import { runExecution, suggestExecutionProfile, summarizeRunForClient } from "./executionService.js";
 import { applyTestCaseReview, TestCaseReviewError } from "./testCaseFeatures.js";
 import { logSystemAudit, getUltrafastConfidenceThreshold } from "./adminService.js";
-import { generateAutomationScript } from "./codegenService.js";
+import { generateAutomationScript, SecurityScanFailedError } from "./codegenService.js";
 
 export interface ResolvedDefaults {
   profileId: string | null;
@@ -229,12 +229,16 @@ export async function triggerUltrafastRun(input: UltrafastTriggerInput) {
     trigger_source: "ultrafast",
   });
 
+  if (runResult?.error || !runResult?.id) {
+    throw new Error(runResult?.error || "Execution could not be started for this test case");
+  }
+
   // FR-4.27: the interactive HTML report, scoped to this run, delivered directly --
   // no separate publish/export click required.
   const reportUrl = `/api/reporting/export.html?runId=${runResult.id}`;
 
   return {
-    run: runResult,
+    run: summarizeRunForClient(runResult),
     resolvedProfile: { id: resolved.profileId, reason: resolved.profileReason },
     resolvedEnvironment: { id: resolved.environmentId, reason: resolved.environmentReason },
     reviewOutcome,

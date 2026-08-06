@@ -90,6 +90,17 @@ export function getNpxCommand(): string {
   return process.platform === "win32" ? "npx.cmd" : "npx";
 }
 
+/** Strip huge Playwright stdout/stderr from HTTP trigger responses (kept on the run row). */
+export function summarizeRunForClient(runResult: any) {
+  if (!runResult || typeof runResult !== "object") return runResult;
+  const { stdout, stderr, ...rest } = runResult;
+  return {
+    ...rest,
+    stdoutBytes: typeof stdout === "string" ? stdout.length : 0,
+    stderrBytes: typeof stderr === "string" ? stderr.length : 0,
+  };
+}
+
 // Escapes a test title for safe use as a literal match inside Playwright's --grep regex.
 function escapeGrepRegex(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -568,9 +579,34 @@ function processExecutionQueueLazy() {
 // sitting in the DB forever (see FR-4.5).
 export function runExecution(scriptId: string, targetUrl: string, input: any = {}, existingRunId?: string): Promise<any> {
   return new Promise((resolve) => {
+    try {
     const script = db.prepare("SELECT * FROM automation_scripts WHERE id = ?").get(scriptId) as any;
     if (!script) {
       resolve({ error: "Script not found" });
+      return;
+    }
+
+    if (!script.file_path || typeof script.file_path !== "string") {
+      const id = nanoid(10);
+      const now = new Date().toISOString();
+      const message = "Script file path is missing -- regenerate automation for this test case";
+      db.prepare(`
+        INSERT INTO execution_runs (id, script_id, status, duration_ms, stdout, stderr, created_at)
+        VALUES (@id, @script_id, 'error', 0, '', @stderr, @created_at)
+      `).run({ id, script_id: scriptId, stderr: message, created_at: now });
+      resolve({ id, status: "error", error: message, durationMs: 0 });
+      return;
+    }
+    const scriptPath = path.isAbsolute(script.file_path) ? script.file_path : path.join(SERVER_ROOT, script.file_path);
+    if (!fs.existsSync(scriptPath)) {
+      const id = nanoid(10);
+      const now = new Date().toISOString();
+      const message = `Script file not found on disk (${path.basename(script.file_path)}) -- regenerate automation`;
+      db.prepare(`
+        INSERT INTO execution_runs (id, script_id, status, duration_ms, stdout, stderr, created_at)
+        VALUES (@id, @script_id, 'error', 0, '', @stderr, @created_at)
+      `).run({ id, script_id: scriptId, stderr: message, created_at: now });
+      resolve({ id, status: "error", error: message, durationMs: 0 });
       return;
     }
 
@@ -594,7 +630,7 @@ export function runExecution(scriptId: string, targetUrl: string, input: any = {
       return;
     }
 
-    const relFile = path.relative(SERVER_ROOT, script.file_path).replace(/\\/g, "/");
+    const relFile = path.relative(SERVER_ROOT, scriptPath).replace(/\\/g, "/");
     const startedAt = Date.now();
     const profile = input.profile_id ? (db.prepare("SELECT * FROM execution_profiles WHERE id = ?").get(input.profile_id) as any) : null;
     const config = profile ? { ...profile } : normalizeProfile(input);
@@ -752,7 +788,9 @@ export function runExecution(scriptId: string, targetUrl: string, input: any = {
       });
     }
 
-    const child = execFile(
+    let child: ChildProcess;
+    try {
+      child = execFile(
       getNpxCommand(),
       args,
       {
@@ -1000,7 +1038,33 @@ export function runExecution(scriptId: string, targetUrl: string, input: any = {
         });
       }
     );
+    } catch (spawnErr: any) {
+      db.prepare(`
+        UPDATE execution_runs SET status = 'error', duration_ms = 0, stderr = @stderr WHERE id = @id
+      `).run({ id: runId, stderr: String(spawnErr?.message || spawnErr).slice(0, 8000) });
+      resolve({
+        id: runId,
+        status: "error",
+        error: spawnErr?.message || "Failed to start Playwright process",
+        durationMs: 0,
+      });
+      return;
+    }
+
+    child.on("error", (spawnErr) => {
+      runningProcesses.delete(runId);
+      const durationMs = Date.now() - startedAt;
+      const message = spawnErr?.message || "Playwright process failed to start";
+      db.prepare(`
+        UPDATE execution_runs SET status = 'error', duration_ms = @duration_ms, stderr = @stderr WHERE id = @id
+      `).run({ id: runId, duration_ms: durationMs, stderr: message.slice(0, 8000) });
+      resolve({ id: runId, status: "error", error: message, durationMs });
+    });
+
     runningProcesses.set(runId, child);
+    } catch (err: any) {
+      resolve({ status: "error", error: err?.message || "Execution failed to start" });
+    }
   });
 }
 

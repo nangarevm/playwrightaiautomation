@@ -7,9 +7,15 @@
 // exercising real code paths over mocking framework internals.
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
 import { db } from '../src/db.ts';
 import { executionRouter } from '../src/routes/execution.ts';
 import { testCasesRouter } from '../src/routes/testcases.ts';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const generatedDir = path.join(__dirname, '..', 'generated');
 
 function resetData() {
   db.prepare('DELETE FROM execution_evidence').run(); // FK to execution_runs, must go first
@@ -44,10 +50,18 @@ function seedScriptFixture() {
     INSERT INTO test_cases (id, input_id, title, category, steps, expected_result, confidence_score, source_rationale, status, authorship_type, version, created_at, updated_at)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run('tc-fm', 'input-fm', 'Fast mode case', 'Smoke', JSON.stringify(['Open page']), 'Page opens', 0.9, 'Fixture', 'accepted', 'ai', 1, now, now);
+  const filePath = path.join(generatedDir, 'script-fm.spec.ts');
+  fs.mkdirSync(generatedDir, { recursive: true });
+  fs.writeFileSync(filePath, `import { test, expect } from '@playwright/test';
+test('Fast mode case', async ({ page }) => {
+  await page.goto(process.env.TARGET_URL || 'http://localhost:4100/demo/login.html');
+  await expect(page).toHaveTitle(/Login/i);
+});
+`, 'utf-8');
   db.prepare(`
     INSERT INTO automation_scripts (id, test_case_id, language, framework, code, file_path, security_scan_status, security_scan_notes, created_at)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).run('script-fm', 'tc-fm', 'typescript', 'playwright', 'test("x", () => {})', 'generated/script-fm.spec.ts', 'passed', 'ok', now);
+  `).run('script-fm', 'tc-fm', 'typescript', 'playwright', 'test("x", () => {})', filePath, 'passed', 'ok', now);
   db.prepare(`
     INSERT INTO execution_profiles (id, name, browser_set, concurrency, artifact_capture_mode, retention_days, selection_mode, retry_strategy, provider, reserved_runner_count, headless_mode, reuse_browser_instances, is_default_for_team, is_default_for_suite, created_at, updated_at)
     VALUES ('profile-fm', 'Fast mode profile', 'chromium', 1, 'logs-only', 30, 'full-suite', 'no-retry', 'local', 0, 1, 0, 0, 0, ?, ?)
