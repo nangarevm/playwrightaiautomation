@@ -14,6 +14,8 @@ const generatedDir = path.join(__dirname, '..', 'generated');
 function resetData() {
   db.prepare('DELETE FROM auto_heal_actions').run();
   db.prepare('DELETE FROM change_detections').run();
+  db.prepare('DELETE FROM execution_evidence').run(); // FK to execution_runs, must go first
+  db.prepare('DELETE FROM bug_findings').run(); // FK to execution_runs, must go first
   db.prepare('DELETE FROM execution_runs').run();
   db.prepare('DELETE FROM review_audit_entries').run();
   db.prepare('DELETE FROM sync_records').run();

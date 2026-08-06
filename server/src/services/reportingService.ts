@@ -253,11 +253,33 @@ export function buildInteractiveHtmlReport(runId?: string): string {
     LIMIT 500
   `).all(runId ? { runId } : {}) as any[];
 
+  // FR-6.5's per-failed-test evidence (test_title/file/status/error_message) --
+  // previously this report only ever showed the whole run's raw process stderr
+  // (usually empty, since Playwright's actual per-test failure reason is
+  // reported via its JSON reporter on stdout, not the process's stderr stream)
+  // plus a bare "Evidence: <path>" line, with no indication of *why* the test
+  // actually failed. Pull the real per-test error message captured at run time
+  // and key it by run_id so each row can show its own test's exact failure.
+  const evidenceByRun = new Map<string, Array<{ test_title: string; error_message: string | null }>>();
+  if (runs.length > 0) {
+    const evidenceRows = db.prepare(`SELECT run_id, test_title, error_message FROM execution_evidence WHERE run_id IN (${runs.map(() => "?").join(",")})`)
+      .all(...runs.map((r) => r.id)) as Array<{ run_id: string; test_title: string; error_message: string | null }>;
+    for (const ev of evidenceRows) {
+      if (!evidenceByRun.has(ev.run_id)) evidenceByRun.set(ev.run_id, []);
+      evidenceByRun.get(ev.run_id)!.push(ev);
+    }
+  }
+
   const dashboard = getDashboardSummary();
 
   const rows = runs.map((r) => {
     const steps: string[] = r.test_steps ? JSON.parse(r.test_steps) : [];
     const statusClass = r.status === "passed" ? "pass" : r.status === "failed" || r.status === "error" ? "fail" : "other";
+    // Prefer the evidence row matching this run's test title (batch runs can carry
+    // evidence for several tests); fall back to the first evidence row for the run.
+    const evidenceForRun = evidenceByRun.get(r.id) ?? [];
+    const matchedEvidence = evidenceForRun.find((e) => e.test_title === r.test_title) ?? evidenceForRun[0];
+    const errorMessage = matchedEvidence?.error_message ?? null;
     return `
       <tr class="run-row ${statusClass}" data-status="${r.status}">
         <td>${r.test_title ?? r.script_id}</td>
@@ -268,6 +290,7 @@ export function buildInteractiveHtmlReport(runId?: string): string {
       </tr>
       <tr class="trace-row"><td colspan="5"><div class="trace">
         <ol>${steps.map((s) => `<li>${escapeHtml(s)}</li>`).join("")}</ol>
+        ${errorMessage ? `<div class="error-reason"><strong>Why it failed:</strong><pre>${escapeHtml(errorMessage)}</pre></div>` : ""}
         ${r.evidence_path ? `<div class="evidence">Evidence: ${escapeHtml(r.evidence_path)}</div>` : ""}
         ${r.stderr ? `<pre class="stderr">${escapeHtml(r.stderr)}</pre>` : ""}
       </div></td></tr>
@@ -289,6 +312,9 @@ td, th { padding: 0.5rem 0.75rem; text-align: left; border-bottom: 1px solid #ee
 .trace-row { display: none; } .trace-row.open { display: table-row; }
 .trace { background: #f3f4f6; padding: 0.75rem; border-radius: 6px; }
 .stderr { color: #b91c1c; white-space: pre-wrap; font-size: 0.8rem; }
+.error-reason { background: #fef2f2; border: 1px solid #fecaca; border-radius: 6px; padding: 0.5rem 0.75rem; margin-bottom: 0.5rem; }
+.error-reason strong { color: #b91c1c; display: block; margin-bottom: 0.25rem; font-size: 0.8rem; }
+.error-reason pre { white-space: pre-wrap; font-size: 0.8rem; color: #7f1d1d; margin: 0; }
 </style></head>
 <body>
   <h1>Run Report</h1>
@@ -367,6 +393,82 @@ export function buildReleaseReportPdf(): Promise<Buffer> {
       .text(
         `Estimated manual QA effort: ${hoursSaved.estimatedManualHours}h  |  Actual automated time: ${hoursSaved.actualAutomatedHours}h  |  Hours saved: ${hoursSaved.hoursSaved}h`
       );
+
+    doc.end();
+  });
+}
+
+export interface BugReportPdfEntry {
+  title: string;
+  failureClass: string | null;
+  failureLabel: string | null;
+  errorMessage: string | null;
+  reportUrl?: string | null;
+}
+
+const FAILURE_CLASS_BADGE: Record<string, string> = {
+  possible_bug: "Product bug",
+  automation_issue: "Automation script issue",
+  environment_issue: "Environment issue",
+  unknown: "Uncategorized",
+};
+
+// Customer-facing bug report PDF for a single crawl/batch (Crawler tab's "Download
+// bug report"). The failure list itself lives only in the browser -- it's built
+// from execution_evidence lookups scoped to that batch's run IDs as the client
+// runs each test -- so the client sends its already-assembled list rather than
+// this endpoint trying to re-derive "which failures belong to this crawl" from
+// scratch server-side.
+export function buildBugReportPdf(entries: BugReportPdfEntry[]): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    const doc = new PDFDocument({ margin: 40 });
+    const chunks: Buffer[] = [];
+    doc.on("data", (chunk) => chunks.push(chunk));
+    doc.on("end", () => resolve(Buffer.concat(chunks)));
+    doc.on("error", reject);
+
+    const genuineBugs = entries.filter((e) => e.failureClass === "possible_bug" || e.failureClass === "unknown" || !e.failureClass);
+    const scriptIssues = entries.filter((e) => e.failureClass === "automation_issue" || e.failureClass === "environment_issue");
+
+    doc.fontSize(18).fillColor("#000").text("AI Test Automation Platform — Bug Report");
+    doc.moveDown(0.3);
+    doc.fontSize(10).fillColor("#555").text(`Generated ${new Date().toISOString()}`);
+    doc.moveDown();
+    doc.fontSize(11).fillColor("#000").text(
+      `${entries.length} failure(s) this crawl: ${genuineBugs.length} product bug(s), ${scriptIssues.length} automation/environment issue(s).`
+    );
+    doc.moveDown();
+
+    const renderEntry = (e: BugReportPdfEntry) => {
+      doc.fontSize(12).fillColor("#000").text(e.title, { continued: false });
+      const badge = FAILURE_CLASS_BADGE[e.failureClass ?? "unknown"] ?? "Uncategorized";
+      doc.fontSize(9).fillColor("#b91c1c").text(badge);
+      if (e.failureLabel) doc.fontSize(9).fillColor("#666").text(e.failureLabel);
+      if (e.errorMessage) {
+        doc.fontSize(8).fillColor("#7f1d1d").font("Courier").text(e.errorMessage.slice(0, 1000));
+        doc.font("Helvetica");
+      } else {
+        doc.fontSize(9).fillColor("#999").text("No detailed error message was captured for this failure.");
+      }
+      if (e.reportUrl) doc.fontSize(8).fillColor("#2563eb").text(e.reportUrl);
+      doc.moveDown(0.8);
+    };
+
+    doc.fontSize(14).fillColor("#000").text("Product bugs");
+    doc.moveDown(0.3);
+    if (genuineBugs.length === 0) {
+      doc.fontSize(10).fillColor("#666").text("No genuine product bugs found in this crawl's failures.");
+      doc.moveDown();
+    } else {
+      genuineBugs.forEach(renderEntry);
+    }
+
+    if (scriptIssues.length > 0) {
+      doc.moveDown(0.4);
+      doc.fontSize(14).fillColor("#000").text("Automation / environment issues (not product bugs)");
+      doc.moveDown(0.3);
+      scriptIssues.forEach(renderEntry);
+    }
 
     doc.end();
   });

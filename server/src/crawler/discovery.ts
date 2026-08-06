@@ -6,9 +6,10 @@
 // visited-URL set to avoid infinite loops on cyclic navigation graphs.
 
 import { chromium, type Browser, type BrowserContext } from "playwright";
-import { DESTRUCTIVE_ACTION_PATTERN, type ApiCallRecord, type CrawlOptions, type ElementRecord, type NavEdge } from "./types.js";
+import { DESTRUCTIVE_ACTION_PATTERN, type ApiCallRecord, type ComponentInventoryItem, type CrawlOptions, type ElementRecord, type NavEdge } from "./types.js";
 import { loginIfCredentialsProvided } from "./auth.js";
 import { discoverPageInteractions } from "./interaction.js";
+import { collectComponentInventory } from "./componentInventory.js";
 import { attachNetworkCapture } from "./network.js";
 
 export interface DiscoveredPage {
@@ -17,10 +18,41 @@ export interface DiscoveredPage {
   elements: ElementRecord[];
   apis: ApiCallRecord[];
   formCount: number;
+  componentInventory: ComponentInventoryItem[];
 }
 
 function normalizeUrl(raw: string): string {
   return /^https?:\/\//i.test(raw) ? raw : `https://${raw}`;
+}
+
+// Common noise params that vary per link/click but never change what the page
+// actually is (tracking/session identifiers) -- stripped before a URL is used
+// as a "have we already visited this page" key, so e.g. "/forum",
+// "/forum?utm_source=nav", and "/forum/" don't each get crawled and scenario-
+// generated as if they were three separate pages (previously: they did, which
+// is why the same page's card + identical "Verify X loads successfully"
+// scenario could show up 2-3x in the Review & curate list for one real page).
+const VOLATILE_QUERY_PARAMS = /^(utm_|fbclid$|gclid$|msclkid$|ref$|referrer$|source$|sid$|session(id)?$|_ga$|_gl$)/i;
+
+// The visited-set key for "is this the same page we already crawled" -- NOT
+// the URL actually navigated to or stored (that stays the real, full URL so
+// links/screenshots/replay scripts keep working). Strips the trailing slash
+// and any volatile query params; keeps everything else (a genuinely content-
+// differentiating param like `?id=42` still produces a distinct key).
+function dedupeKey(rawUrl: string): string {
+  try {
+    const u = new URL(rawUrl);
+    const params = new URLSearchParams(u.search);
+    for (const key of Array.from(params.keys())) {
+      if (VOLATILE_QUERY_PARAMS.test(key)) params.delete(key);
+    }
+    params.sort();
+    const search = params.toString();
+    const pathname = u.pathname.replace(/\/+$/, "") || "/";
+    return `${u.origin}${pathname}${search ? `?${search}` : ""}`;
+  } catch {
+    return rawUrl;
+  }
 }
 
 function sameOrigin(a: string, b: string): boolean {
@@ -45,7 +77,7 @@ async function extractLinks(page: import("playwright").Page, baseUrl: string): P
     .evaluate(() =>
       Array.from(document.querySelectorAll("a[href]")).map((a) => ({
         href: (a as HTMLAnchorElement).href,
-        label: (a.getAttribute("aria-label") || a.textContent || "").trim().slice(0, 80),
+        label: (a.getAttribute("aria-label") || a.textContent || "").replace(/\s+/g, " ").trim().slice(0, 80),
       }))
     )
     .catch(() => [] as Array<{ href: string; label: string }>);
@@ -91,7 +123,12 @@ export async function runDiscoveryCrawl(options: CrawlOptions): Promise<{ pages:
       throw new Error(login.message);
     }
 
+    // Keyed by dedupeKey(url), not the raw URL -- see dedupeKey's comment.
+    // `queuedKeys` mirrors what's already sitting in `queue` so a second link
+    // to the same logical page (different tracking params/trailing slash)
+    // doesn't get queued twice before its first occurrence is even visited.
     const visited = new Set<string>();
+    const queuedKeys = new Set<string>([dedupeKey(normalizedUrl)]);
     const queue: string[] = [normalizedUrl];
     const results: DiscoveredPage[] = [];
     // The navigation graph: every page->page hop discovered, with what was
@@ -108,8 +145,9 @@ export async function runDiscoveryCrawl(options: CrawlOptions): Promise<{ pages:
       const batch: string[] = [];
       while (queue.length > 0 && batch.length < concurrency && results.length + batch.length < maxPages) {
         const next = queue.shift()!;
-        if (visited.has(next)) continue;
-        visited.add(next);
+        const key = dedupeKey(next);
+        if (visited.has(key)) continue;
+        visited.add(key);
         batch.push(next);
       }
       if (batch.length === 0) break;
@@ -129,12 +167,15 @@ export async function runDiscoveryCrawl(options: CrawlOptions): Promise<{ pages:
 
           const { elements, formCount } = await discoverPageInteractions(page, capture?.setTrigger);
           formsDiscoveredTotal += formCount;
+          // Scanned after discoverPageInteractions (not before) so modals/dropdowns
+          // it clicked open are already in the DOM and get counted too.
+          const componentInventory = await collectComponentInventory(page);
 
           // SPA route changes: after interaction, the URL may have changed via
           // history.pushState without a full navigation -- capture that as an
           // additional discoverable route rather than losing it.
           const currentUrl = page.url();
-          if (currentUrl !== targetUrl && sameOrigin(currentUrl, normalizedUrl) && !visited.has(currentUrl)) {
+          if (currentUrl !== targetUrl && sameOrigin(currentUrl, normalizedUrl) && !visited.has(dedupeKey(currentUrl))) {
             discoveredLinksThisBatch.push({ url: currentUrl, label: "navigation" });
             edges.push({ from: targetUrl, to: currentUrl, via: "navigation" });
           }
@@ -149,16 +190,19 @@ export async function runDiscoveryCrawl(options: CrawlOptions): Promise<{ pages:
           discoveredLinksThisBatch.push(...links);
           for (const link of links) edges.push({ from: currentUrl, to: link.url, via: link.label });
 
-          results.push({ url: targetUrl, title, elements, apis: capture?.records ?? [], formCount });
+          results.push({ url: targetUrl, title, elements, apis: capture?.records ?? [], formCount, componentInventory });
         } catch (err: any) {
-          results.push({ url: targetUrl, title: `(failed to load: ${err.message})`, elements: [], apis: [], formCount: 0 });
+          results.push({ url: targetUrl, title: `(failed to load: ${err.message})`, elements: [], apis: [], formCount: 0, componentInventory: [] });
         } finally {
           await page.close().catch(() => undefined);
         }
       });
 
       for (const link of discoveredLinksThisBatch) {
-        if (!visited.has(link.url) && !queue.includes(link.url)) queue.push(link.url);
+        const key = dedupeKey(link.url);
+        if (visited.has(key) || queuedKeys.has(key)) continue;
+        queuedKeys.add(key);
+        queue.push(link.url);
       }
     }
 

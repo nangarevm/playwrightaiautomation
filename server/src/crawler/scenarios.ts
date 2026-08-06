@@ -58,12 +58,14 @@ function makeScenario(
   type: ScenarioRecord["type"],
   flowGroup: string,
   steps: string[],
-  locatorSources: ElementRecord[]
+  locatorSources: ElementRecord[],
+  tier: ScenarioRecord["tier"] = "functional"
 ): ScenarioRecord {
   return {
     id: nanoid(10),
     title,
     type,
+    tier,
     flowGroup,
     steps,
     locators: locatorSources.flatMap((e) => e.locators.slice(0, 1)),
@@ -90,7 +92,8 @@ function buildFormScenarios(pageTitle: string, formElements: ElementRecord[]): S
       "positive",
       flowGroup,
       [`Given the user is on "${pageTitle}"`, ...inputs.map((i) => `When the user ${fillStepFor(i)}`), submitStep, "Then the form is accepted and the expected success state is shown"],
-      [...inputs, ...submitLocator]
+      [...inputs, ...submitLocator],
+      "smoke" // the one core "does this form work at all" happy path
     )
   );
 
@@ -301,13 +304,21 @@ export function buildScenariosForPage(pageTitle: string, elements: ElementRecord
             "positive",
             pageTitle,
             [`Given the user is on "${pageTitle}"`, `When the user clicks "${el.label}"`, "Then the expected navigation or response occurs"],
-            [el]
+            [el],
+            "smoke" // core navigation/key-action coverage on a form-less page
           )
         );
       }
     } else {
       scenarios.push(
-        makeScenario(`Verify ${pageTitle} loads successfully`, "positive", pageTitle, [`Given the user navigates to "${pageTitle}"`, "Then the page loads and its key elements render"], elements.slice(0, 5))
+        makeScenario(
+          `Verify ${pageTitle} loads successfully`,
+          "positive",
+          pageTitle,
+          [`Given the user navigates to "${pageTitle}"`, "Then the page loads and its key elements render"],
+          elements.slice(0, 5),
+          "smoke"
+        )
       );
     }
   }
@@ -344,6 +355,7 @@ export function buildCrudFlowScenario(pageTitle: string, elements: ElementRecord
     id: nanoid(10),
     title: `Verify the create/edit/delete lifecycle works on ${pageTitle}`,
     type: "flow",
+    tier: "functional", // multi-step cross-component flow, not a single core happy path
     flowGroup: pageTitle,
     steps,
     locators,
@@ -481,6 +493,7 @@ export function buildFlowScenariosForSite(
       id: nanoid(10),
       title: `Verify the end-to-end flow from "${titles[0]}" to "${titles[titles.length - 1]}"`,
       type: "flow",
+      tier: "functional", // multi-page journey, matches "multi-step flows... cross-page interactions"
       flowGroup: `Journey: ${titles.join(" → ")}`,
       steps,
       locators,

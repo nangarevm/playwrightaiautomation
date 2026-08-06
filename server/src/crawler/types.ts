@@ -47,10 +47,29 @@ export interface ApiCallRecord {
   host?: string;
 }
 
+// Page-level "what kinds of components does this page have" summary -- see
+// componentInventory.ts. Distinct from ElementRecord, which is per-clickable-
+// element locator data used for scenario generation.
+export interface ComponentInventoryItem {
+  kind: string;
+  label: string;
+  count: number;
+  samples: string[];
+}
+
 export interface ScenarioRecord {
   id: string;
   title: string;
   type: "positive" | "negative" | "flow" | "api";
+  // Coarser than `type`: which of the three test suites this belongs to.
+  // "smoke" = the one core happy-path check per page/form (does the critical
+  // flow work at all); "functional" = everything else generated at crawl time
+  // (edge cases, negative/validation, boundary/format coverage, multi-step
+  // cross-page journeys, API checks); "regression" is never assigned at
+  // generation time -- it's applied at persistence time (crawlerService.ts)
+  // to scenarios carried forward unchanged from a page that didn't change on
+  // a re-crawl, i.e. "this previously worked, re-verify it still does."
+  tier: "smoke" | "functional" | "regression";
   flowGroup: string;
   steps: string[];
   locators: string[];

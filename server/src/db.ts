@@ -348,6 +348,11 @@ CREATE TABLE IF NOT EXISTS execution_evidence (
   created_at TEXT NOT NULL,
   FOREIGN KEY (run_id) REFERENCES execution_runs(id)
 );
+-- error_message added below via ensureColumn: the actual Playwright error text
+-- (e.g. "Test timeout of 15000ms exceeded... waiting for getByLabel('Username')")
+-- for this specific failed test, parsed from the JSON reporter's per-test result.
+-- Previously only title/file/status were kept, so the failure report had no way
+-- to show *why* a test failed short of opening the raw artifacts on disk.
 
 -- SR-FR-0.4: short-TTL idempotency store for state-mutating POST endpoints. A
 -- repeated Idempotency-Key + method + path within the TTL window replays the
@@ -632,6 +637,36 @@ ensureColumn("automation_scripts", "locator_strategy", "TEXT"); // 'accessibilit
 // scenarios_discovered aggregate pattern for the crawl progress UI.
 ensureColumn("crawl_pages", "spelling_issues_json", "TEXT NOT NULL DEFAULT '[]'");
 ensureColumn("crawl_sites", "spelling_issues_found", "INTEGER NOT NULL DEFAULT 0");
+
+ensureColumn("execution_evidence", "error_message", "TEXT");
+
+// AI Crawler: per-page structural component inventory (header/navbar/forms/
+// tables/modals/filters/pagination/cards/footer/...) -- see
+// crawler/componentInventory.ts. Distinct from elements_json (per-clickable-
+// element locator data); this is the page-composition summary shown as its
+// own step before scenario/test-case review.
+ensureColumn("crawl_pages", "component_inventory_json", "TEXT NOT NULL DEFAULT '[]'");
+
+// AI Crawler: which of the three test suites a scenario belongs to --
+// smoke (one core happy path per page/form), functional (edge/negative/
+// boundary/multi-step coverage), or regression (a previously-existing
+// scenario carried forward unchanged because its page didn't change on a
+// re-crawl -- see crawlerService.ts's persistCrawlResult). Existing rows
+// predate this column and default to NULL from ensureColumn's plain ADD
+// COLUMN, so backfill them from `type` with the same smoke/functional split
+// generation-time code now applies, rather than leaving old scenarios
+// uncategorized in the UI.
+ensureColumn("crawl_scenarios", "tier", "TEXT");
+db.prepare("UPDATE crawl_scenarios SET tier = 'functional' WHERE tier IS NULL AND type IN ('negative', 'flow', 'api')").run();
+db.prepare("UPDATE crawl_scenarios SET tier = 'smoke' WHERE tier IS NULL AND type = 'positive'").run();
+// Heuristic classification of *why* a test failed -- 'automation_issue' (the
+// generated script's own locator/timeout, not the product), 'environment_issue'
+// (target unreachable/DNS/connection refused), or 'possible_bug' (an assertion
+// genuinely mismatched real page/API content). Lets the customer-facing bug
+// report distinguish "our script needs fixing" from "your product has a defect"
+// instead of dumping every failure into one undifferentiated list.
+ensureColumn("execution_evidence", "failure_class", "TEXT");
+ensureColumn("execution_evidence", "failure_label", "TEXT");
 
 // Seed a default user per SRS user class (FR-8.1) so RBAC is usable out of the box
 const userCount = (db.prepare("SELECT COUNT(*) as count FROM users").get() as any).count as number;

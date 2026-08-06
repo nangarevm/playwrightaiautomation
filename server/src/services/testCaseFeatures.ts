@@ -491,6 +491,11 @@ export function deleteTestCases(testCaseIds: string[], actorUser: CurrentUser | 
         const runs = db.prepare("SELECT id FROM execution_runs WHERE script_id = ?").all(script.id) as Array<{ id: string }>;
         for (const run of runs) {
           db.prepare("DELETE FROM execution_evidence WHERE run_id = ?").run(run.id);
+          // bug_findings.run_id also FKs to execution_runs (the Bug Detection
+          // Engine's exploratory scan runs automatically after any execution
+          // run whose test case is tagged to a screen) -- same "must go first"
+          // requirement as execution_evidence above.
+          db.prepare("DELETE FROM bug_findings WHERE run_id = ?").run(run.id);
         }
         db.prepare("DELETE FROM execution_runs WHERE script_id = ?").run(script.id);
         try {
