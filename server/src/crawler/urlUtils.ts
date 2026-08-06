@@ -41,35 +41,62 @@ export function originOf(rawUrl: string): string | null {
 }
 
 // Best-effort sitemap seeding so BFS doesn't miss pages only linked from sitemap.xml.
+// Recursively expands sitemap indexes and never returns nested *.xml sitemap URLs
+// as crawl targets (those are indexes, not user-facing pages).
 export async function fetchSitemapUrls(siteUrl: string, maxUrls = 200): Promise<string[]> {
   const origin = originOf(siteUrl);
   if (!origin) return [];
 
   const candidates = [`${origin}/sitemap.xml`, `${origin}/sitemap_index.xml`];
   const found: string[] = [];
+  const visitedSitemaps = new Set<string>();
 
-  for (const sitemapUrl of candidates) {
-    if (found.length >= maxUrls) break;
+  async function ingestSitemap(sitemapUrl: string, depth = 0): Promise<void> {
+    if (depth > 3 || found.length >= maxUrls) return;
+    const key = dedupeKey(sitemapUrl);
+    if (visitedSitemaps.has(key)) return;
+    visitedSitemaps.add(key);
+
     try {
       const res = await fetch(sitemapUrl, { signal: AbortSignal.timeout(8000) });
-      if (!res.ok) continue;
+      if (!res.ok) return;
       const text = await res.text();
       const locMatches = text.matchAll(/<loc>\s*([^<]+)\s*<\/loc>/gi);
       for (const match of locMatches) {
-        const loc = match[1].trim();
-        if (sameOrigin(loc, siteUrl)) found.push(loc);
         if (found.length >= maxUrls) break;
+        const loc = match[1].trim();
+        if (!sameOrigin(loc, siteUrl)) continue;
+        // Nested sitemap index entries -- expand instead of crawling as a page.
+        if (isSitemapUrl(loc)) {
+          await ingestSitemap(loc, depth + 1);
+          continue;
+        }
+        found.push(loc);
       }
     } catch {
       // sitemap is optional -- BFS still works without it
     }
   }
 
+  for (const sitemapUrl of candidates) {
+    if (found.length >= maxUrls) break;
+    await ingestSitemap(sitemapUrl);
+  }
+
   const seen = new Set<string>();
   return found.filter((url) => {
     const key = dedupeKey(url);
-    if (seen.has(key)) return false;
+    if (seen.has(key) || isSitemapUrl(url)) return false;
     seen.add(key);
     return true;
   });
+}
+
+function isSitemapUrl(url: string): boolean {
+  try {
+    const path = new URL(url).pathname.toLowerCase();
+    return path.endsWith(".xml") || /\/sitemap([._-]|$)/i.test(path) || path.endsWith("/sitemap");
+  } catch {
+    return /\.xml$/i.test(url);
+  }
 }

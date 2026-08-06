@@ -32,8 +32,11 @@ function findPageByUrl(siteId: string, url: string): { id: string; url: string }
 }
 
 function loadSiteScenarioFingerprints(siteId: string): Set<string> {
+  // Only flow/API journeys are deduped site-wide. Per-page smoke/regression/
+  // negative/edge baselines must stay even when many pages share a title
+  // (e.g. "SmartAPI" on dozens of docs URLs).
   const rows = db.prepare(
-    "SELECT title, flow_group, type, steps_json FROM crawl_scenarios WHERE site_id = ? AND status = 'active'"
+    "SELECT title, flow_group, type, steps_json FROM crawl_scenarios WHERE site_id = ? AND status = 'active' AND type IN ('flow', 'api')"
   ).all(siteId) as Array<{ title: string; flow_group: string; type: string; steps_json: string }>;
   const fingerprints = new Set<string>();
   for (const row of rows) {
@@ -194,11 +197,12 @@ function mergeScenariosForPage(
       db.prepare(
         "UPDATE crawl_scenarios SET steps_json = ?, locators_json = ?, tier = ?, updated_at = ? WHERE id = ?"
       ).run(JSON.stringify(scenario.steps), JSON.stringify(scenario.locators), scenario.tier, now, prior.id);
-      siteFingerprints.add(fp);
+      if (scenario.type === "flow" || scenario.type === "api") siteFingerprints.add(fp);
       continue;
     }
-    if (siteFingerprints.has(fp)) continue; // duplicate of another page's scenario
-    siteFingerprints.add(fp);
+    // Cross-page skip only for journeys/APIs -- never drop another page's smoke/negative/edge.
+    if ((scenario.type === "flow" || scenario.type === "api") && siteFingerprints.has(fp)) continue;
+    if (scenario.type === "flow" || scenario.type === "api") siteFingerprints.add(fp);
     db.prepare(
       `INSERT INTO crawl_scenarios (id, site_id, page_id, title, type, tier, flow_group, steps_json, locators_json, status, created_at, updated_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)`

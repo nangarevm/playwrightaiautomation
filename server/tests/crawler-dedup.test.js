@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { structureFingerprint, structureMatches } from '../src/crawler/diff.ts';
 import { dedupeKey, fetchSitemapUrls } from '../src/crawler/urlUtils.ts';
 import { dedupeScenarios, dedupeScenariosFuzzy, scenarioFingerprint } from '../src/crawler/scenarioDedup.ts';
+import { buildBaselineCoverageScenarios } from '../src/crawler/scenarios.ts';
 
 test('dedupeKey collapses tracking params and trailing slashes', () => {
   const a = dedupeKey('https://example.com/forum?utm_source=nav');
@@ -86,6 +87,13 @@ test('fetchSitemapUrls returns empty array when sitemap is unreachable', async (
   const urls = await fetchSitemapUrls('https://this-domain-definitely-does-not-exist-12345.example');
   assert.equal(Array.isArray(urls), true);
   assert.equal(urls.length, 0);
+});
+
+test('page-scoped baselines stay unique when titles match across URLs', () => {
+  const a = buildBaselineCoverageScenarios('SmartAPI', [], 'https://example.com/docs/a');
+  const b = buildBaselineCoverageScenarios('SmartAPI', [], 'https://example.com/docs/b');
+  assert.notEqual(a[0].title, b[0].title);
+  assert.notEqual(scenarioFingerprint(a[0]), scenarioFingerprint(b[0]));
 });
 
 test('structureMatches ignores locator differences for incremental re-crawl probes', () => {

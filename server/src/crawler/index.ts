@@ -69,7 +69,7 @@ export async function runCrawl(options: CrawlOptions, getBaseline: BaselineLooku
     let scenarios: ScenarioRecord[] = [];
     let diff: PageDiff | null = null;
     if (changeStatus !== "unchanged") {
-      scenarios = dedupeScenariosFuzzy(buildScenariosForPage(discovered.title, discovered.elements, discovered.formCount));
+      scenarios = dedupeScenariosFuzzy(buildScenariosForPage(discovered.title, discovered.elements, discovered.formCount, discovered.url));
       const crudFlow = buildCrudFlowScenario(discovered.title, discovered.elements);
       if (crudFlow) scenarios.push(crudFlow);
       scenarios = dedupeScenariosFuzzy(scenarios);

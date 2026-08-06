@@ -317,23 +317,35 @@ function groupByComponent(elements: ElementRecord[]): Map<string, ElementRecord[
   return groups;
 }
 
+function pageDisplayName(pageTitle: string, pageUrl?: string): string {
+  if (!pageUrl) return pageTitle;
+  try {
+    const path = new URL(pageUrl).pathname.replace(/\/+$/, "") || "/";
+    if (path !== "/" && !pageTitle.includes(path)) return `${pageTitle} (${path})`;
+  } catch {
+    /* keep title */
+  }
+  return pageTitle;
+}
+
 /** Every discovered page always gets smoke (load) + regression (still works) baselines. */
-export function buildBaselineCoverageScenarios(pageTitle: string, elements: ElementRecord[]): ScenarioRecord[] {
+export function buildBaselineCoverageScenarios(pageTitle: string, elements: ElementRecord[], pageUrl?: string): ScenarioRecord[] {
+  const label = pageDisplayName(pageTitle, pageUrl);
   return [
     makeScenario(
-      `Verify ${pageTitle} loads successfully`,
+      `Verify ${label} loads successfully`,
       "positive",
-      pageTitle,
-      [`Given the user navigates to "${pageTitle}"`, "Then the page loads and its key elements render"],
+      label,
+      [`Given the user navigates to "${label}"`, "Then the page loads and its key elements render"],
       elements.slice(0, 5),
       "smoke"
     ),
     makeScenario(
-      `Regression: verify ${pageTitle} still loads and renders key content`,
+      `Regression: verify ${label} still loads and renders key content`,
       "positive",
-      pageTitle,
+      label,
       [
-        `Given the user navigates to "${pageTitle}"`,
+        `Given the user navigates to "${label}"`,
         "When the page finishes loading",
         "Then key content is visible and the page is not blank or errored",
       ],
@@ -370,8 +382,9 @@ export function buildIntraPageFlowScenario(pageTitle: string, elements: ElementR
 }
 
 /** Guaranteed negative + edge baselines for every discovered page (with or without forms). */
-export function buildNegativeAndEdgeBaselines(pageTitle: string, elements: ElementRecord[]): ScenarioRecord[] {
+export function buildNegativeAndEdgeBaselines(pageTitle: string, elements: ElementRecord[], pageUrl?: string): ScenarioRecord[] {
   const scenarios: ScenarioRecord[] = [];
+  const label = pageDisplayName(pageTitle, pageUrl);
   const inputs = elements.filter((e) => ["input", "textarea", "dropdown", "checkbox"].includes(e.type) && e.label);
   const buttons = elements.filter((e) => e.type === "button" && e.label);
   const links = elements.filter((e) => e.type === "link" && e.label);
@@ -380,11 +393,11 @@ export function buildNegativeAndEdgeBaselines(pageTitle: string, elements: Eleme
   // Negative: bad query string must not crash the page.
   scenarios.push(
     makeScenario(
-      `Verify ${pageTitle} handles an invalid query parameter without crashing`,
+      `Verify ${label} handles an invalid query parameter without crashing`,
       "negative",
-      pageTitle,
+      label,
       [
-        `Given the user opens "${pageTitle}" with an invalid query parameter (e.g. ?id=<<<invalid>>>)`,
+        `Given the user opens "${label}" with an invalid query parameter (e.g. ?id=<<<invalid>>>)`,
         "Then the page shows a controlled error or ignores the parameter — it does not white-screen or throw an uncaught exception",
       ],
       elements.slice(0, 3)
@@ -394,11 +407,11 @@ export function buildNegativeAndEdgeBaselines(pageTitle: string, elements: Eleme
   // Edge: long hash / fragment should still render.
   scenarios.push(
     makeScenario(
-      `Verify ${pageTitle} still renders with a long URL hash fragment`,
+      `Verify ${label} still renders with a long URL hash fragment`,
       "edge",
-      pageTitle,
+      label,
       [
-        `Given the user navigates to "${pageTitle}" with a very long hash fragment`,
+        `Given the user navigates to "${label}" with a very long hash fragment`,
         "Then the page body still renders and key content remains visible",
       ],
       elements.slice(0, 3)
@@ -410,11 +423,11 @@ export function buildNegativeAndEdgeBaselines(pageTitle: string, elements: Eleme
   if (buttons.length > 0 && textInputs.length === 0) {
     scenarios.push(
       makeScenario(
-        `Verify clicking "${buttons[0].label}" without prior input does not crash ${pageTitle}`,
+        `Verify clicking "${buttons[0].label}" without prior input does not crash ${label}`,
         "negative",
-        pageTitle,
+        label,
         [
-          `Given the user is on "${pageTitle}"`,
+          `Given the user is on "${label}"`,
           `When the user clicks "${buttons[0].label}" without filling any fields`,
           "Then the page remains stable (validation, no-op, or safe navigation — not a crash)",
         ],
@@ -427,11 +440,11 @@ export function buildNegativeAndEdgeBaselines(pageTitle: string, elements: Eleme
   if (textInputs.length > 0) {
     scenarios.push(
       makeScenario(
-        `Verify ${pageTitle} remains stable with oversized input in "${textInputs[0].label}"`,
+        `Verify ${label} remains stable with oversized input in "${textInputs[0].label}"`,
         "edge",
-        pageTitle,
+        label,
         [
-          `Given the user is on "${pageTitle}"`,
+          `Given the user is on "${label}"`,
           `When the user enters an extremely long string into "${textInputs[0].label}"`,
           "Then the UI stays responsive and does not crash",
         ],
@@ -444,11 +457,11 @@ export function buildNegativeAndEdgeBaselines(pageTitle: string, elements: Eleme
   if (textInputs.length > 0) {
     scenarios.push(
       makeScenario(
-        `Verify ${pageTitle} safely handles script-like input in "${textInputs[0].label}"`,
+        `Verify ${label} safely handles script-like input in "${textInputs[0].label}"`,
         "negative",
-        pageTitle,
+        label,
         [
-          `Given the user is on "${pageTitle}"`,
+          `Given the user is on "${label}"`,
           `When the user enters script-like characters (<script>alert(1)</script>) into "${textInputs[0].label}"`,
           "Then the input is treated as plain text and no script executes",
         ],
@@ -461,13 +474,13 @@ export function buildNegativeAndEdgeBaselines(pageTitle: string, elements: Eleme
   if (links.length > 0) {
     scenarios.push(
       makeScenario(
-        `Verify browser back works after clicking "${links[0].label}" on ${pageTitle}`,
+        `Verify browser back works after clicking "${links[0].label}" on ${label}`,
         "edge",
-        pageTitle,
+        label,
         [
-          `Given the user is on "${pageTitle}"`,
+          `Given the user is on "${label}"`,
           `When the user clicks "${links[0].label}" and then uses the browser Back button`,
-          `Then the user returns to "${pageTitle}" without errors`,
+          `Then the user returns to "${label}" without errors`,
         ],
         [links[0]]
       )
@@ -477,12 +490,13 @@ export function buildNegativeAndEdgeBaselines(pageTitle: string, elements: Eleme
   return scenarios;
 }
 
-export function buildScenariosForPage(pageTitle: string, elements: ElementRecord[], formCount: number): ScenarioRecord[] {
+export function buildScenariosForPage(pageTitle: string, elements: ElementRecord[], formCount: number, pageUrl?: string): ScenarioRecord[] {
   // Smoke page-load + regression health are required for every discovered page --
   // never skip them just because the page also has forms or clickable elements.
+  const label = pageDisplayName(pageTitle, pageUrl);
   const scenarios: ScenarioRecord[] = [
-    ...buildBaselineCoverageScenarios(pageTitle, elements),
-    ...buildNegativeAndEdgeBaselines(pageTitle, elements),
+    ...buildBaselineCoverageScenarios(pageTitle, elements, pageUrl),
+    ...buildNegativeAndEdgeBaselines(pageTitle, elements, pageUrl),
   ];
 
   if (formCount > 0) {
@@ -498,10 +512,10 @@ export function buildScenariosForPage(pageTitle: string, elements: ElementRecord
   for (const el of standalone.slice(0, MAX_STANDALONE_ELEMENTS)) {
     scenarios.push(
       makeScenario(
-        `Verify clicking "${el.label}" behaves as expected`,
+        `Verify clicking "${el.label}" behaves as expected on ${label}`,
         "positive",
-        pageTitle,
-        [`Given the user is on "${pageTitle}"`, `When the user clicks "${el.label}"`, "Then the expected navigation or response occurs"],
+        label,
+        [`Given the user is on "${label}"`, `When the user clicks "${el.label}"`, "Then the expected navigation or response occurs"],
         [el],
         "functional"
       )

@@ -44,7 +44,9 @@ async function extractLinks(page: import("playwright").Page, baseUrl: string): P
   for (const { href, label } of raw) {
     try {
       const url = new URL(href, baseUrl);
-      url.hash = "";
+      if (url.hash) url.hash = "";
+      // Never queue sitemap/index XML documents as user-facing pages.
+      if (/\.xml$/i.test(url.pathname) || /sitemap/i.test(url.pathname)) continue;
       if (sameOrigin(url.toString(), baseUrl) && !DESTRUCTIVE_ACTION_PATTERN.test(url.pathname)) {
         resolved.push({ url: url.toString(), label: label || url.pathname });
       }
@@ -58,6 +60,45 @@ async function extractLinks(page: import("playwright").Page, baseUrl: string): P
 interface ExtractedLink {
   url: string;
   label: string;
+}
+
+async function dismissConsentOverlays(page: import("playwright").Page): Promise<void> {
+  const candidates = [
+    'button:has-text("Accept")',
+    'button:has-text("Accept all")',
+    'button:has-text("Accept All")',
+    'button:has-text("Agree")',
+    'button:has-text("I agree")',
+    'button:has-text("Got it")',
+    'button:has-text("Allow all")',
+    '[aria-label*="accept" i]',
+    '#onetrust-accept-btn-handler',
+  ];
+  for (const sel of candidates) {
+    const clicked = await page.locator(sel).first().click({ timeout: 800 }).then(() => true).catch(() => false);
+    if (clicked) {
+      await page.waitForTimeout(300);
+      break;
+    }
+  }
+}
+
+/** When interactive locator scan is empty/sparse, promote discovered <a> links into ElementRecords. */
+function mergeLinkElements(elements: ElementRecord[], links: ExtractedLink[]): ElementRecord[] {
+  const existingLabels = new Set(elements.filter((e) => e.type === "link").map((e) => e.label.toLowerCase()));
+  const extras: ElementRecord[] = [];
+  for (const link of links.slice(0, 40)) {
+    const label = (link.label || link.url).replace(/\s+/g, " ").trim().slice(0, 80);
+    if (!label || existingLabels.has(label.toLowerCase())) continue;
+    existingLabels.add(label.toLowerCase());
+    extras.push({
+      type: "link",
+      label,
+      locators: [`page.getByRole('link', { name: ${JSON.stringify(label)} })`],
+      component: "Nav",
+    });
+  }
+  return extras.length ? [...elements, ...extras] : elements;
 }
 
 async function simplePool<T>(items: T[], size: number, worker: (item: T) => Promise<void>): Promise<void> {
@@ -146,12 +187,20 @@ export async function runDiscoveryCrawl(options: CrawlOptions): Promise<{ pages:
       const discoveredLinksThisBatch: ExtractedLink[] = [];
 
       await simplePool(batch, concurrency, async (targetUrl) => {
+        // Defensive: sitemap XML should never be treated as a page (older queues / bad seeds).
+        if (/\.xml$/i.test(targetUrl) || /sitemap/i.test(new URL(targetUrl).pathname)) {
+          return;
+        }
         const page = await context.newPage();
         const capture = options.captureApi ? attachNetworkCapture(page) : null;
         try {
-          await page.goto(targetUrl, { waitUntil: "networkidle", timeout: 20000 }).catch(async () => {
-            await page.goto(targetUrl, { waitUntil: "domcontentloaded", timeout: 20000 });
+          await page.goto(targetUrl, { waitUntil: "domcontentloaded", timeout: 25000 }).catch(async () => {
+            await page.goto(targetUrl, { waitUntil: "load", timeout: 25000 });
           });
+          // Give SPAs a moment to hydrate; networkidle is too strict on analytics-heavy sites.
+          await page.waitForLoadState("networkidle", { timeout: 8000 }).catch(() => undefined);
+          await page.waitForTimeout(600);
+          await dismissConsentOverlays(page);
 
           const title = (await page.title().catch(() => "")) || new URL(targetUrl).pathname || targetUrl;
           options.onProgress?.({ pagesDiscovered: results.length, formsDiscovered: formsDiscoveredTotal, scenariosDiscovered: 0, currentPage: targetUrl });
@@ -184,6 +233,11 @@ export async function runDiscoveryCrawl(options: CrawlOptions): Promise<{ pages:
             componentInventory = await collectComponentInventory(page);
           }
 
+          const links = await extractLinks(page, normalizedUrl);
+          // If locator extraction found almost nothing (blocked SPA / delayed render),
+          // still seed link/button elements from the href inventory so scenarios aren't empty.
+          elements = mergeLinkElements(elements, links);
+
           formsDiscoveredTotal += formCount;
 
           const currentUrl = page.url();
@@ -192,7 +246,6 @@ export async function runDiscoveryCrawl(options: CrawlOptions): Promise<{ pages:
             edges.push({ from: targetUrl, to: currentUrl, via: "navigation" });
           }
 
-          const links = await extractLinks(page, normalizedUrl);
           discoveredLinksThisBatch.push(...links);
           for (const link of links) edges.push({ from: currentUrl, to: link.url, via: link.label });
 

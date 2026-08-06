@@ -36,30 +36,42 @@ function guessComponentName(el: {
 }
 
 export async function extractElementLocators(page: Page, handle: Locator): Promise<RankedLocators | null> {
+  // IMPORTANT: keep this evaluate callback free of nested function declarations.
+  // tsx/esbuild injects `__name(...)` helpers for named/local functions, and those
+  // helpers do not exist in the browser context -- which previously made every
+  // locator extraction fail with "ReferenceError: __name is not defined" and left
+  // crawl pages with zero elements/forms.
   const info = await handle.evaluate((node: Element) => {
     const el = node as HTMLElement;
     const tag = el.tagName.toLowerCase();
     const testId = el.getAttribute("data-testid") || el.getAttribute("data-test") || el.getAttribute("data-qa");
-    const role = el.getAttribute("role") || (tag === "button" ? "button" : tag === "a" ? "link" : tag === "input" ? (el.getAttribute("type") === "checkbox" ? "checkbox" : "textbox") : tag === "select" ? "combobox" : null);
+    const role =
+      el.getAttribute("role") ||
+      (tag === "button"
+        ? "button"
+        : tag === "a"
+          ? "link"
+          : tag === "input"
+            ? el.getAttribute("type") === "checkbox"
+              ? "checkbox"
+              : "textbox"
+            : tag === "select"
+              ? "combobox"
+              : null);
     const id = el.id || null;
-    // Multi-line/wrapped element text (e.g. a button label that wraps across
-    // lines in the DOM) carries literal newlines/tabs in textContent -- .trim()
-    // only strips the ends, not internal whitespace. Collapsing to single spaces
-    // here (not just at codegen time) keeps every downstream consumer of this
-    // label -- scenario titles/steps, generated code comments -- newline-free.
-    const collapseWhitespace = (s: string) => s.replace(/\s+/g, " ").trim();
-    const text = collapseWhitespace(el.textContent || "").slice(0, 60);
+    // Collapse multi-line/wrapped element text so scenario titles/steps stay single-line.
+    const text = (el.textContent || "").replace(/\s+/g, " ").trim().slice(0, 60);
     const ariaLabel = el.getAttribute("aria-label");
     const placeholder = el.getAttribute("placeholder");
 
     let labelText: string | null = null;
     if (id) {
       const labelEl = document.querySelector(`label[for="${CSS.escape(id)}"]`);
-      if (labelEl) labelText = collapseWhitespace(labelEl.textContent || "");
+      if (labelEl) labelText = (labelEl.textContent || "").replace(/\s+/g, " ").trim();
     }
     if (!labelText) {
       const closestLabel = el.closest("label");
-      if (closestLabel) labelText = collapseWhitespace(closestLabel.textContent || "");
+      if (closestLabel) labelText = (closestLabel.textContent || "").replace(/\s+/g, " ").trim();
     }
 
     const accessibleName = ariaLabel || labelText || text || placeholder || null;
@@ -68,7 +80,7 @@ export async function extractElementLocators(page: Page, handle: Locator): Promi
     const closestFormLabel =
       closestForm?.getAttribute("aria-label") ||
       closestForm?.getAttribute("name") ||
-      collapseWhitespace(closestForm?.querySelector("h1,h2,h3,legend")?.textContent || "") ||
+      (closestForm?.querySelector("h1,h2,h3,legend")?.textContent || "").replace(/\s+/g, " ").trim() ||
       (closestForm ? "Form" : null);
 
     const closestSection = el.closest("[role='navigation'], nav, header, footer, section, [aria-label]");
