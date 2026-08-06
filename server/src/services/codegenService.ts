@@ -8,6 +8,8 @@ import { sanitizeForLlm } from "./safetyService.js";
 import { commitGeneratedScriptToGit } from "./integrationsService.js";
 import { withLlmGateway } from "./llmGatewayService.js";
 import { tagScriptToScreen } from "./screensService.js";
+import { getDefaultScriptLanguage } from "../llm/modelConfig.js";
+import type { ScriptLanguage } from "../llm/modelConfig.js";
 
 interface GeneratedArtifactRecord {
   language: string;
@@ -119,7 +121,10 @@ ${sharedSteps.map((s) => `  // ${s}`).join("\n")}
   return filePath;
 }
 
-export async function generateAutomationScript(testCaseId: string, options: { framework?: "playwright" | "selenium" | "cypress" } = {}) {
+export async function generateAutomationScript(
+  testCaseId: string,
+  options: { framework?: "playwright" | "selenium" | "cypress"; language?: ScriptLanguage } = {}
+) {
   const tc = db.prepare("SELECT * FROM test_cases WHERE id = ?").get(testCaseId) as any;
   if (!tc) throw new Error("Test case not found");
   if (tc.status !== "accepted" && tc.status !== "edited") {
@@ -136,43 +141,37 @@ export async function generateAutomationScript(testCaseId: string, options: { fr
     category: tc.category,
   };
 
-  // FR-3.2: optional Selenium/Cypress export, in addition to the default Playwright trio
-  const requestedFramework = options.framework;
+  // FR-3.2: optional Selenium/Cypress export; default Playwright in one language per LLM call.
+  const requestedFramework = options.framework ?? "playwright";
+  const language = options.language ?? getDefaultScriptLanguage();
 
   // FR-9.5/9.6/9.7: route script generation through the same LLM gateway test-case
-  // generation already uses. This matters specifically for the AI Crawler: its scenario
-  // templates ("Submit X with only Y empty", "Upload a <format> file to Z") repeat across
-  // every field/form/environment it discovers, and re-crawling a staging vs. prod copy of
-  // the same app (or the same field template on many forms) produces near-identical
-  // title+steps text -- a semantic cache hit skips the LLM call entirely (0 tokens) instead
-  // of re-generating essentially the same script. Previously this call bypassed the gateway
-  // entirely (see logScriptGenerationUsage's old comment: "no semantic cache/compression"),
-  // which was true for one-off manual test cases but leaves real savings on the table for
-  // the crawler's naturally repetitive, template-driven output.
-  const cacheKey = sanitizedTestCase.title + " " + sanitizedTestCase.steps.join(" ");
+  // generation already uses. Cache key includes language/framework so different
+  // export targets never share the same cached script.
+  const cacheKey = [sanitizedTestCase.title, ...sanitizedTestCase.steps, language, requestedFramework].join(" ");
   type Artifact = { language: string; framework: string; code: string; fileName: string };
   const artifacts = await withLlmGateway<Artifact[]>(
     "script_generation",
     { inputId: tc.id, provider: llm.name, prompt: cacheKey, category: sanitizedTestCase.category },
-    async () => {
-      let result: Artifact[];
-      if (requestedFramework && requestedFramework !== "playwright") {
-        result = [{
-          language: "javascript",
-          framework: requestedFramework,
-          code: await llm.generatePlaywrightScript(sanitizedTestCase, { language: "javascript", framework: requestedFramework }),
-          fileName: `${tc.id}.${requestedFramework === "cypress" ? "cy.js" : "selenium.js"}`,
-        }];
-      } else {
-        const rawArtifacts = await llm.generateAutomationArtifacts?.(sanitizedTestCase, { apiSpecHint: tc.source_rationale }) ?? [];
-        result = rawArtifacts.length > 0 ? rawArtifacts : [{
-          language: "typescript",
-          framework: "playwright",
-          code: await llm.generatePlaywrightScript(sanitizedTestCase, { language: "typescript", framework: "playwright" }),
-          fileName: `${tc.id}.spec.ts`,
-        }];
-      }
-      return { result, outputText: result.map((a) => a.code).join("\n") };
+    async (_preparedPrompt, tier) => {
+      const code = await llm.generatePlaywrightScript(sanitizedTestCase, {
+        tier,
+        language,
+        framework: requestedFramework,
+        apiSpecHint: tc.source_rationale,
+      });
+      const fileName =
+        requestedFramework === "cypress"
+          ? `${tc.id}.cy.js`
+          : requestedFramework === "selenium"
+            ? `${tc.id}.selenium.js`
+            : language === "python"
+              ? `${tc.id}.py`
+              : language === "javascript"
+                ? `${tc.id}.spec.js`
+                : `${tc.id}.spec.ts`;
+      const result: Artifact[] = [{ language, framework: requestedFramework, code, fileName }];
+      return { result, outputText: code };
     }
   );
 

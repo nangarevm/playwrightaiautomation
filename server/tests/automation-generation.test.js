@@ -22,7 +22,7 @@ function resetData() {
   db.prepare('DELETE FROM inputs').run();
 }
 
-test('generateAutomationScript persists multiple automation artifacts and scans them', async () => {
+test('generateAutomationScript persists one automation artifact per request and scans it', async () => {
   resetData();
 
   const inputId = 'input-automation';
@@ -56,17 +56,54 @@ test('generateAutomationScript persists multiple automation artifacts and scans 
   );
 
   const result = await generateAutomationScript(testCaseId);
-  assert.ok(result.artifacts.length >= 2);
+  assert.equal(result.artifacts.length, 1);
 
   const rows = db.prepare('SELECT * FROM automation_scripts WHERE test_case_id = ? ORDER BY language').all(testCaseId);
-  assert.equal(rows.length, result.artifacts.length);
+  assert.equal(rows.length, 1);
   assert.ok(rows.every((row) => row.security_scan_status === 'passed'));
-  assert.ok(rows.some((row) => row.language === 'typescript'));
-  assert.ok(rows.some((row) => row.language === 'python'));
+  assert.equal(rows[0].language, 'typescript');
 
   const files = fs.readdirSync(generatedDir);
   assert.ok(files.some((file) => file.endsWith('.spec.ts')));
-  assert.ok(files.some((file) => file.endsWith('.py')));
+});
+
+test('generateAutomationScript can target a specific language in a single LLM call', async () => {
+  resetData();
+
+  const inputId = 'input-python';
+  db.prepare('INSERT INTO inputs (id, type, content, created_at) VALUES (?, ?, ?, ?)').run(
+    inputId,
+    'manual',
+    'Login workflow',
+    new Date().toISOString()
+  );
+
+  const testCaseId = 'tc-python';
+  db.prepare(`
+    INSERT INTO test_cases (
+      id, input_id, title, category, steps, expected_result, confidence_score,
+      source_rationale, status, authorship_type, version, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    testCaseId,
+    inputId,
+    'Login succeeds with valid credentials',
+    'Smoke',
+    JSON.stringify(['Open login page', 'Enter credentials', 'Submit form']),
+    'Welcome screen appears',
+    0.95,
+    'Mock provider',
+    'accepted',
+    'ai',
+    1,
+    new Date().toISOString(),
+    new Date().toISOString()
+  );
+
+  const result = await generateAutomationScript(testCaseId, { language: 'python' });
+  assert.equal(result.artifacts.length, 1);
+  assert.equal(result.artifacts[0].language, 'python');
+  assert.ok(result.artifacts[0].fileName.endsWith('.py'));
 });
 
 // SR-FR-3.4: locator strategy must be recorded as a queryable column, not just an

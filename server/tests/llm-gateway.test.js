@@ -7,7 +7,10 @@ import {
   withLlmGateway,
   logScriptGenerationUsage,
   getLlmUsageSummary,
+  truncateLargeInput,
+  preparePromptForLlm,
 } from '../src/services/llmGatewayService.ts';
+import { getModelForTier } from '../src/llm/modelConfig.ts';
 
 function resetUsage() {
   db.prepare('DELETE FROM llm_usage_log').run();
@@ -32,6 +35,46 @@ test('compressPrompt leaves small inputs untouched', () => {
   const { compressed, wasCompressed } = compressPrompt(small);
   assert.equal(wasCompressed, false);
   assert.equal(compressed, small);
+});
+
+test('truncateLargeInput keeps head and tail while dropping the middle bulk', () => {
+  const head = 'SECTION A: '.repeat(200);
+  const middle = 'MIDDLE FILLER '.repeat(500);
+  const tail = 'SECTION Z: '.repeat(200);
+  const huge = head + middle + tail;
+
+  const { truncated, wasTruncated } = truncateLargeInput(huge, 4000);
+  assert.equal(wasTruncated, true);
+  assert.ok(truncated.length < huge.length);
+  assert.ok(truncated.length <= 4000);
+  assert.ok(truncated.startsWith(head.slice(0, 100)));
+  assert.ok(truncated.includes('omitted'));
+  assert.ok(truncated.endsWith(tail.slice(-100)));
+});
+
+test('preparePromptForLlm truncates then compresses large document-like inputs', () => {
+  const line = 'Requirement: the checkout page must validate promo codes before submit.';
+  const huge = Array.from({ length: 800 }, (_, i) => `${line} #${i}`).join('\n');
+  const { prepared, wasTruncated, wasCompressed } = preparePromptForLlm(huge);
+  assert.equal(wasTruncated, true);
+  assert.ok(prepared.length < huge.length);
+  assert.ok(wasCompressed || wasTruncated);
+});
+
+test('getModelForTier maps economy and primary to distinct configurable models', () => {
+  const prevPrimary = process.env.LLM_MODEL_PRIMARY;
+  const prevEconomy = process.env.LLM_MODEL_ECONOMY;
+  process.env.LLM_MODEL_PRIMARY = 'claude-sonnet-test';
+  process.env.LLM_MODEL_ECONOMY = 'claude-haiku-test';
+  try {
+    assert.equal(getModelForTier('primary'), 'claude-sonnet-test');
+    assert.equal(getModelForTier('economy'), 'claude-haiku-test');
+  } finally {
+    if (prevPrimary === undefined) delete process.env.LLM_MODEL_PRIMARY;
+    else process.env.LLM_MODEL_PRIMARY = prevPrimary;
+    if (prevEconomy === undefined) delete process.env.LLM_MODEL_ECONOMY;
+    else process.env.LLM_MODEL_ECONOMY = prevEconomy;
+  }
 });
 
 // FR-9.7: simpler generation tasks route to the lower-cost model tier. The

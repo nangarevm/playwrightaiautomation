@@ -5,7 +5,7 @@ import { AutomationArtifacts, GeneratedTestCase, LlmProvider } from "./types.js"
 export const mockProvider: LlmProvider = {
   name: "mock",
 
-  async generateTestCases(inputText: string): Promise<GeneratedTestCase[]> {
+  async generateTestCases(inputText: string, _options?: { tier?: "primary" | "economy" }): Promise<GeneratedTestCase[]> {
     const lower = inputText.toLowerCase();
     const isLogin = lower.includes("login") || lower.includes("log in") || lower.includes("sign in");
 

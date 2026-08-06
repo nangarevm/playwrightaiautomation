@@ -17,9 +17,11 @@
 
 import { nanoid } from "nanoid";
 import { db } from "../db.js";
+import type { ModelTier } from "../llm/modelConfig.js";
+import { getMaxInputChars } from "../llm/modelConfig.js";
 
+export type { ModelTier } from "../llm/modelConfig.js";
 export type LlmCallType = "test_case_generation" | "script_generation";
-export type ModelTier = "primary" | "economy";
 
 // $/MTok, matching the SRS 13.5 worked example (Claude Sonnet 5 introductory
 // pricing) for the primary tier; the economy tier models a materially cheaper
@@ -49,6 +51,37 @@ const CACHE_SIMILARITY_THRESHOLD: Record<LlmCallType, number> = {
 };
 const CACHE_MAX_ENTRIES = 200;
 const COMPRESSION_TRIGGER_CHARS = 1200; // only compress inputs large enough for it to matter (FR-9.6: "large inputs")
+
+const TRUNCATION_MARKER = (omitted: number) =>
+  `\n\n[... ${omitted} characters omitted to stay within the LLM input budget; beginning and end preserved ...]\n\n`;
+
+// FR-9.6 extension: very large document inputs are head/tail-truncated before
+// compression and submission. Keeps the start (context/title) and end (recent
+// requirements) while dropping the middle bulk that blows up token count.
+export function truncateLargeInput(
+  text: string,
+  maxChars: number = getMaxInputChars()
+): { truncated: string; wasTruncated: boolean } {
+  if (text.length <= maxChars) return { truncated: text, wasTruncated: false };
+
+  const marker = TRUNCATION_MARKER(text.length - maxChars);
+  const bodyBudget = maxChars - marker.length;
+  const headLen = Math.floor(bodyBudget * 0.7);
+  const tailLen = bodyBudget - headLen;
+  const truncated = text.slice(0, headLen) + marker + text.slice(text.length - tailLen);
+  return { truncated, wasTruncated: true };
+}
+
+// Full pre-gateway pipeline: truncate oversized inputs, then dedupe/compress lines.
+export function preparePromptForLlm(text: string): {
+  prepared: string;
+  wasTruncated: boolean;
+  wasCompressed: boolean;
+} {
+  const { truncated, wasTruncated } = truncateLargeInput(text);
+  const { compressed, wasCompressed } = compressPrompt(truncated);
+  return { prepared: compressed, wasTruncated, wasCompressed: wasCompressed || wasTruncated };
+}
 
 interface CacheEntry<T> {
   callType: LlmCallType;
@@ -204,18 +237,16 @@ function logUsage(entry: UsageLogInput) {
 export async function withLlmGateway<T>(
   callType: LlmCallType,
   opts: { inputId?: string | null; provider: string; prompt: string; category?: string; failoverUsed?: boolean; onCompressionResolved?: (wasCompressed: boolean) => void },
-  run: (compressedPrompt: string, tier: ModelTier) => Promise<{ result: T; outputText: string }>
+  run: (preparedPrompt: string, tier: ModelTier) => Promise<{ result: T; outputText: string }>
 ): Promise<T> {
   const inputTokensBefore = estimateTokens(opts.prompt);
-  const { compressed, wasCompressed } = compressPrompt(opts.prompt);
-  // FR-9.6: let the caller (e.g. test-case generation) tag its own output records with
-  // whether compression was applied, so downstream accuracy measurement can compare
-  // compressed vs. uncompressed origin using real review data.
-  opts.onCompressionResolved?.(wasCompressed);
-  const inputTokensAfter = estimateTokens(compressed);
-  const tier = chooseModelTier(compressed, opts.category);
+  const { prepared, wasTruncated, wasCompressed } = preparePromptForLlm(opts.prompt);
+  // FR-9.6: let the caller tag output records when any input-shrinking ran.
+  opts.onCompressionResolved?.(wasCompressed || wasTruncated);
+  const inputTokensAfter = estimateTokens(prepared);
+  const tier = chooseModelTier(prepared, opts.category);
 
-  const cached = findCacheHit<T>(callType, compressed);
+  const cached = findCacheHit<T>(callType, prepared);
   if (cached !== null) {
     logUsage({
       callType,
@@ -223,7 +254,7 @@ export async function withLlmGateway<T>(
       provider: opts.provider,
       modelTier: tier,
       cacheHit: true,
-      compressed: wasCompressed,
+      compressed: wasCompressed || wasTruncated,
       failoverUsed: opts.failoverUsed ?? false,
       inputTokensBefore,
       inputTokensAfter,
@@ -232,7 +263,7 @@ export async function withLlmGateway<T>(
     return cached;
   }
 
-  const { result, outputText } = await run(compressed, tier);
+  const { result, outputText } = await run(prepared, tier);
 
   logUsage({
     callType,
@@ -240,14 +271,14 @@ export async function withLlmGateway<T>(
     provider: opts.provider,
     modelTier: tier,
     cacheHit: false,
-    compressed: wasCompressed,
+    compressed: wasCompressed || wasTruncated,
     failoverUsed: opts.failoverUsed ?? false,
     inputTokensBefore,
     inputTokensAfter,
     outputTokens: estimateTokens(outputText),
   });
 
-  storeInCache(callType, compressed, result);
+  storeInCache(callType, prepared, result);
   return result;
 }
 

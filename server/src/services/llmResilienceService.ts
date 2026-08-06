@@ -9,6 +9,7 @@ import { db } from "../db.js";
 import { llm } from "../llm/index.js";
 import { mockProvider } from "../llm/mockProvider.js";
 import { GeneratedTestCase } from "../llm/types.js";
+import type { ModelTier } from "../llm/modelConfig.js";
 
 const MAX_ATTEMPTS = 3;
 const BACKOFF_MS = [200, 500, 1200];
@@ -51,14 +52,15 @@ function isRetryable(err: any): boolean {
 
 export async function generateTestCasesWithDegradedMode(
   inputId: string,
-  prompt: string
+  prompt: string,
+  tier: ModelTier = "primary"
 ): Promise<{ cases: GeneratedTestCase[]; failoverUsed: boolean }> {
   db.prepare("UPDATE inputs SET generation_status = 'pending' WHERE id = ?").run(inputId);
 
   let lastError: any = null;
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     try {
-      const cases = await llm.generateTestCases(prompt);
+      const cases = await llm.generateTestCases(prompt, { tier });
       db.prepare(
         "UPDATE inputs SET generation_status = 'completed', generation_attempts = ?, generation_last_error = NULL WHERE id = ?"
       ).run(attempt, inputId);
@@ -83,7 +85,7 @@ export async function generateTestCasesWithDegradedMode(
   // fail over to the secondary provider rather than immediately giving up.
   if (hasSecondaryProvider) {
     try {
-      const cases = await mockProvider.generateTestCases(prompt);
+      const cases = await mockProvider.generateTestCases(prompt, { tier: "economy" });
       logFailoverEvent(inputId, lastError?.message ?? "unknown error");
       db.prepare(
         "UPDATE inputs SET generation_status = 'completed', generation_attempts = ?, generation_last_error = ? WHERE id = ?"

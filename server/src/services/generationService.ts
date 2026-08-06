@@ -30,8 +30,8 @@ export async function generateTestCasesForInput(inputId: string, inputText: stri
   const cases = await withLlmGateway<GeneratedTestCase[]>(
     "test_case_generation",
     { inputId, provider: llm.name, prompt, onCompressionResolved: (v) => { wasCompressed = v; } },
-    async (compressedPrompt) => {
-      const { cases: result } = await generateTestCasesWithDegradedMode(inputId, compressedPrompt);
+    async (preparedPrompt, tier) => {
+      const { cases: result } = await generateTestCasesWithDegradedMode(inputId, preparedPrompt, tier);
       return { result, outputText: JSON.stringify(result) };
     }
   );
@@ -100,8 +100,8 @@ export async function regenerateTestCase(testCaseId: string) {
   const candidates = await withLlmGateway<GeneratedTestCase[]>(
     "test_case_generation",
     { inputId: existing.input_id, provider: llm.name, prompt, category: existing.category, onCompressionResolved: (v) => { wasCompressed = v; } },
-    async (compressedPrompt) => {
-      const { cases: result } = await generateTestCasesWithDegradedMode(existing.input_id, compressedPrompt);
+    async (preparedPrompt, tier) => {
+      const { cases: result } = await generateTestCasesWithDegradedMode(existing.input_id, preparedPrompt, tier);
       return { result, outputText: JSON.stringify(result) };
     }
   );
