@@ -44,9 +44,23 @@ export function diffElements(before: ElementRecord[], after: ElementRecord[]): P
   return { added, removed, changed };
 }
 
-export type ChangeStatus = "new" | "changed" | "unchanged";
+export type ChangeStatus = "new" | "changed" | "unchanged" | "removed";
 
 export function classifyChange(previousHash: string | null | undefined, currentHash: string): ChangeStatus {
   if (!previousHash) return "new";
   return previousHash === currentHash ? "unchanged" : "changed";
+}
+
+// Structure-only fingerprint (type + label) -- ignores locator churn so a
+// re-crawl can decide "this page is still the same form" before spending time
+// on exploratory clicks. Used by incremental discovery short-circuit.
+export function structureFingerprint(elements: ElementRecord[]): string {
+  const structural = elements
+    .map((e) => `${e.type}|${e.label}`)
+    .sort();
+  return crypto.createHash("sha256").update(JSON.stringify(structural)).digest("hex");
+}
+
+export function structureMatches(a: ElementRecord[], b: ElementRecord[]): boolean {
+  return structureFingerprint(a) === structureFingerprint(b);
 }

@@ -8,18 +8,45 @@ import { nanoid } from "nanoid";
 import { db } from "../db.js";
 import { runCrawl, type CrawlRunOutput } from "../crawler/index.js";
 import type { ElementRecord } from "../crawler/types.js";
+import { scenarioFingerprint } from "../crawler/scenarioDedup.js";
+import { dedupeKey, normalizeUrl } from "../crawler/urlUtils.js";
 import { catalogScreen } from "./screensService.js";
 import { generateAutomationScript } from "./codegenService.js";
 import { logAudit } from "./adminService.js";
+import { runPostCrawlBugScan } from "./bugDetectionService.js";
 
-function normalizeUrl(raw: string): string {
-  return /^https?:\/\//i.test(raw) ? raw : `https://${raw}`;
+function normalizeUrlLocal(raw: string): string {
+  return normalizeUrl(raw);
 }
 
 // FR-8: repeat visits auto-detect a known site and switch to diff mode --
 // no manual toggle required by the caller.
 export function findSiteByUrl(url: string) {
-  return db.prepare("SELECT * FROM crawl_sites WHERE url = ?").get(normalizeUrl(url)) as any;
+  return db.prepare("SELECT * FROM crawl_sites WHERE url = ?").get(normalizeUrlLocal(url)) as any;
+}
+
+function findPageByUrl(siteId: string, url: string): { id: string; url: string } | undefined {
+  const key = dedupeKey(url);
+  const pages = db.prepare("SELECT id, url FROM crawl_pages WHERE site_id = ?").all(siteId) as Array<{ id: string; url: string }>;
+  return pages.find((p) => dedupeKey(p.url) === key);
+}
+
+function loadSiteScenarioFingerprints(siteId: string): Set<string> {
+  const rows = db.prepare(
+    "SELECT title, flow_group, type, steps_json FROM crawl_scenarios WHERE site_id = ? AND status = 'active'"
+  ).all(siteId) as Array<{ title: string; flow_group: string; type: string; steps_json: string }>;
+  const fingerprints = new Set<string>();
+  for (const row of rows) {
+    fingerprints.add(
+      scenarioFingerprint({
+        title: row.title,
+        flowGroup: row.flow_group,
+        type: row.type,
+        steps: JSON.parse(row.steps_json),
+      })
+    );
+  }
+  return fingerprints;
 }
 
 export function listSites() {
@@ -30,22 +57,31 @@ export function getSite(siteId: string) {
   return db.prepare("SELECT * FROM crawl_sites WHERE id = ?").get(siteId) as any;
 }
 
-function upsertSiteRow(url: string, captureApi: boolean): { site: any; isRerun: boolean } {
-  const normalized = normalizeUrl(url);
+function upsertSiteRow(url: string, captureApi: boolean, mode: "incremental" | "full"): { site: any; isRerun: boolean } {
+  const normalized = normalizeUrlLocal(url);
   const existing = findSiteByUrl(normalized);
   const now = new Date().toISOString();
   if (existing) {
+    if (existing.status === "running") {
+      throw new Error("A crawl is already running for this site. Wait for it to finish or retry later.");
+    }
     db.prepare(
-      "UPDATE crawl_sites SET status = 'running', current_page = NULL, error = NULL, is_rerun = 1, capture_api = ? WHERE id = ?"
-    ).run(captureApi ? 1 : 0, existing.id);
+      "UPDATE crawl_sites SET status = 'running', current_page = NULL, error = NULL, is_rerun = 1, capture_api = ?, crawl_mode = ? WHERE id = ?"
+    ).run(captureApi ? 1 : 0, mode, existing.id);
     return { site: getSite(existing.id), isRerun: true };
   }
   const id = nanoid(10);
   db.prepare(
-    `INSERT INTO crawl_sites (id, url, status, pages_discovered, forms_discovered, scenarios_discovered, is_rerun, capture_api, created_at)
-     VALUES (?, ?, 'running', 0, 0, 0, 0, ?, ?)`
-  ).run(id, normalized, captureApi ? 1 : 0, now);
+    `INSERT INTO crawl_sites (id, url, status, pages_discovered, forms_discovered, scenarios_discovered, is_rerun, capture_api, crawl_mode, created_at)
+     VALUES (?, ?, 'running', 0, 0, 0, 0, ?, ?, ?)`
+  ).run(id, normalized, captureApi ? 1 : 0, mode, now);
   return { site: getSite(id), isRerun: false };
+}
+
+function knownUrlsForSite(siteId: string): string[] {
+  return (db.prepare("SELECT url FROM crawl_pages WHERE site_id = ? AND change_status != 'removed'").all(siteId) as Array<{ url: string }>).map(
+    (r) => r.url
+  );
 }
 
 // Runs the crawl to completion and persists everything. Callers (the route)
@@ -59,12 +95,18 @@ export async function startCrawl(params: {
   maxPages?: number;
   captureApi?: boolean;
   concurrency?: number;
-}): Promise<{ siteId: string; isRerun: boolean }> {
-  const { site, isRerun } = upsertSiteRow(params.url, Boolean(params.captureApi));
+  /** incremental (default on re-run) skips deep interaction for unchanged pages; full always deep-scans. */
+  mode?: "incremental" | "full";
+}): Promise<{ siteId: string; isRerun: boolean; mode: "incremental" | "full" }> {
+  const existing = findSiteByUrl(params.url);
+  const mode: "incremental" | "full" = params.mode ?? (existing ? "incremental" : "full");
+  const { site, isRerun } = upsertSiteRow(params.url, Boolean(params.captureApi), mode);
   const siteId = site.id;
 
   const getBaseline = (url: string): { hash: string; elements: ElementRecord[] } | null => {
-    const row = db.prepare("SELECT dom_hash, elements_json FROM crawl_pages WHERE site_id = ? AND url = ?").get(siteId, url) as any;
+    const page = findPageByUrl(siteId, url);
+    if (!page) return null;
+    const row = db.prepare("SELECT dom_hash, elements_json FROM crawl_pages WHERE id = ?").get(page.id) as any;
     if (!row || !row.dom_hash) return null;
     return { hash: row.dom_hash, elements: JSON.parse(row.elements_json) };
   };
@@ -77,6 +119,8 @@ export async function startCrawl(params: {
       maxPages: params.maxPages,
       captureApi: params.captureApi,
       concurrency: params.concurrency,
+      mode,
+      knownUrls: isRerun ? knownUrlsForSite(siteId) : [],
       onProgress: (p) => {
         db.prepare("UPDATE crawl_sites SET pages_discovered = ?, forms_discovered = ?, current_page = ? WHERE id = ?").run(
           p.pagesDiscovered,
@@ -88,12 +132,91 @@ export async function startCrawl(params: {
     },
     getBaseline
   )
-    .then((result) => persistCrawlResult(siteId, result, isRerun))
+    .then((result) => {
+      const summary = persistCrawlResult(siteId, result, isRerun);
+      // On re-crawl, only scan pages that are new or changed -- unchanged pages were
+      // already scanned (or unchanged) and re-scanning every page is wasteful.
+      const scanStatuses = isRerun ? (["new", "changed"] as const) : undefined;
+      runPostCrawlBugScan(siteId, { changeStatuses: scanStatuses ? [...scanStatuses] : undefined }).catch((err) => {
+        console.warn(`[crawler] post-crawl bug scan failed for site ${siteId}: ${err?.message ?? err}`);
+      });
+      return summary;
+    })
     .catch((err: any) => {
       db.prepare("UPDATE crawl_sites SET status = 'failed', error = ? WHERE id = ?").run(err.message || String(err), siteId);
     });
 
-  return { siteId, isRerun };
+  return { siteId, isRerun, mode };
+}
+
+function mergeScenariosForPage(
+  siteId: string,
+  pageId: string,
+  incoming: Array<{ id: string; title: string; type: string; tier: string; flowGroup: string; steps: string[]; locators: string[] }>,
+  siteFingerprints: Set<string>,
+  now: string
+) {
+  const existing = db.prepare(
+    "SELECT id, title, type, flow_group, steps_json, locators_json, generated_test_case_id, status FROM crawl_scenarios WHERE page_id = ? AND status = 'active'"
+  ).all(pageId) as Array<{
+    id: string;
+    title: string;
+    type: string;
+    flow_group: string;
+    steps_json: string;
+    locators_json: string;
+    generated_test_case_id: string | null;
+    status: string;
+  }>;
+
+  const existingByFp = new Map<string, (typeof existing)[0]>();
+  for (const row of existing) {
+    const fp = scenarioFingerprint({
+      title: row.title,
+      flowGroup: row.flow_group,
+      type: row.type,
+      steps: JSON.parse(row.steps_json),
+    });
+    existingByFp.set(fp, row);
+  }
+
+  const keptFps = new Set<string>();
+  for (const scenario of incoming) {
+    const fp = scenarioFingerprint(scenario);
+    keptFps.add(fp);
+    const prior = existingByFp.get(fp);
+    if (prior) {
+      // Same scenario still present -- refresh locators/steps in place (keeps generated_test_case_id).
+      db.prepare(
+        "UPDATE crawl_scenarios SET steps_json = ?, locators_json = ?, tier = ?, updated_at = ? WHERE id = ?"
+      ).run(JSON.stringify(scenario.steps), JSON.stringify(scenario.locators), scenario.tier, now, prior.id);
+      siteFingerprints.add(fp);
+      continue;
+    }
+    if (siteFingerprints.has(fp)) continue; // duplicate of another page's scenario
+    siteFingerprints.add(fp);
+    db.prepare(
+      `INSERT INTO crawl_scenarios (id, site_id, page_id, title, type, tier, flow_group, steps_json, locators_json, status, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)`
+    ).run(scenario.id, siteId, pageId, scenario.title, scenario.type, scenario.tier, scenario.flowGroup, JSON.stringify(scenario.steps), JSON.stringify(scenario.locators), now, now);
+  }
+
+  // Retire scenarios that no longer apply to this page.
+  for (const [fp, row] of existingByFp) {
+    if (keptFps.has(fp)) continue;
+    if (row.generated_test_case_id) {
+      // Keep the linked test case, but mark the crawl scenario soft-deleted so
+      // Review & curate doesn't keep offering a stale discovery.
+      db.prepare(
+        "UPDATE crawl_scenarios SET status = 'soft_deleted', deleted_at = ?, updated_at = ? WHERE id = ?"
+      ).run(now, now, row.id);
+    } else {
+      db.prepare(
+        "UPDATE crawl_scenarios SET status = 'soft_deleted', deleted_at = ?, updated_at = ? WHERE id = ?"
+      ).run(now, now, row.id);
+    }
+    siteFingerprints.delete(fp);
+  }
 }
 
 function persistCrawlResult(siteId: string, result: CrawlRunOutput, isRerun: boolean) {
@@ -101,65 +224,117 @@ function persistCrawlResult(siteId: string, result: CrawlRunOutput, isRerun: boo
   let totalScenarios = 0;
   let totalForms = 0;
   let totalSpellingIssues = 0;
+  let removedPages = 0;
 
   const tx = db.transaction(() => {
+    const siteFingerprints = loadSiteScenarioFingerprints(siteId);
+    const seenKeys = new Set<string>();
+
     for (const page of result.pages) {
-      const existingPage = db.prepare("SELECT id FROM crawl_pages WHERE site_id = ? AND url = ?").get(siteId, page.url) as any;
+      const existingPage = findPageByUrl(siteId, page.url);
       const pageId = existingPage?.id || nanoid(10);
+      seenKeys.add(dedupeKey(page.url));
       const formCount = page.elements.filter((e) => ["input", "textarea", "dropdown"].includes(e.type)).length > 0 ? 1 : 0;
       totalForms += formCount;
       totalSpellingIssues += page.spellingIssues.length;
 
       if (existingPage) {
-        db.prepare(
-          `UPDATE crawl_pages SET title = ?, dom_hash = ?, elements_json = ?, apis_json = ?, change_status = ?, diff_json = ?, spelling_issues_json = ?, component_inventory_json = ?, updated_at = ? WHERE id = ?`
-        ).run(page.title, page.hash, JSON.stringify(page.elements), JSON.stringify(page.apis), page.changeStatus, page.diff ? JSON.stringify(page.diff) : null, JSON.stringify(page.spellingIssues), JSON.stringify(page.componentInventory), now, pageId);
+        // Unchanged pages: refresh last_seen/change_status but keep elements/apis/spelling unless we have fresher data.
+        if (page.changeStatus === "unchanged") {
+          db.prepare(
+            `UPDATE crawl_pages SET title = ?, change_status = 'unchanged', last_seen_at = ?, updated_at = ? WHERE id = ?`
+          ).run(page.title, now, now, pageId);
+        } else {
+          db.prepare(
+            `UPDATE crawl_pages SET title = ?, dom_hash = ?, elements_json = ?, apis_json = ?, change_status = ?, diff_json = ?, spelling_issues_json = ?, component_inventory_json = ?, last_seen_at = ?, updated_at = ? WHERE id = ?`
+          ).run(
+            page.title,
+            page.hash,
+            JSON.stringify(page.elements),
+            page.apis.length ? JSON.stringify(page.apis) : (db.prepare("SELECT apis_json FROM crawl_pages WHERE id = ?").get(pageId) as any)?.apis_json ?? "[]",
+            page.changeStatus,
+            page.diff ? JSON.stringify(page.diff) : null,
+            JSON.stringify(page.spellingIssues),
+            JSON.stringify(page.componentInventory),
+            now,
+            now,
+            pageId
+          );
+        }
       } else {
         db.prepare(
-          `INSERT INTO crawl_pages (id, site_id, url, title, dom_hash, screenshot_hash, elements_json, apis_json, change_status, diff_json, spelling_issues_json, component_inventory_json, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?)`
-        ).run(pageId, siteId, page.url, page.title, page.hash, JSON.stringify(page.elements), JSON.stringify(page.apis), page.changeStatus, page.diff ? JSON.stringify(page.diff) : null, JSON.stringify(page.spellingIssues), JSON.stringify(page.componentInventory), now, now);
+          `INSERT INTO crawl_pages (id, site_id, url, title, dom_hash, screenshot_hash, elements_json, apis_json, change_status, diff_json, spelling_issues_json, component_inventory_json, last_seen_at, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        ).run(
+          pageId,
+          siteId,
+          page.url,
+          page.title,
+          page.hash,
+          JSON.stringify(page.elements),
+          JSON.stringify(page.apis),
+          page.changeStatus,
+          page.diff ? JSON.stringify(page.diff) : null,
+          JSON.stringify(page.spellingIssues),
+          JSON.stringify(page.componentInventory),
+          now,
+          now,
+          now
+        );
       }
 
-      // Phase 4: unchanged pages keep whatever scenarios they already have --
-      // only new/changed pages get fresh scenario rows inserted here.
       if (page.changeStatus !== "unchanged") {
-        for (const scenario of page.scenarios) {
-          db.prepare(
-            `INSERT INTO crawl_scenarios (id, site_id, page_id, title, type, tier, flow_group, steps_json, locators_json, status, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)`
-          ).run(scenario.id, siteId, pageId, scenario.title, scenario.type, scenario.tier, scenario.flowGroup, JSON.stringify(scenario.steps), JSON.stringify(scenario.locators), now, now);
-        }
+        mergeScenariosForPage(siteId, pageId, page.scenarios, siteFingerprints, now);
       } else if (isRerun && existingPage) {
-        // This page was re-crawled and found unchanged -- its existing active
-        // scenarios are being carried forward as-is (not regenerated above),
-        // which is exactly what "previously working, re-verify after a
-        // change [elsewhere on the site]" means. Flag them regression so the
-        // Review & curate UI can distinguish "still verifying this still
-        // works" from a freshly generated smoke/functional case.
         db.prepare("UPDATE crawl_scenarios SET tier = 'regression', updated_at = ? WHERE page_id = ? AND status = 'active'").run(now, pageId);
       }
 
       const activeScenarioCount = (db.prepare("SELECT COUNT(*) as c FROM crawl_scenarios WHERE page_id = ? AND status = 'active'").get(pageId) as any).c;
       totalScenarios += activeScenarioCount;
 
-      // FR-1.10 parity: catalog every crawled page as a first-class Screen too,
-      // so it participates in the existing Screen Explorer / screen-scoped runs.
       catalogScreen({ name: page.title || page.url, sourceInputId: siteId, urlOrPath: page.url, content: page.hash });
     }
 
+    // Pages present in prior crawls but missing this run → marked removed (and their
+    // ungenerated scenarios retired). Generated test cases are left alone.
+    if (isRerun) {
+      const priorPages = db.prepare("SELECT id, url FROM crawl_pages WHERE site_id = ? AND change_status != 'removed'").all(siteId) as Array<{
+        id: string;
+        url: string;
+      }>;
+      for (const prior of priorPages) {
+        if (seenKeys.has(dedupeKey(prior.url))) continue;
+        removedPages++;
+        db.prepare("UPDATE crawl_pages SET change_status = 'removed', updated_at = ? WHERE id = ?").run(now, prior.id);
+        db.prepare(
+          "UPDATE crawl_scenarios SET status = 'soft_deleted', deleted_at = ?, updated_at = ? WHERE page_id = ? AND status = 'active' AND generated_test_case_id IS NULL"
+        ).run(now, now, prior.id);
+      }
+    }
+
+    const summary = {
+      ...(result.summary ?? { mode: isRerun ? "incremental" : "full", newPages: 0, changedPages: 0, unchangedPages: 0, reusedBaselines: 0 }),
+      removedPages,
+      scenariosActive: totalScenarios,
+    };
+
     db.prepare(
-      "UPDATE crawl_sites SET status = 'completed', pages_discovered = ?, forms_discovered = ?, scenarios_discovered = ?, spelling_issues_found = ?, current_page = NULL, last_crawled_at = ? WHERE id = ?"
-    ).run(result.pages.length, totalForms, totalScenarios, totalSpellingIssues, now, siteId);
+      "UPDATE crawl_sites SET status = 'completed', pages_discovered = ?, forms_discovered = ?, scenarios_discovered = ?, spelling_issues_found = ?, current_page = NULL, last_crawled_at = ?, recrawl_summary_json = ? WHERE id = ?"
+    ).run(result.pages.length, totalForms, totalScenarios, totalSpellingIssues, now, JSON.stringify(summary), siteId);
+
+    return summary;
   });
 
-  tx();
+  return tx();
 }
 
-export function getSiteDetail(siteId: string) {
+export function getSiteDetail(siteId: string, opts?: { includeRemoved?: boolean }) {
   const site = getSite(siteId);
   if (!site) return null;
-  const pages = (db.prepare("SELECT * FROM crawl_pages WHERE site_id = ? ORDER BY created_at ASC").all(siteId) as any[]).map((p) => ({
+  const pageRows = opts?.includeRemoved
+    ? (db.prepare("SELECT * FROM crawl_pages WHERE site_id = ? ORDER BY created_at ASC").all(siteId) as any[])
+    : (db.prepare("SELECT * FROM crawl_pages WHERE site_id = ? AND change_status != 'removed' ORDER BY created_at ASC").all(siteId) as any[]);
+  const pages = pageRows.map((p) => ({
     ...p,
     elements: JSON.parse(p.elements_json),
     apis: JSON.parse(p.apis_json),
@@ -168,7 +343,8 @@ export function getSiteDetail(siteId: string) {
     componentInventory: JSON.parse(p.component_inventory_json || "[]"),
     scenarios: (db.prepare("SELECT * FROM crawl_scenarios WHERE page_id = ? AND status = 'active' ORDER BY created_at ASC").all(p.id) as any[]).map(parseScenarioRow),
   }));
-  return { site, pages };
+  const recrawlSummary = site.recrawl_summary_json ? JSON.parse(site.recrawl_summary_json) : null;
+  return { site: { ...site, recrawl_summary: recrawlSummary }, pages };
 }
 
 function parseScenarioRow(row: any) {
@@ -280,6 +456,16 @@ export async function generateTestsFromScenarios(scenarioIds: string[], actorUse
       continue;
     }
 
+    if (scenario.generated_test_case_id) {
+      results.push({
+        scenarioId,
+        ok: true,
+        testCaseId: scenario.generated_test_case_id,
+        error: "Test case already generated for this scenario (skipped duplicate)",
+      });
+      continue;
+    }
+
     try {
       const page = db.prepare("SELECT * FROM crawl_pages WHERE id = ?").get(scenario.page_id) as any;
       const site = db.prepare("SELECT * FROM crawl_sites WHERE id = ?").get(scenario.site_id) as any;
@@ -298,6 +484,25 @@ export async function generateTestsFromScenarios(scenarioIds: string[], actorUse
       }
 
       const steps: string[] = JSON.parse(scenario.steps_json);
+      const screen = db.prepare("SELECT id FROM screens WHERE url_or_path = ? ORDER BY updated_at DESC LIMIT 1").get(page?.url) as any;
+
+      // Skip if an equivalent test case already exists for this screen (title + steps match).
+      if (screen) {
+        const existingCase = db.prepare(
+          "SELECT id FROM test_cases WHERE screen_id = ? AND title = ? AND steps = ? AND status != 'rejected' LIMIT 1"
+        ).get(screen.id, scenario.title, JSON.stringify(steps)) as { id: string } | undefined;
+        if (existingCase) {
+          db.prepare("UPDATE crawl_scenarios SET generated_test_case_id = ?, updated_at = ? WHERE id = ?").run(existingCase.id, now, scenarioId);
+          results.push({
+            scenarioId,
+            ok: true,
+            testCaseId: existingCase.id,
+            error: "Linked to existing equivalent test case (skipped duplicate)",
+          });
+          continue;
+        }
+      }
+
       const testCaseId = nanoid(10);
       db.prepare(`
         INSERT INTO test_cases
@@ -324,7 +529,6 @@ export async function generateTestsFromScenarios(scenarioIds: string[], actorUse
 
       // FR-2.14 parity: tag the generated test case to the Screen the crawler
       // already catalogued for this page.
-      const screen = db.prepare("SELECT id FROM screens WHERE url_or_path = ? ORDER BY updated_at DESC LIMIT 1").get(page?.url) as any;
       if (screen) db.prepare("UPDATE test_cases SET screen_id = ? WHERE id = ?").run(screen.id, testCaseId);
 
       const generation = await generateAutomationScript(testCaseId);

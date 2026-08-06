@@ -32,15 +32,19 @@ async function triggerInfiniteScroll(page: Page): Promise<void> {
 
 export async function discoverPageInteractions(
   page: Page,
-  onNetworkTrigger?: (label: string) => void
+  onNetworkTrigger?: (label: string) => void,
+  options?: { shallow?: boolean }
 ): Promise<PageInteractionResult> {
-  await triggerInfiniteScroll(page);
+  const shallow = Boolean(options?.shallow);
+  if (!shallow) {
+    await triggerInfiniteScroll(page);
+  }
 
   const formCount = await page.locator("form").count().catch(() => 0);
 
   const elements: ElementRecord[] = [];
   const handles = page.locator(INTERACTIVE_SELECTOR);
-  const count = Math.min(await handles.count().catch(() => 0), 200);
+  const count = Math.min(await handles.count().catch(() => 0), shallow ? 80 : 200);
 
   let interactionsUsed = 0;
 
@@ -66,8 +70,9 @@ export async function discoverPageInteractions(
       inputType: ranked.inputType ?? undefined,
     });
 
-    // Reveal dropdowns/accordions/modals by clicking non-navigating, non-destructive,
-    // bounded-count triggers -- so their contents get captured on the next pass too.
+    // Shallow mode: locator inventory only -- no exploratory clicks (fast re-crawl probe).
+    if (shallow) continue;
+
     const isDestructive = DESTRUCTIVE_ACTION_PATTERN.test(ranked.label);
     const isLikelyToggle = ranked.type === "button" && interactionsUsed < MAX_INTERACTIONS_PER_PAGE;
     if (isLikelyToggle && !isDestructive) {

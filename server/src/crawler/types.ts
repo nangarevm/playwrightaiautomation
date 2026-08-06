@@ -12,6 +12,12 @@ export interface CrawlOptions {
   maxPages?: number;
   captureApi?: boolean;
   concurrency?: number;
+  /** incremental (default on re-run): skip deep interaction when page structure matches baseline. full: always deep-scan. */
+  mode?: "incremental" | "full";
+  /** Previously discovered page URLs for this site -- seeded first on re-crawl so coverage isn't lost. */
+  knownUrls?: string[];
+  /** Baseline lookup used during discovery for early unchanged short-circuit (incremental mode). */
+  getBaseline?: (url: string) => { hash: string; elements: ElementRecord[] } | null;
   onProgress?: (progress: CrawlProgress) => void;
 }
 
@@ -107,7 +113,7 @@ export interface PageRecord {
   elements: ElementRecord[];
   apis: ApiCallRecord[];
   scenarios: ScenarioRecord[];
-  changeStatus: "new" | "changed" | "unchanged";
+  changeStatus: "new" | "changed" | "unchanged" | "removed";
   diff?: PageDiff;
   spellingIssues: SpellingIssue[];
 }

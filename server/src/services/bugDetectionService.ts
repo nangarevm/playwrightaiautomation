@@ -18,6 +18,8 @@ import { nanoid } from "nanoid";
 import { db } from "../db.js";
 import { getScreen } from "./screensService.js";
 import { fileGenericBug } from "./integrationsService.js";
+import type { SpellingIssue } from "../crawler/types.js";
+import { originOf } from "../crawler/urlUtils.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const UPLOAD_DIR = path.join(__dirname, "..", "uploads");
@@ -320,6 +322,25 @@ export async function scanScreenForUiBugs(screen: { id: string; name: string; ur
         })
       );
     }
+
+    const brokenLinks = await checkBrokenInternalLinks(page, screen.url_or_path);
+    if (brokenLinks.length) {
+      const screenshotUrl = await screenshotNow();
+      findings.push(
+        recordBugFinding({
+          source: "ui_exploratory",
+          severity: "medium",
+          title: `Broken internal link(s) on ${screen.name}`,
+          detail: brokenLinks.map((l) => `HTTP ${l.status} — ${l.url} (${l.label})`).join("\n"),
+          screenId: screen.id,
+          runId,
+          evidence: { brokenLinks },
+          stepsToReproduce: [...baseSteps, `Observe: ${brokenLinks.length} same-origin link(s) return 4xx/5xx instead of loading.`],
+          screenshotUrl,
+        })
+      );
+    }
+
     if (stuckSpinners > 0) {
       const screenshotUrl = await screenshotNow();
       findings.push(
@@ -383,4 +404,117 @@ export async function runBugScanForScreen(screenId: string, runId?: string): Pro
   const screen = getScreen(screenId) as { id: string; name: string; url_or_path: string | null } | undefined;
   if (!screen) throw new Error("Screen not found.");
   return scanScreenForUiBugs(screen, runId);
+}
+
+async function checkBrokenInternalLinks(
+  page: import("playwright").Page,
+  pageUrl: string
+): Promise<Array<{ url: string; label: string; status: number }>> {
+  const origin = originOf(pageUrl);
+  if (!origin) return [];
+
+  const links = await page
+    .evaluate(() =>
+      Array.from(document.querySelectorAll("a[href]"))
+        .map((a) => ({
+          href: (a as HTMLAnchorElement).href,
+          label: (a.textContent || "").replace(/\s+/g, " ").trim().slice(0, 60),
+        }))
+        .filter((l) => l.href.startsWith("http"))
+    )
+    .catch(() => [] as Array<{ href: string; label: string }>);
+
+  const sameOriginLinks = links.filter((l) => {
+    try {
+      return new URL(l.href).origin === origin && !l.href.includes("#");
+    } catch {
+      return false;
+    }
+  });
+
+  const broken: Array<{ url: string; label: string; status: number }> = [];
+  const checked = new Set<string>();
+  for (const link of sameOriginLinks.slice(0, 15)) {
+    if (checked.has(link.href)) continue;
+    checked.add(link.href);
+    try {
+      const res = await page.request.get(link.href, { timeout: 8000 });
+      if (res.status() >= 400) broken.push({ url: link.href, label: link.label || link.href, status: res.status() });
+    } catch {
+      broken.push({ url: link.href, label: link.label || link.href, status: 0 });
+    }
+  }
+  return broken;
+}
+
+export function fileSpellingFindings(screenId: string, screenName: string, issues: SpellingIssue[]): BugFindingRow[] {
+  const findings: BugFindingRow[] = [];
+  const seen = new Set<string>();
+  for (const issue of issues.slice(0, 20)) {
+    const key = `${issue.word}::${issue.context}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    findings.push(
+      recordBugFinding({
+        source: "ui_exploratory",
+        severity: "low",
+        title: `Spelling issue on ${screenName}: "${issue.word}"`,
+        detail: `Misspelled "${issue.word}" in ${issue.context}${issue.suggestions?.[0] ? ` (suggested: "${issue.suggestions[0]}")` : ""}`,
+        screenId,
+        evidence: { issue },
+        stepsToReproduce: [
+          `Navigate to the screen: ${screenName}`,
+          `Look for the text in context: ${issue.context}`,
+          `Observe the misspelling "${issue.word}"`,
+        ],
+      })
+    );
+  }
+  return findings;
+}
+
+// After a crawl completes: scan every cataloged page for UI bugs, file spelling
+// issues captured during crawl, and fuzz API endpoints observed in network capture.
+export async function runPostCrawlBugScan(
+  siteId: string,
+  opts?: { changeStatuses?: string[] }
+): Promise<BugFindingRow[]> {
+  const site = db.prepare("SELECT * FROM crawl_sites WHERE id = ?").get(siteId) as { url: string } | undefined;
+  if (!site) return [];
+
+  let pages = db.prepare("SELECT * FROM crawl_pages WHERE site_id = ? AND change_status != 'removed'").all(siteId) as any[];
+  if (opts?.changeStatuses?.length) {
+    const allowed = new Set(opts.changeStatuses);
+    pages = pages.filter((p) => allowed.has(p.change_status));
+  }
+
+  const allFindings: BugFindingRow[] = [];
+  const apiTemplates = new Set<string>();
+
+  for (const page of pages) {
+    const screen = db.prepare("SELECT id, name FROM screens WHERE url_or_path = ? ORDER BY updated_at DESC LIMIT 1").get(page.url) as
+      | { id: string; name: string }
+      | undefined;
+    if (!screen) continue;
+
+    const spellingIssues: SpellingIssue[] = JSON.parse(page.spelling_issues_json || "[]");
+    if (spellingIssues.length) allFindings.push(...fileSpellingFindings(screen.id, screen.name, spellingIssues));
+
+    const uiFindings = await scanScreenForUiBugs({ id: screen.id, name: screen.name, url_or_path: page.url });
+    allFindings.push(...uiFindings);
+
+    const apis = JSON.parse(page.apis_json || "[]") as Array<{ method: string; endpoint: string }>;
+    for (const api of apis) {
+      if (api.endpoint.includes(":id") || /\/\d+/.test(api.endpoint)) {
+        apiTemplates.add(api.endpoint);
+      }
+    }
+  }
+
+  if (apiTemplates.size > 0) {
+    const fuzzed = await fuzzApiEndpoints(site.url, Array.from(apiTemplates).slice(0, 10));
+    allFindings.push(...fuzzed);
+  }
+
+  return allFindings;
 }

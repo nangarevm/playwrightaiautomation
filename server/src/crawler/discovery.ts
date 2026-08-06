@@ -11,6 +11,10 @@ import { loginIfCredentialsProvided } from "./auth.js";
 import { discoverPageInteractions } from "./interaction.js";
 import { collectComponentInventory } from "./componentInventory.js";
 import { attachNetworkCapture } from "./network.js";
+import { dedupeKey, fetchSitemapUrls, normalizeUrl, sameOrigin } from "./urlUtils.js";
+import { structureMatches } from "./diff.js";
+
+export { dedupeKey, normalizeUrl, sameOrigin } from "./urlUtils.js";
 
 export interface DiscoveredPage {
   url: string;
@@ -19,67 +23,22 @@ export interface DiscoveredPage {
   apis: ApiCallRecord[];
   formCount: number;
   componentInventory: ComponentInventoryItem[];
+  /** True when incremental mode reused the prior baseline without deep interaction. */
+  reusedBaseline?: boolean;
 }
 
-function normalizeUrl(raw: string): string {
-  return /^https?:\/\//i.test(raw) ? raw : `https://${raw}`;
-}
-
-// Common noise params that vary per link/click but never change what the page
-// actually is (tracking/session identifiers) -- stripped before a URL is used
-// as a "have we already visited this page" key, so e.g. "/forum",
-// "/forum?utm_source=nav", and "/forum/" don't each get crawled and scenario-
-// generated as if they were three separate pages (previously: they did, which
-// is why the same page's card + identical "Verify X loads successfully"
-// scenario could show up 2-3x in the Review & curate list for one real page).
-const VOLATILE_QUERY_PARAMS = /^(utm_|fbclid$|gclid$|msclkid$|ref$|referrer$|source$|sid$|session(id)?$|_ga$|_gl$)/i;
-
-// The visited-set key for "is this the same page we already crawled" -- NOT
-// the URL actually navigated to or stored (that stays the real, full URL so
-// links/screenshots/replay scripts keep working). Strips the trailing slash
-// and any volatile query params; keeps everything else (a genuinely content-
-// differentiating param like `?id=42` still produces a distinct key).
-function dedupeKey(rawUrl: string): string {
-  try {
-    const u = new URL(rawUrl);
-    const params = new URLSearchParams(u.search);
-    for (const key of Array.from(params.keys())) {
-      if (VOLATILE_QUERY_PARAMS.test(key)) params.delete(key);
-    }
-    params.sort();
-    const search = params.toString();
-    const pathname = u.pathname.replace(/\/+$/, "") || "/";
-    return `${u.origin}${pathname}${search ? `?${search}` : ""}`;
-  } catch {
-    return rawUrl;
-  }
-}
-
-function sameOrigin(a: string, b: string): boolean {
-  try {
-    return new URL(a).origin === new URL(b).origin;
-  } catch {
-    return false;
-  }
-}
-
-interface ExtractedLink {
-  url: string;
-  label: string;
-}
-
-// Same link-collection logic as before, but now also keeps each link's visible
-// text/aria-label -- that's what turns a bare page->page edge into a step a
-// human (or a Playwright script) can actually replay: "clicks 'View Cart'"
-// instead of just "navigates somewhere."
 async function extractLinks(page: import("playwright").Page, baseUrl: string): Promise<ExtractedLink[]> {
   const raw = await page
-    .evaluate(() =>
-      Array.from(document.querySelectorAll("a[href]")).map((a) => ({
-        href: (a as HTMLAnchorElement).href,
-        label: (a.getAttribute("aria-label") || a.textContent || "").replace(/\s+/g, " ").trim().slice(0, 80),
-      }))
-    )
+    .evaluate(() => {
+      const anchors = Array.from(document.querySelectorAll("a[href], [role='link'][href], nav a[href], [data-testid*='nav'] a[href]"));
+      return anchors.map((node) => {
+        const el = node as HTMLAnchorElement;
+        return {
+          href: el.href,
+          label: (el.getAttribute("aria-label") || el.textContent || "").replace(/\s+/g, " ").trim().slice(0, 80),
+        };
+      });
+    })
     .catch(() => [] as Array<{ href: string; label: string }>);
   const resolved: ExtractedLink[] = [];
   for (const { href, label } of raw) {
@@ -96,6 +55,11 @@ async function extractLinks(page: import("playwright").Page, baseUrl: string): P
   return resolved;
 }
 
+interface ExtractedLink {
+  url: string;
+  label: string;
+}
+
 async function simplePool<T>(items: T[], size: number, worker: (item: T) => Promise<void>): Promise<void> {
   let index = 0;
   async function next(): Promise<void> {
@@ -109,8 +73,8 @@ async function simplePool<T>(items: T[], size: number, worker: (item: T) => Prom
 
 export async function runDiscoveryCrawl(options: CrawlOptions): Promise<{ pages: DiscoveredPage[]; edges: NavEdge[]; authenticated: boolean; authMessage: string }> {
   const normalizedUrl = normalizeUrl(options.url);
-  const maxPages = Math.max(1, options.maxPages ?? 10);
-  const concurrency = Math.max(1, Math.min(options.concurrency ?? 2, 4));
+  const maxPages = Math.max(1, options.maxPages ?? 50);
+  const concurrency = Math.max(1, Math.min(options.concurrency ?? 3, 6));
 
   const browser: Browser = await chromium.launch({ headless: true });
   const context: BrowserContext = await browser.newContext({ viewport: { width: 1280, height: 800 } });
@@ -130,7 +94,34 @@ export async function runDiscoveryCrawl(options: CrawlOptions): Promise<{ pages:
     const visited = new Set<string>();
     const queuedKeys = new Set<string>([dedupeKey(normalizedUrl)]);
     const queue: string[] = [normalizedUrl];
+
+    // Re-crawl: re-visit previously discovered pages first so coverage isn't lost
+    // when homepage/nav links change between runs.
+    for (const known of options.knownUrls ?? []) {
+      try {
+        if (!sameOrigin(known, normalizedUrl)) continue;
+        const key = dedupeKey(known);
+        if (!queuedKeys.has(key)) {
+          queuedKeys.add(key);
+          queue.push(known);
+        }
+      } catch {
+        /* skip malformed known URLs */
+      }
+    }
+
+    // Seed BFS with sitemap URLs so deep pages not linked from the homepage are still discovered.
+    const sitemapUrls = await fetchSitemapUrls(normalizedUrl, maxPages * 2);
+    for (const sitemapUrl of sitemapUrls) {
+      const key = dedupeKey(sitemapUrl);
+      if (!queuedKeys.has(key)) {
+        queuedKeys.add(key);
+        queue.push(sitemapUrl);
+      }
+    }
+
     const results: DiscoveredPage[] = [];
+    const incremental = (options.mode ?? "full") === "incremental";
     // The navigation graph: every page->page hop discovered, with what was
     // clicked (or "navigation" for an SPA route change with no single
     // attributable link) to get there -- this is what buildFlowScenariosForSite
@@ -165,32 +156,55 @@ export async function runDiscoveryCrawl(options: CrawlOptions): Promise<{ pages:
           const title = (await page.title().catch(() => "")) || new URL(targetUrl).pathname || targetUrl;
           options.onProgress?.({ pagesDiscovered: results.length, formsDiscovered: formsDiscoveredTotal, scenariosDiscovered: 0, currentPage: targetUrl });
 
-          const { elements, formCount } = await discoverPageInteractions(page, capture?.setTrigger);
-          formsDiscoveredTotal += formCount;
-          // Scanned after discoverPageInteractions (not before) so modals/dropdowns
-          // it clicked open are already in the DOM and get counted too.
-          const componentInventory = await collectComponentInventory(page);
+          const baseline = options.getBaseline?.(targetUrl) ?? null;
+          let elements: ElementRecord[];
+          let formCount: number;
+          let componentInventory: ComponentInventoryItem[];
+          let reusedBaseline = false;
 
-          // SPA route changes: after interaction, the URL may have changed via
-          // history.pushState without a full navigation -- capture that as an
-          // additional discoverable route rather than losing it.
+          if (incremental && baseline?.elements?.length) {
+            // Fast probe: shallow scan (no exploratory clicks). If structure matches
+            // the last crawl, reuse baseline locators and skip the expensive deep pass.
+            const shallow = await discoverPageInteractions(page, capture?.setTrigger, { shallow: true });
+            if (structureMatches(shallow.elements, baseline.elements)) {
+              elements = baseline.elements;
+              formCount = shallow.formCount || (baseline.elements.filter((e) => ["input", "textarea", "dropdown"].includes(e.type)).length > 0 ? 1 : 0);
+              componentInventory = [];
+              reusedBaseline = true;
+            } else {
+              const deep = await discoverPageInteractions(page, capture?.setTrigger);
+              elements = deep.elements;
+              formCount = deep.formCount;
+              componentInventory = await collectComponentInventory(page);
+            }
+          } else {
+            const deep = await discoverPageInteractions(page, capture?.setTrigger);
+            elements = deep.elements;
+            formCount = deep.formCount;
+            componentInventory = await collectComponentInventory(page);
+          }
+
+          formsDiscoveredTotal += formCount;
+
           const currentUrl = page.url();
           if (currentUrl !== targetUrl && sameOrigin(currentUrl, normalizedUrl) && !visited.has(dedupeKey(currentUrl))) {
             discoveredLinksThisBatch.push({ url: currentUrl, label: "navigation" });
             edges.push({ from: targetUrl, to: currentUrl, via: "navigation" });
           }
 
-          // Attribute link edges to the page they're actually extracted from --
-          // if an exploratory click above (discoverPageInteractions) navigated
-          // the page away from targetUrl, extractLinks here is scraping the
-          // POST-navigation page's DOM, not targetUrl's. Using targetUrl as
-          // `from` would fabricate an edge for a link that doesn't exist on the
-          // originally-requested page.
           const links = await extractLinks(page, normalizedUrl);
           discoveredLinksThisBatch.push(...links);
           for (const link of links) edges.push({ from: currentUrl, to: link.url, via: link.label });
 
-          results.push({ url: targetUrl, title, elements, apis: capture?.records ?? [], formCount, componentInventory });
+          results.push({
+            url: targetUrl,
+            title,
+            elements,
+            apis: reusedBaseline ? [] : (capture?.records ?? []),
+            formCount,
+            componentInventory,
+            reusedBaseline,
+          });
         } catch (err: any) {
           results.push({ url: targetUrl, title: `(failed to load: ${err.message})`, elements: [], apis: [], formCount: 0, componentInventory: [] });
         } finally {
