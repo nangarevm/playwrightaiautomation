@@ -36,7 +36,7 @@ test('dedupeScenarios removes exact duplicate scenarios', () => {
   assert.equal(unique.length, 1);
 });
 
-test('dedupeScenariosFuzzy removes near-duplicate load-smoke scenarios', () => {
+test('dedupeScenariosFuzzy keeps page-load scenarios for different pages', () => {
   const a = {
     id: '1',
     title: 'Verify Dashboard loads successfully',
@@ -53,6 +53,29 @@ test('dedupeScenariosFuzzy removes near-duplicate load-smoke scenarios', () => {
     tier: 'smoke',
     flowGroup: 'Reports',
     steps: ['Given the user navigates to "Reports"', 'Then the page loads and its key elements render'],
+    locators: [],
+  };
+  const unique = dedupeScenariosFuzzy([a, b]);
+  assert.equal(unique.length, 2);
+});
+
+test('dedupeScenariosFuzzy collapses near-duplicates on the same page/tier', () => {
+  const a = {
+    id: '1',
+    title: 'Verify Dashboard loads successfully',
+    type: 'positive',
+    tier: 'smoke',
+    flowGroup: 'Dashboard',
+    steps: ['Given the user navigates to "Dashboard"', 'Then the page loads and its key elements render'],
+    locators: [],
+  };
+  const b = {
+    id: '2',
+    title: 'Verify Dashboard loads successfully now',
+    type: 'positive',
+    tier: 'smoke',
+    flowGroup: 'Dashboard',
+    steps: ['Given the user navigates to "Dashboard"', 'Then the page loads and its key elements render'],
     locators: [],
   };
   const unique = dedupeScenariosFuzzy([a, b]);

@@ -93,7 +93,7 @@ function buildFormScenarios(pageTitle: string, formElements: ElementRecord[]): S
       flowGroup,
       [`Given the user is on "${pageTitle}"`, ...inputs.map((i) => `When the user ${fillStepFor(i)}`), submitStep, "Then the form is accepted and the expected success state is shown"],
       [...inputs, ...submitLocator],
-      "smoke" // the one core "does this form work at all" happy path
+      "regression" // primary happy path -- regression suite (smoke is page-load only)
     )
   );
 
@@ -145,7 +145,7 @@ function buildFormScenarios(pageTitle: string, formElements: ElementRecord[]): S
     scenarios.push(
       makeScenario(
         `Verify ${flowGroup} still submits successfully when "${field.label}" is left blank`,
-        "positive",
+        "edge",
         flowGroup,
         [
           `Given the user is on "${pageTitle}"`,
@@ -237,13 +237,13 @@ function buildFormScenarios(pageTitle: string, formElements: ElementRecord[]): S
     );
   }
 
-  // 6. Checkbox toggle coverage.
+  // 6. Checkbox toggle coverage (edge: state boundary).
   const checkboxes = inputs.filter((i) => i.type === "checkbox");
   for (const box of checkboxes.slice(0, MAX_PER_FIELD_CATEGORY)) {
     scenarios.push(
       makeScenario(
         `Verify "${box.label}" can be toggled on and off`,
-        "positive",
+        "edge",
         flowGroup,
         [`Given the user is on "${pageTitle}"`, `When the user toggles "${box.label}"`, "Then its checked state visibly reflects the toggle"],
         [box]
@@ -251,16 +251,53 @@ function buildFormScenarios(pageTitle: string, formElements: ElementRecord[]): S
     );
   }
 
-  // 7. Dropdown selection-change coverage.
+  // 7. Dropdown selection-change coverage (edge: alternate option).
   const dropdowns = inputs.filter((i) => i.type === "dropdown");
   for (const dd of dropdowns.slice(0, MAX_PER_FIELD_CATEGORY)) {
     scenarios.push(
       makeScenario(
         `Verify a different option can be selected in "${dd.label}"`,
-        "positive",
+        "edge",
         flowGroup,
         [`Given the user is on "${pageTitle}"`, `When the user selects a different option in "${dd.label}"`, "Then the newly selected option is reflected in the field"],
         [dd]
+      )
+    );
+  }
+
+  // 8. Edge: oversized input in the first text-like field (boundary length).
+  const textField = inputs.find((i) => (i.type === "input" || i.type === "textarea") && i.inputType !== "file");
+  if (textField) {
+    scenarios.push(
+      makeScenario(
+        `Verify ${flowGroup} handles an extremely long value in "${textField.label}"`,
+        "edge",
+        flowGroup,
+        [
+          `Given the user is on "${pageTitle}"`,
+          `When the user pastes an extremely long string (1000+ characters) into "${textField.label}"`,
+          submitStep,
+          "Then the page remains stable (validation error or truncated input, not a crash)",
+        ],
+        [textField, ...submitLocator]
+      )
+    );
+  }
+
+  // 9. Edge: double-submit / rapid resubmit of the form.
+  if (submit) {
+    scenarios.push(
+      makeScenario(
+        `Verify ${flowGroup} handles a rapid double submit safely`,
+        "edge",
+        flowGroup,
+        [
+          `Given the user is on "${pageTitle}"`,
+          ...inputs.slice(0, 3).map((i) => `When the user ${fillStepFor(i)}`),
+          `And the user clicks "${submit.label}" twice in quick succession`,
+          "Then the form does not create duplicate submissions or crash",
+        ],
+        [...inputs.slice(0, 3), submit]
       )
     );
   }
@@ -280,8 +317,173 @@ function groupByComponent(elements: ElementRecord[]): Map<string, ElementRecord[
   return groups;
 }
 
-export function buildScenariosForPage(pageTitle: string, elements: ElementRecord[], formCount: number): ScenarioRecord[] {
+/** Every discovered page always gets smoke (load) + regression (still works) baselines. */
+export function buildBaselineCoverageScenarios(pageTitle: string, elements: ElementRecord[]): ScenarioRecord[] {
+  return [
+    makeScenario(
+      `Verify ${pageTitle} loads successfully`,
+      "positive",
+      pageTitle,
+      [`Given the user navigates to "${pageTitle}"`, "Then the page loads and its key elements render"],
+      elements.slice(0, 5),
+      "smoke"
+    ),
+    makeScenario(
+      `Regression: verify ${pageTitle} still loads and renders key content`,
+      "positive",
+      pageTitle,
+      [
+        `Given the user navigates to "${pageTitle}"`,
+        "When the page finishes loading",
+        "Then key content is visible and the page is not blank or errored",
+      ],
+      elements.slice(0, 5),
+      "regression"
+    ),
+  ];
+}
+
+/** Intra-page multi-step journey when the site has no cross-page nav edges yet. */
+export function buildIntraPageFlowScenario(pageTitle: string, elements: ElementRecord[]): ScenarioRecord | null {
+  const interactive = elements.filter((e) => ["link", "button", "input", "dropdown"].includes(e.type) && e.label);
+  if (interactive.length < 2) return null;
+  const steps = interactive.slice(0, 4);
+  const narrated: string[] = [`Given the user starts on "${pageTitle}"`];
+  steps.forEach((el, i) => {
+    const connector = i === 0 ? "When" : "And";
+    if (el.type === "input" || el.type === "dropdown") {
+      narrated.push(`${connector} the user interacts with "${el.label}"`);
+    } else {
+      narrated.push(`${connector} the user clicks "${el.label}"`);
+    }
+  });
+  narrated.push(`Then the user completes the in-page flow on "${pageTitle}" without errors`);
+  return {
+    id: nanoid(10),
+    title: `Verify the in-page flow on "${pageTitle}"`,
+    type: "flow",
+    tier: "regression",
+    flowGroup: `Flow: ${pageTitle}`,
+    steps: narrated,
+    locators: steps.flatMap((e) => e.locators.slice(0, 1)),
+  };
+}
+
+/** Guaranteed negative + edge baselines for every discovered page (with or without forms). */
+export function buildNegativeAndEdgeBaselines(pageTitle: string, elements: ElementRecord[]): ScenarioRecord[] {
   const scenarios: ScenarioRecord[] = [];
+  const inputs = elements.filter((e) => ["input", "textarea", "dropdown", "checkbox"].includes(e.type) && e.label);
+  const buttons = elements.filter((e) => e.type === "button" && e.label);
+  const links = elements.filter((e) => e.type === "link" && e.label);
+  const textInputs = inputs.filter((i) => (i.type === "input" || i.type === "textarea") && i.inputType !== "file");
+
+  // Negative: bad query string must not crash the page.
+  scenarios.push(
+    makeScenario(
+      `Verify ${pageTitle} handles an invalid query parameter without crashing`,
+      "negative",
+      pageTitle,
+      [
+        `Given the user opens "${pageTitle}" with an invalid query parameter (e.g. ?id=<<<invalid>>>)`,
+        "Then the page shows a controlled error or ignores the parameter — it does not white-screen or throw an uncaught exception",
+      ],
+      elements.slice(0, 3)
+    )
+  );
+
+  // Edge: long hash / fragment should still render.
+  scenarios.push(
+    makeScenario(
+      `Verify ${pageTitle} still renders with a long URL hash fragment`,
+      "edge",
+      pageTitle,
+      [
+        `Given the user navigates to "${pageTitle}" with a very long hash fragment`,
+        "Then the page body still renders and key content remains visible",
+      ],
+      elements.slice(0, 3)
+    )
+  );
+
+  // Negative: empty submit when a button exists but no form scenarios ran for this page
+  // (form pages already get empty-submit negatives from buildFormScenarios).
+  if (buttons.length > 0 && textInputs.length === 0) {
+    scenarios.push(
+      makeScenario(
+        `Verify clicking "${buttons[0].label}" without prior input does not crash ${pageTitle}`,
+        "negative",
+        pageTitle,
+        [
+          `Given the user is on "${pageTitle}"`,
+          `When the user clicks "${buttons[0].label}" without filling any fields`,
+          "Then the page remains stable (validation, no-op, or safe navigation — not a crash)",
+        ],
+        [buttons[0]]
+      )
+    );
+  }
+
+  // Edge: oversized text in first text field even when not in a detected form group.
+  if (textInputs.length > 0) {
+    scenarios.push(
+      makeScenario(
+        `Verify ${pageTitle} remains stable with oversized input in "${textInputs[0].label}"`,
+        "edge",
+        pageTitle,
+        [
+          `Given the user is on "${pageTitle}"`,
+          `When the user enters an extremely long string into "${textInputs[0].label}"`,
+          "Then the UI stays responsive and does not crash",
+        ],
+        [textInputs[0]]
+      )
+    );
+  }
+
+  // Negative: special/script-like characters in first text field (XSS-ish input).
+  if (textInputs.length > 0) {
+    scenarios.push(
+      makeScenario(
+        `Verify ${pageTitle} safely handles script-like input in "${textInputs[0].label}"`,
+        "negative",
+        pageTitle,
+        [
+          `Given the user is on "${pageTitle}"`,
+          `When the user enters script-like characters (<script>alert(1)</script>) into "${textInputs[0].label}"`,
+          "Then the input is treated as plain text and no script executes",
+        ],
+        [textInputs[0]]
+      )
+    );
+  }
+
+  // Edge: browser back after following a link.
+  if (links.length > 0) {
+    scenarios.push(
+      makeScenario(
+        `Verify browser back works after clicking "${links[0].label}" on ${pageTitle}`,
+        "edge",
+        pageTitle,
+        [
+          `Given the user is on "${pageTitle}"`,
+          `When the user clicks "${links[0].label}" and then uses the browser Back button`,
+          `Then the user returns to "${pageTitle}" without errors`,
+        ],
+        [links[0]]
+      )
+    );
+  }
+
+  return scenarios;
+}
+
+export function buildScenariosForPage(pageTitle: string, elements: ElementRecord[], formCount: number): ScenarioRecord[] {
+  // Smoke page-load + regression health are required for every discovered page --
+  // never skip them just because the page also has forms or clickable elements.
+  const scenarios: ScenarioRecord[] = [
+    ...buildBaselineCoverageScenarios(pageTitle, elements),
+    ...buildNegativeAndEdgeBaselines(pageTitle, elements),
+  ];
 
   if (formCount > 0) {
     const groups = groupByComponent(elements);
@@ -291,36 +493,19 @@ export function buildScenariosForPage(pageTitle: string, elements: ElementRecord
     }
   }
 
-  if (scenarios.length === 0) {
-    // No form on this page -- cover it by standalone interactive element
-    // (links, buttons) instead of one placeholder "page loads" scenario, so
-    // nav-heavy/link-only pages still get real, reviewable coverage.
-    const standalone = elements.filter((e) => ["link", "button"].includes(e.type) && e.label);
-    if (standalone.length > 0) {
-      for (const el of standalone.slice(0, MAX_STANDALONE_ELEMENTS)) {
-        scenarios.push(
-          makeScenario(
-            `Verify clicking "${el.label}" behaves as expected`,
-            "positive",
-            pageTitle,
-            [`Given the user is on "${pageTitle}"`, `When the user clicks "${el.label}"`, "Then the expected navigation or response occurs"],
-            [el],
-            "smoke" // core navigation/key-action coverage on a form-less page
-          )
-        );
-      }
-    } else {
-      scenarios.push(
-        makeScenario(
-          `Verify ${pageTitle} loads successfully`,
-          "positive",
-          pageTitle,
-          [`Given the user navigates to "${pageTitle}"`, "Then the page loads and its key elements render"],
-          elements.slice(0, 5),
-          "smoke"
-        )
-      );
-    }
+  // Nav/link coverage on every page (in addition to smoke/regression baselines).
+  const standalone = elements.filter((e) => ["link", "button"].includes(e.type) && e.label);
+  for (const el of standalone.slice(0, MAX_STANDALONE_ELEMENTS)) {
+    scenarios.push(
+      makeScenario(
+        `Verify clicking "${el.label}" behaves as expected`,
+        "positive",
+        pageTitle,
+        [`Given the user is on "${pageTitle}"`, `When the user clicks "${el.label}"`, "Then the expected navigation or response occurs"],
+        [el],
+        "functional"
+      )
+    );
   }
 
   return scenarios;
@@ -372,7 +557,7 @@ export function buildCrudFlowScenario(pageTitle: string, elements: ElementRecord
 // test case (its Given/When/And/Then steps) and an automation script, same as
 // any other scenario -- no separate manual/automation logic needed.
 
-const MAX_FLOW_SCENARIOS = 6; // cap so a large site doesn't flood review with journeys
+const MAX_FLOW_SCENARIOS = 20; // enough journeys so multi-page sites don't leave the flow slot thin
 const MAX_FLOW_DEPTH = 6; // longest journey (in pages) worth generating a single scenario for
 const MIN_FLOW_DEPTH = 2; // a "flow" needs at least 2 hops to mean anything beyond a single page
 
@@ -493,7 +678,7 @@ export function buildFlowScenariosForSite(
       id: nanoid(10),
       title: `Verify the end-to-end flow from "${titles[0]}" to "${titles[titles.length - 1]}"`,
       type: "flow",
-      tier: "functional", // multi-page journey, matches "multi-step flows... cross-page interactions"
+      tier: "regression", // core user journey -- part of the regression baseline
       flowGroup: `Journey: ${titles.join(" → ")}`,
       steps,
       locators,

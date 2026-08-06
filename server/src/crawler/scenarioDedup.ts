@@ -38,10 +38,16 @@ function jaccard(a: Set<string>, b: Set<string>): number {
   return intersection / (a.size + b.size - intersection);
 }
 
-// Catches near-duplicate generic scenarios like "Verify X loads successfully"
-// vs "Verify Y loads successfully" when steps are effectively the same template.
+// Catches near-duplicate scenarios on the SAME page/component only.
+// Never collapse across different flowGroups -- each discovered page must keep
+// its own smoke page-load / regression scenarios (e.g. Home vs Contact Us).
 export function isNearDuplicateScenario(a: ScenarioRecord, b: ScenarioRecord, threshold = 0.82): boolean {
   if (scenarioFingerprint(a) === scenarioFingerprint(b)) return true;
+  const groupA = a.flowGroup.toLowerCase().replace(/\s+/g, " ").trim();
+  const groupB = b.flowGroup.toLowerCase().replace(/\s+/g, " ").trim();
+  if (groupA !== groupB) return false;
+  if (a.tier !== b.tier) return false;
+  if (a.type !== b.type) return false;
   const aTokens = tokenSet(`${a.title} ${a.steps.join(" ")}`);
   const bTokens = tokenSet(`${b.title} ${b.steps.join(" ")}`);
   return jaccard(aTokens, bTokens) >= threshold;

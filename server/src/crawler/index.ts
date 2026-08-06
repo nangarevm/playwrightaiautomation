@@ -5,7 +5,7 @@
 // owns all persistence, so this module stays independently testable.
 
 import { runDiscoveryCrawl } from "./discovery.js";
-import { buildCrudFlowScenario, buildFlowScenariosForSite, buildScenariosForPage } from "./scenarios.js";
+import { buildCrudFlowScenario, buildFlowScenariosForSite, buildIntraPageFlowScenario, buildScenariosForPage } from "./scenarios.js";
 import { buildApiScenariosForSite } from "./apiScenarios.js";
 import { classifyChange, diffElements, hashElements, type ChangeStatus } from "./diff.js";
 import { collectPageSpellingIssues } from "./spellcheck.js";
@@ -126,6 +126,22 @@ export async function runCrawl(options: CrawlOptions, getBaseline: BaselineLooku
       siteFlowFingerprints.add(fp);
       const owner = output.find((p) => p.url === entryUrl);
       owner?.scenarios.push(scenario);
+    }
+  }
+
+  // Guarantee the flow slot is never empty for a page that has interactive
+  // elements when the site graph didn't yield a multi-page journey for it.
+  for (const page of output) {
+    if (page.changeStatus === "unchanged") continue;
+    const hasFlow = page.scenarios.some((s) => s.type === "flow");
+    if (hasFlow) continue;
+    const intra = buildIntraPageFlowScenario(page.title, page.elements);
+    if (intra) {
+      const fp = scenarioFingerprint(intra);
+      if (!siteFlowFingerprints.has(fp)) {
+        siteFlowFingerprints.add(fp);
+        page.scenarios.push(intra);
+      }
     }
   }
 

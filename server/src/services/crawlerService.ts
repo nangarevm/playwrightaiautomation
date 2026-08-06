@@ -12,7 +12,7 @@ import { scenarioFingerprint } from "../crawler/scenarioDedup.js";
 import { dedupeKey, normalizeUrl } from "../crawler/urlUtils.js";
 import { catalogScreen } from "./screensService.js";
 import { generateAutomationScript } from "./codegenService.js";
-import { logAudit } from "./adminService.js";
+import { logAudit, type CurrentUser } from "./adminService.js";
 import { runPostCrawlBugScan } from "./bugDetectionService.js";
 
 function normalizeUrlLocal(raw: string): string {
@@ -139,6 +139,10 @@ export async function startCrawl(params: {
       const scanStatuses = isRerun ? (["new", "changed"] as const) : undefined;
       runPostCrawlBugScan(siteId, { changeStatuses: scanStatuses ? [...scanStatuses] : undefined }).catch((err) => {
         console.warn(`[crawler] post-crawl bug scan failed for site ${siteId}: ${err?.message ?? err}`);
+      });
+      // Auto-generate regression/smoke test cases so the client gets a runnable baseline suite.
+      autoGenerateRegressionTests(siteId).catch((err) => {
+        console.warn(`[crawler] auto regression test generation failed for site ${siteId}: ${err?.message ?? err}`);
       });
       return summary;
     })
@@ -328,6 +332,42 @@ function persistCrawlResult(siteId: string, result: CrawlRunOutput, isRerun: boo
   return tx();
 }
 
+const SYSTEM_CRAWLER_ACTOR: CurrentUser = { id: "crawler-system", name: "Crawler System", role: "QA Lead" };
+
+/** After crawl: generate smoke, flow, regression, negative, and edge tests — no empty slots. */
+export async function autoGenerateRegressionTests(siteId: string, limit = 150): Promise<{ generated: number; skipped: number }> {
+  const scenarios = db
+    .prepare(
+      `SELECT id FROM crawl_scenarios
+       WHERE site_id = ? AND status = 'active' AND generated_test_case_id IS NULL
+         AND (
+           tier IN ('regression', 'smoke')
+           OR type IN ('flow', 'negative', 'edge')
+         )
+       ORDER BY CASE
+         WHEN tier = 'smoke' THEN 0
+         WHEN type = 'flow' THEN 1
+         WHEN tier = 'regression' THEN 2
+         WHEN type = 'negative' THEN 3
+         WHEN type = 'edge' THEN 4
+         ELSE 5
+       END, created_at ASC
+       LIMIT ?`
+    )
+    .all(siteId, limit) as Array<{ id: string }>;
+
+  if (scenarios.length === 0) return { generated: 0, skipped: 0 };
+
+  const results = await generateTestsFromScenarios(
+    scenarios.map((s) => s.id),
+    SYSTEM_CRAWLER_ACTOR
+  );
+  const generated = results.filter((r) => r.ok && r.testCaseId && !r.error?.includes("skipped")).length;
+  const skipped = results.length - generated;
+  logAudit(SYSTEM_CRAWLER_ACTOR, "crawl_auto_coverage_generated", "crawl_site", siteId, { generated, skipped, total: results.length });
+  return { generated, skipped };
+}
+
 export function getSiteDetail(siteId: string, opts?: { includeRemoved?: boolean }) {
   const site = getSite(siteId);
   if (!site) return null;
@@ -435,10 +475,11 @@ function cascadeRemoveGeneratedArtifacts(scenario: any) {
 // primary signal now; `type` still refines "functional" into the more specific
 // API/Negative buckets the rest of the platform already filters/reports on.
 function scenarioCategoryFor(scenario: { type: string; tier?: string }): string {
-  if (scenario.tier === "regression") return "Regression";
   if (scenario.type === "api") return "API";
   if (scenario.type === "negative") return "Negative";
+  if (scenario.type === "edge") return "Edge Case";
   if (scenario.tier === "smoke") return "Smoke";
+  if (scenario.tier === "regression") return "Regression";
   return "Functional";
 }
 
@@ -484,7 +525,10 @@ export async function generateTestsFromScenarios(scenarioIds: string[], actorUse
       }
 
       const steps: string[] = JSON.parse(scenario.steps_json);
+      const locators: string[] = JSON.parse(scenario.locators_json || "[]");
       const screen = db.prepare("SELECT id FROM screens WHERE url_or_path = ? ORDER BY updated_at DESC LIMIT 1").get(page?.url) as any;
+      const pageUrl = page?.url ?? site.url;
+      const crawlMetaSuffix = ` CRAWL_URL=${pageUrl}${locators.length ? ` LOCATORS=${JSON.stringify(locators)}` : ""}`;
 
       // Skip if an equivalent test case already exists for this screen (title + steps match).
       if (screen) {
@@ -521,8 +565,8 @@ export async function generateTestsFromScenarios(scenarioIds: string[], actorUse
         // trailing (no parenthesis/period), unlike the UI-scenario rationale below.
         rationale:
           scenario.type === "api"
-            ? `Discovered by the AI crawler on ${page?.url ?? site.url} -- API endpoint ${scenario.flow_group}`
-            : `Discovered by the AI crawler on ${page?.url ?? site.url} (${scenario.flow_group}).`,
+            ? `Discovered by the AI crawler on ${pageUrl} -- API endpoint ${scenario.flow_group}`
+            : `Discovered by the AI crawler on ${pageUrl} (${scenario.flow_group}).${crawlMetaSuffix}`,
         created_at: now,
         updated_at: now,
       });

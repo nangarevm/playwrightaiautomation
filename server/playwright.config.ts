@@ -35,7 +35,7 @@ const workers = reuseBrowser ? 1 : Math.max(1, requestedConcurrency);
 // "Project(s) ... not found" on every multi-browser run.
 export default defineConfig({
   testDir: "./generated",
-  timeout: 15000,
+  timeout: 45000,
   retries: 0,
   workers,
   // Phase 6: real Allure reporting, not just Playwright's own JSON/HTML report.
@@ -52,6 +52,8 @@ export default defineConfig({
     video: videoSetting,
     trace: traceSetting,
     headless: headlessSetting,
+    navigationTimeout: 30000,
+    actionTimeout: 15000,
   },
   projects: [
     { name: "chromium", use: { ...devices["Desktop Chrome"] } },

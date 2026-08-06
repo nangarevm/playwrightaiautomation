@@ -6,7 +6,7 @@ import { fileURLToPath } from "url";
 import { db } from "../db.js";
 import { recordTimeBreakdownForRun, updateFlakyFlagForScript } from "./reportingService.js";
 import { autoFileBugOnRegression, notifyAllOnRunComplete } from "./integrationsService.js";
-import { runBugScanForScreen } from "./bugDetectionService.js";
+import { runBugScanForScreen, recordBugFinding } from "./bugDetectionService.js";
 import { decryptSecret } from "./secretsService.js";
 import { getEnvironment, preflightHealthCheck } from "./environmentsService.js";
 import { logAudit } from "./adminService.js";
@@ -805,23 +805,26 @@ export function runExecution(scriptId: string, targetUrl: string, input: any = {
         const classifyTestFailure = (message: string | null): { failureClass: string; failureLabel: string } => {
           if (!message) return { failureClass: "unknown", failureLabel: "No error detail captured" };
           const m = message.toLowerCase();
-          // The generated script itself doesn't even run/parse -- always a script
-          // bug, never a product defect (e.g. a malformed API URL passed to
-          // apiRequestContext.get, or invalid syntax in the emitted file).
           if (/syntaxerror|typeerror.*invalid url|invalid url/.test(m)) {
             return { failureClass: "automation_issue", failureLabel: "Automation script issue -- the generated script itself is malformed (syntax/invalid input), not a product defect" };
           }
           if (/net::err_|err_connection_refused|err_name_not_resolved|err_connection_timed_out|err_connection_reset|err_internet_disconnected/.test(m)) {
             return { failureClass: "environment_issue", failureLabel: "Target unreachable (network/environment issue, not a product defect)" };
           }
+          if (/returned http [45]\d\d|response\.ok|tohavetitle.*received|tobevisible.*received|not visible|404|page not found|internal server error/.test(m)) {
+            return { failureClass: "possible_bug", failureLabel: "Possible product bug -- page content or HTTP response did not match expectations" };
+          }
+          if (/expect\(.*\)\.|assert/.test(m)) {
+            return { failureClass: "possible_bug", failureLabel: "Possible product bug -- an assertion did not match actual page/API content" };
+          }
           if (/(getbylabel|getbyrole|getbytext|getbytestid|getbyplaceholder|locator\()/.test(m) && /(timeout|waiting for)/.test(m)) {
             return { failureClass: "automation_issue", failureLabel: "Automation script issue -- the generated locator didn't match anything on the page" };
           }
-          if (/test timeout of \d+ms exceeded/.test(m) && !/expect\(/.test(m)) {
-            return { failureClass: "automation_issue", failureLabel: "Automation script issue -- step timed out before reaching an assertion" };
-          }
-          if (/expect\(.*\)\.|assert/.test(m) || /returned http 5\d\d|response\.ok/.test(m)) {
-            return { failureClass: "possible_bug", failureLabel: "Possible product bug -- an assertion did not match actual page/API content" };
+          if (/test timeout of \d+ms exceeded/.test(m)) {
+            if (/(getbylabel|getbyrole|getbytext|getbytestid|getbyplaceholder|locator\()/.test(m)) {
+              return { failureClass: "automation_issue", failureLabel: "Automation script issue -- step timed out before reaching an assertion" };
+            }
+            return { failureClass: "possible_bug", failureLabel: "Possible product bug -- the page did not become ready within the time limit (slow load, broken page, or blocked content)" };
           }
           return { failureClass: "unknown", failureLabel: "Uncategorized failure -- review the error detail" };
         };
@@ -892,6 +895,24 @@ export function runExecution(scriptId: string, targetUrl: string, input: any = {
                 failure_label: ft.failureLabel,
                 created_at: evNow,
               });
+
+              // Surface likely product defects in the Bugs tab, not only as test-run noise.
+              if (ft.failureClass === "possible_bug") {
+                recordBugFinding({
+                  source: "regression",
+                  severity: "high",
+                  title: `Possible product defect: ${ft.title}`,
+                  detail: ft.errorMessage || ft.failureLabel,
+                  screenId: testCase?.screen_id ?? null,
+                  runId,
+                  evidence: { testTitle: ft.title, testFile: ft.file, failureClass: ft.failureClass },
+                  stepsToReproduce: [
+                    `Run the automated test: ${ft.title}`,
+                    `Target URL: ${targetUrl}`,
+                    `Observe failure: ${ft.failureLabel}`,
+                  ],
+                });
+              }
             }
           }
         } catch {

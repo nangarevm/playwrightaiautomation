@@ -561,7 +561,7 @@ export interface CrawlScenario {
   site_id: string;
   page_id: string;
   title: string;
-  type: "positive" | "negative" | "flow" | "api";
+  type: "positive" | "negative" | "edge" | "flow" | "api";
   // Which of the three test suites this belongs to -- see server's
   // crawler/types.ts ScenarioRecord.tier for the smoke/functional/regression
   // definitions. Nullable only for pre-migration rows the backfill hasn't

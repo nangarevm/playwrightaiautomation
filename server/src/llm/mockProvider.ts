@@ -89,7 +89,8 @@ export const mockProvider: LlmProvider = {
   async generatePlaywrightScript(testCase, options): Promise<string> {
     const language = options?.language ?? "typescript";
     const framework = options?.framework ?? "playwright";
-    const isLogin = testCase.title.toLowerCase().includes("login");
+    const crawlMeta = extractCrawlMeta(options?.apiSpecHint);
+    const isLogin = isLoginFlowTest(testCase);
 
     // FR-3.5: API-category test cases (generated from Swagger/Postman input) get
     // a distinct request-based script -- Playwright's APIRequestContext hitting
@@ -129,6 +130,11 @@ export const mockProvider: LlmProvider = {
         password: "demo_pass_123",
         expectError: false,
       }, language);
+    }
+
+    // Crawler-discovered scenarios: use the real page URL and locators captured during crawl.
+    if (crawlMeta.url || crawlMeta.locators.length > 0) {
+      return buildCrawledPlaywrightScript(testCase, language, crawlMeta);
     }
 
     // Generic fallback script
@@ -227,6 +233,97 @@ const ROLE_HINT_PATTERN = /\b(button|link|field|input|checkbox|radio|label|headi
 // a defensive backstop; locators.ts/discovery.ts also normalize at the source.
 function collapseWhitespace(s: string): string {
   return s.replace(/\s+/g, " ").trim();
+}
+
+/** Page titles like "Login Portal" are not login-form tests unless steps mention credentials. */
+function isLoginFlowTest(testCase: { title: string; steps: string[] }): boolean {
+  const stepsText = testCase.steps.join(" ").toLowerCase();
+  const title = testCase.title.toLowerCase();
+  if (/username|password|log in|sign in|credentials/.test(stepsText)) return true;
+  if (/\b(login fails|log in with|sign in with|incorrect password|empty.*field|valid credentials)\b/.test(title)) return true;
+  return false;
+}
+
+function extractCrawlMeta(hint?: string): { url?: string; locators: string[] } {
+  if (!hint) return { locators: [] };
+  const url =
+    hint.match(/CRAWL_URL=(\S+)/)?.[1] ??
+    hint.match(/Discovered by the AI crawler on (https?:\/\/\S+)/)?.[1]?.replace(/\.$/, "");
+  const locMatch = hint.match(/LOCATORS=(\[[\s\S]*?\])(?:\s|$)/);
+  let locators: string[] = [];
+  if (locMatch) {
+    try {
+      locators = JSON.parse(locMatch[1]);
+    } catch {
+      locators = [];
+    }
+  }
+  return { url, locators };
+}
+
+function resolveTargetUrl(crawlUrl?: string): string {
+  return crawlUrl || process.env.TARGET_URL || "http://localhost:4100/demo/login.html";
+}
+
+function escapeForTsString(s: string): string {
+  return s.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+}
+
+/** Build a script from crawler-captured URL + Playwright locator expressions. */
+function buildCrawledPlaywrightScript(
+  testCase: { title: string; steps: string[]; expected_result: string },
+  language: "typescript" | "javascript" | "python",
+  crawlMeta: { url?: string; locators: string[] }
+): string {
+  const targetUrl = resolveTargetUrl(crawlMeta.url);
+  const title = escapeForTsString(testCase.title);
+  const isFlow = /end-to-end flow/i.test(testCase.title);
+
+  const stepLines: string[] = [];
+  let locatorIdx = 0;
+  for (const step of testCase.steps) {
+    const stepLower = step.toLowerCase();
+    const locator = crawlMeta.locators[locatorIdx] ?? crawlMeta.locators[crawlMeta.locators.length - 1];
+    if (locator && /(click|navigat|toggle|select)/.test(stepLower)) {
+      if (/navigat/.test(stepLower) && stepLower.includes("given")) {
+        stepLines.push(`  // ${collapseWhitespace(step)}`);
+        continue;
+      }
+      stepLines.push(`  await ${locator}.click();`);
+      stepLines.push(`  await page.waitForLoadState('domcontentloaded');`);
+      if (/click|toggle|select/.test(stepLower)) locatorIdx++;
+    } else {
+      stepLines.push(`  // ${collapseWhitespace(step)}`);
+    }
+  }
+
+  if (language === "python") {
+    return `from playwright.sync_api import sync_playwright, expect
+
+# Auto-generated from crawler-discovered scenario (mock provider)
+with sync_playwright() as p:
+    browser = p.chromium.launch(headless=True)
+    page = browser.new_page()
+    page.goto("${targetUrl}", wait_until="domcontentloaded", timeout=45000)
+    page.wait_for_load_state("domcontentloaded")
+    expect(page).to_have_title(/.+/)
+    browser.close()
+`;
+  }
+
+  const flowAssertion = isFlow
+    ? `  await expect(page.locator('body')).toBeVisible();\n  await expect(page).toHaveTitle(/.+/);`
+    : `  await expect(page).toHaveTitle(/.+/);\n  await expect(page.locator('body')).toBeVisible();`;
+
+  return `import { test, expect } from '@playwright/test';
+
+// Auto-generated from crawler-discovered scenario (mock provider)
+test('${title}', async ({ page }) => {
+  await page.goto('${escapeForTsString(targetUrl)}', { waitUntil: 'domcontentloaded', timeout: 45000 });
+  await page.waitForLoadState('domcontentloaded');
+${stepLines.length ? stepLines.join("\n") + "\n" : ""}${flowAssertion}
+});
+`;
 }
 
 function resolveLocatorForStep(stepText: string, language: "typescript" | "javascript" | "python"): { code: string; usedFallback: boolean } {
