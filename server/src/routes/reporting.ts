@@ -1,5 +1,6 @@
 import { Router } from "express";
 import {
+  buildBugReportPdf,
   buildInteractiveHtmlReport,
   buildReleaseReportPdf,
   buildReleaseReportXlsx,
@@ -81,6 +82,25 @@ reportingRouter.get("/export.pdf", async (_req, res) => {
     const buffer = await buildReleaseReportPdf();
     res.setHeader("Content-Type", "application/pdf");
     res.setHeader("Content-Disposition", "attachment; filename=release-report.pdf");
+    res.send(buffer);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Customer-facing bug report PDF for a single crawl/batch (Crawler tab's "Download
+// bug report as PDF"). The failure list is client-assembled (see buildBugReportPdf's
+// comment) and posted here rather than looked up by runId, since the client's
+// classification/grouping is already the source of truth for what the user sees.
+reportingRouter.post("/bug-report.pdf", async (req, res) => {
+  try {
+    const { entries } = req.body as { entries?: unknown };
+    if (!Array.isArray(entries) || entries.length === 0) {
+      return res.status(400).json({ error: "entries (non-empty array) is required" });
+    }
+    const buffer = await buildBugReportPdf(entries as any);
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader("Content-Disposition", "attachment; filename=bug-report.pdf");
     res.send(buffer);
   } catch (err: any) {
     res.status(500).json({ error: err.message });

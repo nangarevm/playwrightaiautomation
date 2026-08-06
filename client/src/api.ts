@@ -266,6 +266,9 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ script_id: ref.scriptId, test_case_id: ref.testCaseId, target_url: targetUrl }),
     }),
+  // FR-6.5 per-failed-test evidence for a single run, including the real
+  // Playwright error message captured when the run completed.
+  getExecutionEvidence: (runId: string): Promise<ExecutionEvidenceRow[]> => req(`/execution-runs/${runId}/evidence`),
   // Stop execution: kill a single run in flight (running or still queued).
   stopExecutionRun: (runId: string) => req(`/execution-runs/${runId}/stop`, { method: "POST" }),
   // Stop everything currently running or queued -- "abandon this batch".
@@ -496,8 +499,34 @@ export const api = {
     req(`/bugs/${id}`, { method: "PATCH", body: JSON.stringify({ status }) }),
   fileBugFinding: (id: string): Promise<BugFindingRow> => req(`/bugs/${id}/file`, { method: "POST" }),
 
-  // Allure reporting (Phase 6)
-  allureGenerate: () => req("/allure/generate", { method: "POST" }),
+  // Customer-facing bug report PDF for a crawl/batch's failures -- the entries
+  // themselves are assembled client-side (see BugReportPanel), posted here for
+  // pdfkit rendering since this platform's PDF generation is server-side only.
+  downloadBugReportPdf: async (entries: Array<Record<string, unknown>>, filename = "bug-report.pdf") => {
+    const res = await fetch("/api/reporting/bug-report.pdf", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ entries }),
+    });
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      throw new Error(body.error || `PDF generation failed (${res.status})`);
+    }
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+  },
+
+  // Allure reporting (Phase 6). sinceMs scopes generation to result files recorded
+  // at/after that epoch-ms timestamp (e.g. "this crawl's runs" instead of the
+  // platform's entire accumulated history) -- omit for the full-history report.
+  allureGenerate: (sinceMs?: number) => req("/allure/generate", { method: "POST", body: JSON.stringify({ sinceMs }) }),
   allureStatus: () => req("/allure/status"),
   allureDownloadUrl: "/api/allure/download",
   allureEmailStatus: (): Promise<{ configured: boolean }> => req("/allure/email-status"),
@@ -533,12 +562,25 @@ export interface CrawlScenario {
   page_id: string;
   title: string;
   type: "positive" | "negative" | "flow" | "api";
+  // Which of the three test suites this belongs to -- see server's
+  // crawler/types.ts ScenarioRecord.tier for the smoke/functional/regression
+  // definitions. Nullable only for pre-migration rows the backfill hasn't
+  // reached yet (shouldn't happen in practice; ensureColumn's backfill runs
+  // on every server start).
+  tier: "smoke" | "functional" | "regression" | null;
   flow_group: string;
   steps: string[];
   locators: string[];
   status: string;
   generated_test_case_id?: string;
   created_at: string;
+}
+
+export interface CrawlComponentInventoryItem {
+  kind: string;
+  label: string;
+  count: number;
+  samples: string[];
 }
 
 export interface CrawlPage {
@@ -553,11 +595,28 @@ export interface CrawlPage {
   apis: Array<{ trigger: string; method: string; endpoint: string; schema: any }>;
   scenarios: CrawlScenario[];
   spellingIssues: CrawlSpellingIssue[];
+  componentInventory: CrawlComponentInventoryItem[];
 }
 
 export interface CrawlSiteDetail {
   site: CrawlSite;
   pages: CrawlPage[];
+}
+
+export interface ExecutionEvidenceRow {
+  id: string;
+  run_id: string;
+  test_title: string | null;
+  test_file: string | null;
+  status: string | null;
+  evidence_path: string | null;
+  error_message: string | null;
+  // Heuristic "why did this fail" bucket: 'automation_issue' (the script's own
+  // locator/timeout), 'environment_issue' (target unreachable), 'possible_bug'
+  // (a real content/behavior mismatch), or 'unknown'.
+  failure_class: "automation_issue" | "environment_issue" | "possible_bug" | "unknown" | null;
+  failure_label: string | null;
+  created_at: string;
 }
 
 export interface BugFindingRow {

@@ -9,8 +9,9 @@ export const allureRouter = Router();
 // Phase 6: confirms report generation succeeded (file count, index.html present)
 // BEFORE the client enables its download/view button -- so a failure shows up
 // here rather than producing an empty/broken download.
-allureRouter.post("/generate", async (_req, res) => {
-  const result = await generateAllureReport();
+allureRouter.post("/generate", async (req, res) => {
+  const sinceMs = req.body?.sinceMs ? Number(req.body.sinceMs) : undefined;
+  const result = await generateAllureReport(sinceMs && Number.isFinite(sinceMs) ? sinceMs : undefined);
   if (!result.ok) return res.status(502).json(errBody(502, result.message, result));
   res.json(result);
 });

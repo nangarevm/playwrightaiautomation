@@ -9,7 +9,7 @@ import { buildCrudFlowScenario, buildFlowScenariosForSite, buildScenariosForPage
 import { buildApiScenariosForSite } from "./apiScenarios.js";
 import { classifyChange, diffElements, hashElements, type ChangeStatus } from "./diff.js";
 import { collectPageSpellingIssues } from "./spellcheck.js";
-import type { ApiCallRecord, CrawlOptions, ElementRecord, PageDiff, ScenarioRecord, SpellingIssue } from "./types.js";
+import type { ApiCallRecord, ComponentInventoryItem, CrawlOptions, ElementRecord, PageDiff, ScenarioRecord, SpellingIssue } from "./types.js";
 
 export interface CrawledPageOutput {
   url: string;
@@ -21,6 +21,7 @@ export interface CrawledPageOutput {
   changeStatus: ChangeStatus;
   diff: PageDiff | null;
   spellingIssues: SpellingIssue[];
+  componentInventory: ComponentInventoryItem[];
 }
 
 export interface CrawlRunOutput {
@@ -76,6 +77,7 @@ export async function runCrawl(options: CrawlOptions, getBaseline: BaselineLooku
       changeStatus,
       diff,
       spellingIssues: collectPageSpellingIssues(discovered.title, discovered.elements),
+      componentInventory: discovered.componentInventory,
     };
   });
 

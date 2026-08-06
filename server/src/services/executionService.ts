@@ -389,7 +389,15 @@ function normalizeProfile(input: any): any {
     provider: input?.provider || "local",
     runner_pool_name: input?.runner_pool_name || null,
     reserved_runner_count: Number(input?.reserved_runner_count || 0),
-    headless_mode: input?.headless_mode ? 1 : 0,
+    // Defaults to headless unless a profile/request explicitly opts into headed
+    // (0/false) -- previously any run with no explicit headless_mode (e.g. "Run
+    // all"/"Run selected" with no profile selected, which is the common case for
+    // a fresh workspace) fell through to headed (0), spinning up a full visible
+    // Chrome window per test. Fine for one test; catastrophic for a large batch --
+    // dozens of concurrent headed windows contend for CPU/GPU/memory badly enough
+    // that page loads blow past the 15s test timeout across the whole run, which
+    // is exactly the "all tests timing out" failure mode this was causing.
+    headless_mode: input?.headless_mode === false || input?.headless_mode === 0 ? 0 : 1,
     reuse_browser_instances: input?.reuse_browser_instances ? 1 : 0,
     is_default_for_team: input?.is_default_for_team ? 1 : 0,
     is_default_for_suite: input?.is_default_for_suite ? 1 : 0,
@@ -608,6 +616,12 @@ export function runExecution(scriptId: string, targetUrl: string, input: any = {
     const reuseBrowser = Number(config.reuse_browser_instances || 0) === 1;
     const headless = Number(config.headless_mode || 0) === 1;
 
+    // FR-4.24/FR-4.28: speed_mode defaults to 'fast' (existing checkpointed behavior) unless
+    // the caller (Ultrafast trigger route) explicitly passes 'ultrafast', or the resolved
+    // profile has a saved default_speed_mode. Computed here (rather than further down, where
+    // it used to live) because the retry decision immediately below needs it.
+    const speedMode: string = input.speed_mode === "ultrafast" ? "ultrafast" : (profile?.default_speed_mode === "ultrafast" && input.speed_mode !== "fast") ? "ultrafast" : "fast";
+
     // FR-4.1/FR-4.9: always pass an explicit --project set matching the selected
     // browser set. Previously "chromium" (the default) passed no --project flag at
     // all, and since playwright.config.ts now declares all three projects, an
@@ -634,6 +648,17 @@ export function runExecution(scriptId: string, targetUrl: string, input: any = {
       args.push("--retries=1");
       if (testCase?.title) args.push(`--grep=${escapeGrepRegex(testCase.title)}`);
     }
+    // Ultrafast-triggered runs (Crawler's "Generate + Run", Execution tab's quick
+    // trigger) never go through the Execution Settings Panel, so retry_strategy is
+    // whatever normalizeProfile() defaulted to -- "no-retry" -- unless a saved
+    // profile with an explicit strategy was resolved. A single-attempt run means
+    // a transient hiccup (page briefly slow, one flaky network blip) gets reported
+    // as a hard failure/bug indistinguishable from a real defect. Retry once before
+    // confirming failed, same as retry-flaky, but only when nothing more specific
+    // was already requested above.
+    if (speedMode === "ultrafast" && retryStrategy === "no-retry") {
+      args.push("--retries=1");
+    }
     if (selectionMode === "flaky-tests-only") args.push("--grep=flaky");
 
     // FR-4.21: decrypt and inject only the secrets this specific script
@@ -659,11 +684,6 @@ export function runExecution(scriptId: string, targetUrl: string, input: any = {
 
     // FR-4.4: which CI/CD tool triggered this run, when invoked via the webhook route.
     const ciSource: string | null = input.ci_source ?? null;
-
-    // FR-4.24/FR-4.28: speed_mode defaults to 'fast' (existing checkpointed behavior) unless
-    // the caller (Ultrafast trigger route) explicitly passes 'ultrafast', or the resolved
-    // profile has a saved default_speed_mode.
-    const speedMode: string = input.speed_mode === "ultrafast" ? "ultrafast" : (profile?.default_speed_mode === "ultrafast" && input.speed_mode !== "fast") ? "ultrafast" : "fast";
     const environmentId: string | null = input.environment_id ?? null;
 
     // FR-4.6: the actual worker count Playwright will use for this run -- mirrors the
@@ -774,6 +794,38 @@ export function runExecution(scriptId: string, targetUrl: string, input: any = {
           /* best-effort evidence lookup */
         }
 
+        // Heuristic "why did this actually fail" classification -- distinguishes a
+        // generated script's own locator/selector problem (the AI targeted an
+        // element that doesn't exist on this page) or an unreachable target
+        // (DNS/connection refused -- a network/environment problem, not the
+        // product under test) from a genuine content/behavior mismatch worth
+        // reporting as a real bug. Order matters: check the more specific
+        // (automation/environment) patterns before falling back to "possible_bug"
+        // so an ambiguous message doesn't get over-classified as a real defect.
+        const classifyTestFailure = (message: string | null): { failureClass: string; failureLabel: string } => {
+          if (!message) return { failureClass: "unknown", failureLabel: "No error detail captured" };
+          const m = message.toLowerCase();
+          // The generated script itself doesn't even run/parse -- always a script
+          // bug, never a product defect (e.g. a malformed API URL passed to
+          // apiRequestContext.get, or invalid syntax in the emitted file).
+          if (/syntaxerror|typeerror.*invalid url|invalid url/.test(m)) {
+            return { failureClass: "automation_issue", failureLabel: "Automation script issue -- the generated script itself is malformed (syntax/invalid input), not a product defect" };
+          }
+          if (/net::err_|err_connection_refused|err_name_not_resolved|err_connection_timed_out|err_connection_reset|err_internet_disconnected/.test(m)) {
+            return { failureClass: "environment_issue", failureLabel: "Target unreachable (network/environment issue, not a product defect)" };
+          }
+          if (/(getbylabel|getbyrole|getbytext|getbytestid|getbyplaceholder|locator\()/.test(m) && /(timeout|waiting for)/.test(m)) {
+            return { failureClass: "automation_issue", failureLabel: "Automation script issue -- the generated locator didn't match anything on the page" };
+          }
+          if (/test timeout of \d+ms exceeded/.test(m) && !/expect\(/.test(m)) {
+            return { failureClass: "automation_issue", failureLabel: "Automation script issue -- step timed out before reaching an assertion" };
+          }
+          if (/expect\(.*\)\.|assert/.test(m) || /returned http 5\d\d|response\.ok/.test(m)) {
+            return { failureClass: "possible_bug", failureLabel: "Possible product bug -- an assertion did not match actual page/API content" };
+          }
+          return { failureClass: "unknown", failureLabel: "Uncategorized failure -- review the error detail" };
+        };
+
         // FR-6.5: per-failed-test evidence entries, parsed from Playwright's own JSON reporter
         // output (--reporter=json on stdout) instead of one evidence_path for the whole run.
         // This is test-level granularity (one row per failed test), not step/action-level --
@@ -781,14 +833,34 @@ export function runExecution(scriptId: string, targetUrl: string, input: any = {
         // per-step implementation isn't attempted here; this is the honest partial improvement.
         try {
           const parsed = JSON.parse(stdout);
-          const failedTests: Array<{ title: string; file: string; status: string }> = [];
+          const failedTests: Array<{ title: string; file: string; status: string; errorMessage: string | null; failureClass: string; failureLabel: string }> = [];
           const walkSuites = (suites: any[], filePrefix = "") => {
             for (const suite of suites ?? []) {
               const file = suite.file || filePrefix;
               for (const spec of suite.specs ?? []) {
                 if (!spec.ok) {
                   for (const t of spec.tests ?? []) {
-                    failedTests.push({ title: spec.title, file, status: t.status || "failed" });
+                    // The JSON reporter nests the actual failure under
+                    // results[] (one per retry attempt) -- error.message is the
+                    // human-readable "why" (e.g. "Test timeout of 15000ms
+                    // exceeded... waiting for getByLabel('Username')"); errors[]
+                    // is used as a fallback since some Playwright versions only
+                    // populate that array. Take the last attempt's error since
+                    // that's the one that actually decided the final outcome.
+                    const lastResult = (t.results ?? [])[(t.results ?? []).length - 1];
+                    const rawMessage = lastResult?.error?.message ?? lastResult?.errors?.[0]?.message ?? null;
+                    // eslint-disable-next-line no-control-regex
+                    const stripAnsi = (s: string) => s.replace(/\x1b\[[0-9;]*m/g, "");
+                    const errorMessage = rawMessage ? stripAnsi(String(rawMessage)).slice(0, 2000) : null;
+                    const { failureClass, failureLabel } = classifyTestFailure(errorMessage);
+                    failedTests.push({
+                      title: spec.title,
+                      file,
+                      status: t.status || "failed",
+                      errorMessage,
+                      failureClass,
+                      failureLabel,
+                    });
                   }
                 }
               }
@@ -799,8 +871,8 @@ export function runExecution(scriptId: string, targetUrl: string, input: any = {
 
           if (failedTests.length > 0) {
             const insertEvidence = db.prepare(`
-              INSERT INTO execution_evidence (id, run_id, test_title, test_file, status, evidence_path, created_at)
-              VALUES (@id, @run_id, @test_title, @test_file, @status, @evidence_path, @created_at)
+              INSERT INTO execution_evidence (id, run_id, test_title, test_file, status, evidence_path, error_message, failure_class, failure_label, created_at)
+              VALUES (@id, @run_id, @test_title, @test_file, @status, @evidence_path, @error_message, @failure_class, @failure_label, @created_at)
             `);
             const evNow = new Date().toISOString();
             for (const ft of failedTests) {
@@ -815,6 +887,9 @@ export function runExecution(scriptId: string, targetUrl: string, input: any = {
                 test_file: ft.file,
                 status: ft.status,
                 evidence_path: matchedDir ? path.join(resultsDir, matchedDir) : evidencePath,
+                error_message: ft.errorMessage,
+                failure_class: ft.failureClass,
+                failure_label: ft.failureLabel,
                 created_at: evNow,
               });
             }

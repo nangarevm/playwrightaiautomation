@@ -4,6 +4,7 @@ import { db } from '../src/db.ts';
 import { saveVisualBaseline, diffAgainstVisualBaseline } from '../src/services/screensService.ts';
 
 function resetScreens() {
+  db.prepare('DELETE FROM bug_findings').run(); // FK to screens, must go first
   db.prepare('DELETE FROM screens').run();
 }
 

@@ -42,18 +42,24 @@ export async function extractElementLocators(page: Page, handle: Locator): Promi
     const testId = el.getAttribute("data-testid") || el.getAttribute("data-test") || el.getAttribute("data-qa");
     const role = el.getAttribute("role") || (tag === "button" ? "button" : tag === "a" ? "link" : tag === "input" ? (el.getAttribute("type") === "checkbox" ? "checkbox" : "textbox") : tag === "select" ? "combobox" : null);
     const id = el.id || null;
-    const text = (el.textContent || "").trim().slice(0, 60);
+    // Multi-line/wrapped element text (e.g. a button label that wraps across
+    // lines in the DOM) carries literal newlines/tabs in textContent -- .trim()
+    // only strips the ends, not internal whitespace. Collapsing to single spaces
+    // here (not just at codegen time) keeps every downstream consumer of this
+    // label -- scenario titles/steps, generated code comments -- newline-free.
+    const collapseWhitespace = (s: string) => s.replace(/\s+/g, " ").trim();
+    const text = collapseWhitespace(el.textContent || "").slice(0, 60);
     const ariaLabel = el.getAttribute("aria-label");
     const placeholder = el.getAttribute("placeholder");
 
     let labelText: string | null = null;
     if (id) {
       const labelEl = document.querySelector(`label[for="${CSS.escape(id)}"]`);
-      if (labelEl) labelText = (labelEl.textContent || "").trim();
+      if (labelEl) labelText = collapseWhitespace(labelEl.textContent || "");
     }
     if (!labelText) {
       const closestLabel = el.closest("label");
-      if (closestLabel) labelText = (closestLabel.textContent || "").trim();
+      if (closestLabel) labelText = collapseWhitespace(closestLabel.textContent || "");
     }
 
     const accessibleName = ariaLabel || labelText || text || placeholder || null;
@@ -62,7 +68,7 @@ export async function extractElementLocators(page: Page, handle: Locator): Promi
     const closestFormLabel =
       closestForm?.getAttribute("aria-label") ||
       closestForm?.getAttribute("name") ||
-      (closestForm?.querySelector("h1,h2,h3,legend")?.textContent || "").trim() ||
+      collapseWhitespace(closestForm?.querySelector("h1,h2,h3,legend")?.textContent || "") ||
       (closestForm ? "Form" : null);
 
     const closestSection = el.closest("[role='navigation'], nav, header, footer, section, [aria-label]");

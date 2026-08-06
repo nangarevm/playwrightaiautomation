@@ -29,7 +29,24 @@ const PRICING_USD_PER_MTOK: Record<ModelTier, { input: number; output: number }>
   economy: { input: 0.25, output: 1.25 },
 };
 
-const CACHE_SIMILARITY_THRESHOLD = 0.82;
+// Fuzzy (Jaccard-similarity) cache matching is safe for test-case generation --
+// worst case, a near-duplicate description gets a slightly-off but still
+// plausible title/rationale back. It is NOT safe for script_generation: the
+// cached response is real Playwright code with a specific field's actual
+// locators/labels baked in (e.g. page.getByLabel('Email')). A "near-duplicate"
+// scenario that differs only in which field/page it targets (very common
+// across the AI Crawler's templated per-field/per-form scenarios -- "Verify
+// Contact Form rejects an invalid email in 'Email'" vs. "...in 'Phone'") would
+// return code that clicks/fills the WRONG element: a token-savings "win" that
+// silently produces an incorrect automation script and a false sense of
+// coverage. So script_generation only cache-hits on an exact (1.0) match of
+// its normalized prompt -- still a real, correctness-safe token saving for
+// genuine duplicates (the same field pattern re-crawled unchanged, or the
+// same field/form appearing verbatim on more than one page).
+const CACHE_SIMILARITY_THRESHOLD: Record<LlmCallType, number> = {
+  test_case_generation: 0.82,
+  script_generation: 1,
+};
 const CACHE_MAX_ENTRIES = 200;
 const COMPRESSION_TRIGGER_CHARS = 1200; // only compress inputs large enough for it to matter (FR-9.6: "large inputs")
 
@@ -67,9 +84,10 @@ function jaccardSimilarity(a: Set<string>, b: Set<string>): number {
 // request of the same call type, or null on a cache miss.
 function findCacheHit<T>(callType: LlmCallType, prompt: string): T | null {
   const candidateTokens = normalizeToTokenSet(prompt);
+  const threshold = CACHE_SIMILARITY_THRESHOLD[callType];
   for (const entry of semanticCache) {
     if (entry.callType !== callType) continue;
-    if (jaccardSimilarity(candidateTokens, entry.tokenSet) >= CACHE_SIMILARITY_THRESHOLD) {
+    if (jaccardSimilarity(candidateTokens, entry.tokenSet) >= threshold) {
       return entry.response as T;
     }
   }

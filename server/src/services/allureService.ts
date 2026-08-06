@@ -51,27 +51,72 @@ let inFlightGeneration: Promise<AllureGenerateResult> | null = null;
 // project's devDependency, via `npx --package=allure-commandline`, or a global
 // `npm install -g allure-commandline`) -- previously a missing commandline
 // tool silently produced incomplete/non-openable output with no clear signal.
-export async function generateAllureReport(): Promise<AllureGenerateResult> {
+//
+// `sinceMs`: allure-results/ accumulates a raw JSON file per test EVERY run,
+// forever (nothing ever clears it) -- so an unscoped generate always builds
+// from the platform's ENTIRE history, not just the runs a caller cares about.
+// The Crawler tab's panel is explicitly labeled "from this crawl's runs" but
+// was actually showing that same aggregate (e.g. hundreds of stale results
+// from unrelated past sessions instead of the dozen tests just run). Passing
+// a `sinceMs` timestamp here restricts generation to result files whose
+// recorded start time is at or after it.
+export async function generateAllureReport(sinceMs?: number): Promise<AllureGenerateResult> {
   if (inFlightGeneration) return inFlightGeneration;
-  inFlightGeneration = runAllureGenerate().finally(() => {
+  inFlightGeneration = runAllureGenerate(sinceMs).finally(() => {
     inFlightGeneration = null;
   });
   return inFlightGeneration;
 }
 
-async function runAllureGenerate(): Promise<AllureGenerateResult> {
+// Each allure-playwright *-result.json carries a `start` epoch-ms field for the
+// test attempt it records. Container/attachment/env files have no such field
+// (and no natural "which run" association) -- they're always kept; an orphan
+// container referencing a filtered-out result is harmless, Allure just ignores it.
+function resultFileQualifies(fileName: string, dir: string, sinceMs: number): boolean {
+  if (!fileName.endsWith("-result.json")) return true;
+  try {
+    const data = JSON.parse(fs.readFileSync(path.join(dir, fileName), "utf8"));
+    const start = Number(data.start ?? data.stop ?? 0);
+    return start >= sinceMs;
+  } catch {
+    return false;
+  }
+}
+
+async function runAllureGenerate(sinceMs?: number): Promise<AllureGenerateResult> {
   if (!fs.existsSync(ALLURE_RESULTS_DIR) || countFilesRecursive(ALLURE_RESULTS_DIR) === 0) {
     return { ok: false, fileCount: 0, indexExists: false, message: "No allure-results found -- run at least one test first (allure-playwright writes results there)." };
   }
 
+  // Scoped generation: copy only the qualifying result files into a throwaway
+  // directory and point the CLI at that instead of the full accumulated folder.
+  let resultsSourceDir = ALLURE_RESULTS_DIR;
+  let scopedDir: string | null = null;
+  if (sinceMs) {
+    const allFiles = fs.readdirSync(ALLURE_RESULTS_DIR).filter((f) => f.endsWith(".json") || f.endsWith(".properties") || f.endsWith(".txt"));
+    const qualifying = allFiles.filter((f) => resultFileQualifies(f, ALLURE_RESULTS_DIR, sinceMs));
+    if (qualifying.length === 0) {
+      return { ok: false, fileCount: 0, indexExists: false, message: "No test runs found since this crawl started -- run the generated scripts first, then generate the report." };
+    }
+    scopedDir = path.join(SERVER_ROOT, `allure-results-scoped-${Date.now()}`);
+    fs.mkdirSync(scopedDir, { recursive: true });
+    for (const f of qualifying) fs.copyFileSync(path.join(ALLURE_RESULTS_DIR, f), path.join(scopedDir, f));
+    resultsSourceDir = scopedDir;
+  }
+
+  const resultsArg = path.relative(SERVER_ROOT, resultsSourceDir).replace(/\\/g, "/");
   const generated = await new Promise<{ ok: boolean; error?: string }>((resolve) => {
     execFile(
       getNpxCommand(),
-      ["--yes", "allure-commandline", "generate", "allure-results", "--clean", "-o", "allure-report"],
+      ["--yes", "allure-commandline", "generate", resultsArg, "--clean", "-o", "allure-report"],
       { cwd: SERVER_ROOT, maxBuffer: 20 * 1024 * 1024, shell: process.platform === "win32", timeout: 60000 },
       (error, _stdout, stderr) => resolve({ ok: !error, error: error ? String(stderr || error.message).slice(0, 1000) : undefined })
     );
   });
+
+  if (scopedDir) {
+    fs.rmSync(scopedDir, { recursive: true, force: true });
+  }
 
   const indexPath = path.join(ALLURE_REPORT_DIR, "index.html");
   const indexExists = fs.existsSync(indexPath);

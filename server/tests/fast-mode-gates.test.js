@@ -12,6 +12,8 @@ import { executionRouter } from '../src/routes/execution.ts';
 import { testCasesRouter } from '../src/routes/testcases.ts';
 
 function resetData() {
+  db.prepare('DELETE FROM execution_evidence').run(); // FK to execution_runs, must go first
+  db.prepare('DELETE FROM bug_findings').run(); // FK to execution_runs, must go first
   db.prepare('DELETE FROM execution_runs').run();
   db.prepare('DELETE FROM review_audit_entries').run();
   db.prepare('DELETE FROM automation_scripts').run();

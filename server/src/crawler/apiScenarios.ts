@@ -56,6 +56,7 @@ export function buildApiScenariosForSite(siteHost: string, pages: PageApiInput[]
         id: nanoid(10),
         title: `Verify ${key} returns a successful response`,
         type: "api",
+        tier: "functional", // endpoint verification, not a single core UI happy path
         flowGroup: key,
         steps: [
           `Given the API endpoint "${key}" was observed during the crawl (triggered by: ${call.trigger})`,

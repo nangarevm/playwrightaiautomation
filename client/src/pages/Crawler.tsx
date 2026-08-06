@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { api, CrawlSite, CrawlSiteDetail } from "../api.js";
 import { Pill } from "../components/Pill.js";
 import { AllureReportPanel } from "../components/AllureReportPanel.js";
+import { BugReportPanel } from "../components/BugReportPanel.js";
 
 // AI Crawler end-to-end flow (project brief Phase 8): onboarding -> live crawl
 // progress -> curate-before-generate review -> one-click test generation + run ->
@@ -43,6 +44,24 @@ export default function Crawler() {
   // download actions below -- this only filters which ones are visible and
   // selectable, so every existing action works identically for either kind.
   const [scenarioFilter, setScenarioFilter] = useState<"ui" | "api" | "both">("both");
+  // Independent of scenarioFilter (UI/API/Both) -- which test suite tier to
+  // show. "all" (default) applies no tier restriction; the three specific
+  // options let a reviewer pull just the smoke suite, just functional
+  // coverage, or just the regression set carried forward from unchanged pages.
+  const [tierFilter, setTierFilter] = useState<"all" | "smoke" | "functional" | "regression">("all");
+  // Per-page collapse state for the "Review & curate" cards below -- a crawl
+  // of any real size produces one card per page, and having every one of them
+  // permanently expanded makes the list unreadable. Pages start expanded
+  // (matching prior behavior); collapsing is opt-in per page.
+  const [collapsedPageIds, setCollapsedPageIds] = useState<Set<string>>(new Set());
+  function togglePageCollapsed(pageId: string) {
+    setCollapsedPageIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(pageId)) next.delete(pageId);
+      else next.add(pageId);
+      return next;
+    });
+  }
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [genResults, setGenResults] = useState<any[] | null>(null);
@@ -53,8 +72,38 @@ export default function Crawler() {
   // silently swallowed failures too), so after generation there was no signal at
   // all of which scripts actually passed/failed/errored, only the Execution tab's
   // full run history to cross-reference manually. Keyed by testCaseId.
-  type RunStatus = { state: "running" | "passed" | "failed" | "error" | "needs_review" | "trigger_failed"; durationMs?: number; reportUrl?: string | null; error?: string };
+  type RunStatus = { state: "running" | "passed" | "failed" | "error" | "needs_review" | "trigger_failed"; durationMs?: number; reportUrl?: string | null; error?: string; runId?: string };
   const [runStatuses, setRunStatuses] = useState<Record<string, RunStatus>>({});
+
+  // Marks when the current "Generate + Run" batch started, so the Allure panel
+  // below can scope its report to only this crawl's runs (allure-results/
+  // accumulates every run ever executed on this machine and never clears
+  // itself, so an unscoped report was always showing stale aggregate data).
+  const [batchStartedAt, setBatchStartedAt] = useState<number | null>(null);
+
+  // Customer-facing bug list, built from this batch's failed/errored runs --
+  // the exact Playwright error for each (plus a script-issue-vs-real-bug
+  // classification), not just a pass/fail pill.
+  type CrawlFailure = {
+    testCaseId: string;
+    title: string;
+    errorMessage: string | null;
+    reportUrl?: string | null;
+    runId: string;
+    failureClass: "automation_issue" | "environment_issue" | "possible_bug" | "unknown" | null;
+    failureLabel: string | null;
+  };
+  const [crawlFailures, setCrawlFailures] = useState<CrawlFailure[]>([]);
+
+  // Bumped once the "Generate + Run" batch's runs all finish, to trigger the
+  // Allure panel's own generate step automatically -- so the user never has to
+  // click "Generate Allure report" separately after running tests here.
+  const [allureAutoGenKey, setAllureAutoGenKey] = useState<number | undefined>(undefined);
+
+  // Live "what's happening right now" status line for the multi-step Generate +
+  // Run + Report flow, which otherwise looks stalled for the many seconds each
+  // step (script generation, each test run, Allure build) actually takes.
+  const [progressMessage, setProgressMessage] = useState<string | null>(null);
 
   const [batchQueue, setBatchQueue] = useState<BatchItem[]>([]);
   const [batchRunning, setBatchRunning] = useState(false);
@@ -218,10 +267,10 @@ export default function Crawler() {
     });
   }
 
-  function scenarioVisible(s: { type: string }): boolean {
-    if (scenarioFilter === "both") return true;
-    if (scenarioFilter === "api") return s.type === "api";
-    return s.type !== "api";
+  function scenarioVisible(s: { type: string; tier?: string | null }): boolean {
+    const typeOk = scenarioFilter === "both" ? true : scenarioFilter === "api" ? s.type === "api" : s.type !== "api";
+    const tierOk = tierFilter === "all" ? true : s.tier === tierFilter;
+    return typeOk && tierOk;
   }
 
   // Faster curation: one click to select every not-yet-generated scenario
@@ -304,14 +353,23 @@ export default function Crawler() {
     setBusy("generate-run-report");
     setGenResults(null);
     setRunStatuses({});
+    setCrawlFailures([]);
+    // Subtract a few seconds of slack for clock/latency skew between this
+    // browser and the server writing allure-results -- better to include one
+    // extra stray result than to clip off the very run we're scoping to.
+    const startedAt = Date.now() - 5000;
+    setBatchStartedAt(startedAt);
     try {
+      setProgressMessage(`Generating ${selected.size} test script(s)…`);
       const { results } = await api.crawlerGenerateTests(Array.from(selected));
       setGenResults(results);
       setDownloadSelected(new Set(results.filter((r: any) => r.ok && r.testCaseId).map((r: any) => r.testCaseId)));
       await refreshDetail();
 
-      for (const r of results) {
-        if (!r.ok || !r.testCaseId) continue;
+      const runnable = results.filter((r: any) => r.ok && r.testCaseId);
+      let completed = 0;
+      for (const r of runnable) {
+        setProgressMessage(`Running test ${completed + 1} of ${runnable.length}: ${r.scriptFile || r.testCaseId}…`);
         setRunStatuses((prev) => ({ ...prev, [r.testCaseId]: { state: "running" } }));
         try {
           const runResult = await api.triggerUltrafast({ testCaseId: r.testCaseId }, url.trim());
@@ -321,23 +379,55 @@ export default function Crawler() {
             setRunStatuses((prev) => ({ ...prev, [r.testCaseId]: { state: "needs_review" } }));
           } else {
             const status = runResult.run.status as string;
+            const state = status === "passed" ? "passed" : status === "failed" ? "failed" : "error";
             setRunStatuses((prev) => ({
               ...prev,
               [r.testCaseId]: {
-                state: status === "passed" ? "passed" : status === "failed" ? "failed" : "error",
+                state,
                 durationMs: runResult.run.durationMs,
                 reportUrl: runResult.reportUrl,
+                runId: runResult.run.id,
               },
             }));
+            if (state === "failed" || state === "error") {
+              try {
+                const evidence = await api.getExecutionEvidence(runResult.run.id);
+                const first = evidence[0];
+                setCrawlFailures((prev) => [
+                  ...prev,
+                  {
+                    testCaseId: r.testCaseId,
+                    title: first?.test_title || r.scriptFile || r.testCaseId,
+                    errorMessage: first?.error_message ?? null,
+                    reportUrl: runResult.reportUrl,
+                    runId: runResult.run.id,
+                    failureClass: first?.failure_class ?? null,
+                    failureLabel: first?.failure_label ?? null,
+                  },
+                ]);
+              } catch {
+                // Evidence lookup is best-effort -- the pass/fail pill above already reflects the outcome.
+              }
+            }
           }
         } catch (runErr: any) {
           setRunStatuses((prev) => ({ ...prev, [r.testCaseId]: { state: "trigger_failed", error: runErr.message } }));
         }
+        completed++;
       }
+
+      // Last step: build the Allure report for this crawl automatically -- no
+      // separate click required. AllureReportPanel does the actual generate
+      // call and shows its own "Generating…" state; this just triggers it.
+      setProgressMessage("Building Allure report for this crawl…");
+      setAllureAutoGenKey(Date.now());
+      setProgressMessage("Done.");
     } catch (e: any) {
       setError(e.message);
+      setProgressMessage(null);
     } finally {
       setBusy(null);
+      setTimeout(() => setProgressMessage(null), 4000);
     }
   }
 
@@ -369,6 +459,9 @@ export default function Crawler() {
   const uiScenarioCount = allScenarios.filter((s) => s.type !== "api").length;
   const apiScenarioCount = allScenarios.filter((s) => s.type === "api").length;
   const visibleScenarioCount = allScenarios.filter(scenarioVisible).length;
+  const smokeCount = allScenarios.filter((s) => s.tier === "smoke").length;
+  const functionalCount = allScenarios.filter((s) => s.tier === "functional").length;
+  const regressionCount = allScenarios.filter((s) => s.tier === "regression").length;
 
   return (
     <div className="space-y-6">
@@ -526,6 +619,12 @@ export default function Crawler() {
                 {busy === "generate-run-report" ? "Working…" : `Generate + Run (${selected.size})`}
               </button>
             </div>
+            {progressMessage && (
+              <p className="text-xs text-signal flex items-center gap-1.5">
+                <span className="inline-block h-1.5 w-1.5 rounded-full bg-signal animate-pulse" />
+                {progressMessage}
+              </p>
+            )}
           </div>
 
           {/* UI scenarios come from discovered page elements; API scenarios come from
@@ -560,62 +659,138 @@ export default function Crawler() {
             )}
           </div>
 
+          {/* Smoke = the one core happy path per page/form. Functional = everything
+              else generated at crawl time (edge/negative/boundary/multi-step/API).
+              Regression = scenarios carried forward unchanged from a page that
+              didn't change on a re-crawl -- see crawlerService.ts's persistCrawlResult. */}
+          <div className="flex items-center gap-2 flex-wrap">
+            <span className="text-xs text-ink/50">Test suite:</span>
+            <div className="flex items-center rounded-full border border-line bg-white/60 p-0.5 text-xs w-fit">
+              <button
+                className={`rounded-full px-3 py-1 font-medium ${tierFilter === "all" ? "bg-ink text-paper" : "text-ink/60"}`}
+                onClick={() => setTierFilter("all")}
+              >
+                All ({allScenarios.length})
+              </button>
+              <button
+                className={`rounded-full px-3 py-1 font-medium ${tierFilter === "smoke" ? "bg-ink text-paper" : "text-ink/60"}`}
+                onClick={() => setTierFilter("smoke")}
+                title="Core critical flows confirming the app is functional"
+              >
+                Smoke ({smokeCount})
+              </button>
+              <button
+                className={`rounded-full px-3 py-1 font-medium ${tierFilter === "functional" ? "bg-ink text-paper" : "text-ink/60"}`}
+                onClick={() => setTierFilter("functional")}
+                title="Edge cases, negative/error handling, boundary conditions, multi-step and cross-page flows"
+              >
+                Functional ({functionalCount})
+              </button>
+              <button
+                className={`rounded-full px-3 py-1 font-medium ${tierFilter === "regression" ? "bg-ink text-paper" : "text-ink/60"}`}
+                onClick={() => setTierFilter("regression")}
+                title="Previously-working scenarios carried forward from an unchanged page on a re-crawl"
+              >
+                Regression ({regressionCount})
+              </button>
+            </div>
+          </div>
+
           {detail.pages.map((page) => {
             const visibleScenarios = page.scenarios.filter(scenarioVisible);
+            const isCollapsed = collapsedPageIds.has(page.id);
             return (
               <div key={page.id} className="rounded-md border border-line p-3 space-y-2">
-                <div className="flex items-center justify-between">
-                  <p className="text-sm font-medium truncate max-w-[420px]" title={page.url}>{page.title || page.url}</p>
-                  <div className="flex items-center gap-1.5">
+                <button
+                  className="flex items-center justify-between w-full text-left"
+                  onClick={() => togglePageCollapsed(page.id)}
+                  aria-expanded={!isCollapsed}
+                >
+                  <span className="flex items-center gap-1.5 min-w-0">
+                    <span className={`text-ink/40 text-xs shrink-0 transition-transform ${isCollapsed ? "" : "rotate-90"}`}>▶</span>
+                    <p className="text-sm font-medium truncate max-w-[420px]" title={page.url}>{page.title || page.url}</p>
+                  </span>
+                  <span className="flex items-center gap-1.5 shrink-0">
+                    <span className="text-xs text-ink/40">{visibleScenarios.length} scenario(s)</span>
                     {page.spellingIssues.length > 0 && <Pill tone="warn">{page.spellingIssues.length} spelling issue(s)</Pill>}
                     <Pill tone={page.change_status === "changed" ? "warn" : page.change_status === "new" ? "good" : "neutral"}>{page.change_status}</Pill>
-                  </div>
-                </div>
-                {page.diff && (page.diff.added.length + page.diff.removed.length + page.diff.changed.length > 0) && (
-                  <p className="text-xs text-ink/50">
-                    +{page.diff.added.length} added / -{page.diff.removed.length} removed / ~{page.diff.changed.length} changed
-                  </p>
-                )}
-                {page.spellingIssues.length > 0 && (
-                  <ul className="rounded border border-line/70 bg-alert/5 p-2 text-xs space-y-1">
-                    {page.spellingIssues.map((issue, i) => (
-                      <li key={i}>
-                        <span className="font-medium text-alert">"{issue.word}"</span>{" "}
-                        <span className="text-ink/50">({issue.context})</span>
-                        {issue.suggestions.length > 0 && (
-                          <span className="text-ink/60"> — did you mean: {issue.suggestions.join(", ")}?</span>
-                        )}
-                      </li>
-                    ))}
-                  </ul>
-                )}
-                {page.scenarios.length === 0 ? (
-                  <p className="text-xs text-ink/40">No scenarios (unchanged page — kept from the previous crawl).</p>
-                ) : visibleScenarios.length === 0 ? (
-                  <p className="text-xs text-ink/40">No {scenarioFilter === "api" ? "API" : "UI"} scenarios on this page.</p>
-                ) : (
-                  <ul className="space-y-1.5">
-                    {visibleScenarios.map((s) => (
-                      <li key={s.id} className="rounded border border-line/70 p-2 text-xs space-y-1">
-                        <div className="flex items-center justify-between gap-2">
-                          <label className="flex items-center gap-2">
-                            <input type="checkbox" checked={selected.has(s.id)} onChange={() => toggle(s.id)} disabled={Boolean(s.generated_test_case_id)} />
-                            <span className="font-medium">{s.title}</span>
-                            <Pill tone={s.type === "negative" ? "bad" : s.type === "flow" ? "warn" : s.type === "api" ? "neutral" : "good"}>{s.type}</Pill>
-                            {s.generated_test_case_id && <Pill tone="neutral">test generated</Pill>}
-                          </label>
-                          <button className="text-alert underline disabled:opacity-40" disabled={busy === s.id} onClick={() => deleteOne(s.id)}>
-                            Delete
-                          </button>
-                        </div>
-                        <ul className="pl-4 list-disc text-ink/60">
-                          {s.steps.map((step, i) => (
-                            <li key={i}>{step}</li>
+                  </span>
+                </button>
+                {!isCollapsed && (
+                  <>
+                    {page.diff && (page.diff.added.length + page.diff.removed.length + page.diff.changed.length > 0) && (
+                      <p className="text-xs text-ink/50">
+                        +{page.diff.added.length} added / -{page.diff.removed.length} removed / ~{page.diff.changed.length} changed
+                      </p>
+                    )}
+                    {page.spellingIssues.length > 0 && (
+                      <ul className="rounded border border-line/70 bg-alert/5 p-2 text-xs space-y-1">
+                        {page.spellingIssues.map((issue, i) => (
+                          <li key={i}>
+                            <span className="font-medium text-alert">"{issue.word}"</span>{" "}
+                            <span className="text-ink/50">({issue.context})</span>
+                            {issue.suggestions.length > 0 && (
+                              <span className="text-ink/60"> — did you mean: {issue.suggestions.join(", ")}?</span>
+                            )}
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+                    {/* Step 1: Component Inventory -- what's actually on this page (header,
+                        navbar, forms, tables, modals, filters, pagination, cards, footer, ...),
+                        shown before Step 2's test cases so composition is visible up front. */}
+                    {page.componentInventory && page.componentInventory.length > 0 && (
+                      <div className="rounded border border-line/70 bg-ink/[0.03] p-2 space-y-1.5">
+                        <p className="text-[11px] font-semibold uppercase tracking-wide text-ink/50">Step 1 · Component inventory</p>
+                        <div className="flex flex-wrap gap-1.5">
+                          {page.componentInventory.map((c) => (
+                            <span
+                              key={c.kind}
+                              className="inline-flex items-center gap-1 rounded-full border border-line bg-white/70 px-2 py-0.5 text-[11px] text-ink/70"
+                              title={c.samples.length > 0 ? c.samples.join(", ") : undefined}
+                            >
+                              {c.label} <span className="text-ink/40">×{c.count}</span>
+                            </span>
                           ))}
-                        </ul>
-                      </li>
-                    ))}
-                  </ul>
+                        </div>
+                      </div>
+                    )}
+
+                    {page.scenarios.length > 0 && (
+                      <p className="text-[11px] font-semibold uppercase tracking-wide text-ink/50 pt-1">Step 2 · Test cases</p>
+                    )}
+                    {page.scenarios.length === 0 ? (
+                      <p className="text-xs text-ink/40">No scenarios (unchanged page — kept from the previous crawl).</p>
+                    ) : visibleScenarios.length === 0 ? (
+                      <p className="text-xs text-ink/40">No {scenarioFilter === "api" ? "API" : "UI"} scenarios on this page.</p>
+                    ) : (
+                      <ul className="space-y-1.5">
+                        {visibleScenarios.map((s) => (
+                          <li key={s.id} className="rounded border border-line/70 p-2 text-xs space-y-1">
+                            <div className="flex items-center justify-between gap-2">
+                              <label className="flex items-center gap-2">
+                                <input type="checkbox" checked={selected.has(s.id)} onChange={() => toggle(s.id)} disabled={Boolean(s.generated_test_case_id)} />
+                                <span className="font-medium">{s.title}</span>
+                                <Pill tone={s.type === "negative" ? "bad" : s.type === "flow" ? "warn" : s.type === "api" ? "neutral" : "good"}>{s.type}</Pill>
+                                {s.tier && (
+                                  <Pill tone={s.tier === "regression" ? "warn" : s.tier === "smoke" ? "good" : "neutral"}>{s.tier}</Pill>
+                                )}
+                                {s.generated_test_case_id && <Pill tone="neutral">test generated</Pill>}
+                              </label>
+                              <button className="text-alert underline disabled:opacity-40" disabled={busy === s.id} onClick={() => deleteOne(s.id)}>
+                                Delete
+                              </button>
+                            </div>
+                            <ul className="pl-4 list-disc text-ink/60">
+                              {s.steps.map((step, i) => (
+                                <li key={i}>{step}</li>
+                              ))}
+                            </ul>
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+                  </>
                 )}
               </div>
             );
@@ -733,7 +908,8 @@ export default function Crawler() {
         </div>
       )}
 
-      <AllureReportPanel title="Allure report (from this crawl's runs)" />
+      <AllureReportPanel title="Allure report (from this crawl's runs)" sinceMs={batchStartedAt ?? undefined} autoGenerateKey={allureAutoGenKey} />
+      <BugReportPanel failures={crawlFailures} />
     </div>
   );
 }

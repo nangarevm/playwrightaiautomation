@@ -88,7 +88,7 @@ export async function startCrawl(params: {
     },
     getBaseline
   )
-    .then((result) => persistCrawlResult(siteId, result))
+    .then((result) => persistCrawlResult(siteId, result, isRerun))
     .catch((err: any) => {
       db.prepare("UPDATE crawl_sites SET status = 'failed', error = ? WHERE id = ?").run(err.message || String(err), siteId);
     });
@@ -96,7 +96,7 @@ export async function startCrawl(params: {
   return { siteId, isRerun };
 }
 
-function persistCrawlResult(siteId: string, result: CrawlRunOutput) {
+function persistCrawlResult(siteId: string, result: CrawlRunOutput, isRerun: boolean) {
   const now = new Date().toISOString();
   let totalScenarios = 0;
   let totalForms = 0;
@@ -112,13 +112,13 @@ function persistCrawlResult(siteId: string, result: CrawlRunOutput) {
 
       if (existingPage) {
         db.prepare(
-          `UPDATE crawl_pages SET title = ?, dom_hash = ?, elements_json = ?, apis_json = ?, change_status = ?, diff_json = ?, spelling_issues_json = ?, updated_at = ? WHERE id = ?`
-        ).run(page.title, page.hash, JSON.stringify(page.elements), JSON.stringify(page.apis), page.changeStatus, page.diff ? JSON.stringify(page.diff) : null, JSON.stringify(page.spellingIssues), now, pageId);
+          `UPDATE crawl_pages SET title = ?, dom_hash = ?, elements_json = ?, apis_json = ?, change_status = ?, diff_json = ?, spelling_issues_json = ?, component_inventory_json = ?, updated_at = ? WHERE id = ?`
+        ).run(page.title, page.hash, JSON.stringify(page.elements), JSON.stringify(page.apis), page.changeStatus, page.diff ? JSON.stringify(page.diff) : null, JSON.stringify(page.spellingIssues), JSON.stringify(page.componentInventory), now, pageId);
       } else {
         db.prepare(
-          `INSERT INTO crawl_pages (id, site_id, url, title, dom_hash, screenshot_hash, elements_json, apis_json, change_status, diff_json, spelling_issues_json, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?)`
-        ).run(pageId, siteId, page.url, page.title, page.hash, JSON.stringify(page.elements), JSON.stringify(page.apis), page.changeStatus, page.diff ? JSON.stringify(page.diff) : null, JSON.stringify(page.spellingIssues), now, now);
+          `INSERT INTO crawl_pages (id, site_id, url, title, dom_hash, screenshot_hash, elements_json, apis_json, change_status, diff_json, spelling_issues_json, component_inventory_json, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?)`
+        ).run(pageId, siteId, page.url, page.title, page.hash, JSON.stringify(page.elements), JSON.stringify(page.apis), page.changeStatus, page.diff ? JSON.stringify(page.diff) : null, JSON.stringify(page.spellingIssues), JSON.stringify(page.componentInventory), now, now);
       }
 
       // Phase 4: unchanged pages keep whatever scenarios they already have --
@@ -126,10 +126,18 @@ function persistCrawlResult(siteId: string, result: CrawlRunOutput) {
       if (page.changeStatus !== "unchanged") {
         for (const scenario of page.scenarios) {
           db.prepare(
-            `INSERT INTO crawl_scenarios (id, site_id, page_id, title, type, flow_group, steps_json, locators_json, status, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)`
-          ).run(scenario.id, siteId, pageId, scenario.title, scenario.type, scenario.flowGroup, JSON.stringify(scenario.steps), JSON.stringify(scenario.locators), now, now);
+            `INSERT INTO crawl_scenarios (id, site_id, page_id, title, type, tier, flow_group, steps_json, locators_json, status, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)`
+          ).run(scenario.id, siteId, pageId, scenario.title, scenario.type, scenario.tier, scenario.flowGroup, JSON.stringify(scenario.steps), JSON.stringify(scenario.locators), now, now);
         }
+      } else if (isRerun && existingPage) {
+        // This page was re-crawled and found unchanged -- its existing active
+        // scenarios are being carried forward as-is (not regenerated above),
+        // which is exactly what "previously working, re-verify after a
+        // change [elsewhere on the site]" means. Flag them regression so the
+        // Review & curate UI can distinguish "still verifying this still
+        // works" from a freshly generated smoke/functional case.
+        db.prepare("UPDATE crawl_scenarios SET tier = 'regression', updated_at = ? WHERE page_id = ? AND status = 'active'").run(now, pageId);
       }
 
       const activeScenarioCount = (db.prepare("SELECT COUNT(*) as c FROM crawl_scenarios WHERE page_id = ? AND status = 'active'").get(pageId) as any).c;
@@ -157,6 +165,7 @@ export function getSiteDetail(siteId: string) {
     apis: JSON.parse(p.apis_json),
     diff: p.diff_json ? JSON.parse(p.diff_json) : null,
     spellingIssues: JSON.parse(p.spelling_issues_json || "[]"),
+    componentInventory: JSON.parse(p.component_inventory_json || "[]"),
     scenarios: (db.prepare("SELECT * FROM crawl_scenarios WHERE page_id = ? AND status = 'active' ORDER BY created_at ASC").all(p.id) as any[]).map(parseScenarioRow),
   }));
   return { site, pages };
@@ -222,6 +231,19 @@ function cascadeRemoveGeneratedArtifacts(scenario: any) {
   if (!scenario.generated_test_case_id) return;
   const scripts = db.prepare("SELECT * FROM automation_scripts WHERE test_case_id = ?").all(scenario.generated_test_case_id) as any[];
   for (const script of scripts) {
+    // Runs (and their per-test evidence rows -- execution_evidence.run_id has a
+    // FK to execution_runs with no ON DELETE CASCADE, so evidence must go first
+    // or the run delete below fails with SQLITE_CONSTRAINT_FOREIGNKEY) must be
+    // removed before the script/test_case they reference, and this whole lookup
+    // has to happen BEFORE the automation_scripts delete a few lines down --
+    // doing it after would make the "WHERE script_id IN automation_scripts"
+    // subquery match nothing, since those rows would already be gone.
+    const runs = db.prepare("SELECT id FROM execution_runs WHERE script_id = ?").all(script.id) as Array<{ id: string }>;
+    for (const run of runs) {
+      db.prepare("DELETE FROM execution_evidence WHERE run_id = ?").run(run.id);
+      db.prepare("DELETE FROM bug_findings WHERE run_id = ?").run(run.id);
+    }
+    db.prepare("DELETE FROM execution_runs WHERE script_id = ?").run(script.id);
     try {
       if (script.file_path && fs.existsSync(script.file_path)) fs.rmSync(script.file_path, { force: true });
     } catch {
@@ -229,15 +251,19 @@ function cascadeRemoveGeneratedArtifacts(scenario: any) {
     }
     db.prepare("DELETE FROM automation_scripts WHERE id = ?").run(script.id);
   }
-  db.prepare("DELETE FROM execution_runs WHERE script_id IN (SELECT id FROM automation_scripts WHERE test_case_id = ?)").run(scenario.generated_test_case_id);
   db.prepare("DELETE FROM test_cases WHERE id = ?").run(scenario.generated_test_case_id);
 }
 
-function scenarioCategoryFor(type: string): string {
-  if (type === "api") return "API";
-  if (type === "negative") return "Negative";
-  if (type === "flow") return "Regression";
-  return "Smoke";
+// Maps a crawl_scenarios row onto the platform-wide test_cases.category enum.
+// `tier` (smoke/functional/regression -- see types.ts's ScenarioRecord) is the
+// primary signal now; `type` still refines "functional" into the more specific
+// API/Negative buckets the rest of the platform already filters/reports on.
+function scenarioCategoryFor(scenario: { type: string; tier?: string }): string {
+  if (scenario.tier === "regression") return "Regression";
+  if (scenario.type === "api") return "API";
+  if (scenario.type === "negative") return "Negative";
+  if (scenario.tier === "smoke") return "Smoke";
+  return "Functional";
 }
 
 // Phase 8 step 4 ("Generate Tests"): turns curated/selected scenarios into a
@@ -281,7 +307,7 @@ export async function generateTestsFromScenarios(scenarioIds: string[], actorUse
         id: testCaseId,
         input_id: input.id,
         title: scenario.title,
-        category: scenarioCategoryFor(scenario.type),
+        category: scenarioCategoryFor(scenario),
         steps: JSON.stringify(steps),
         expected_result: steps[steps.length - 1] || "The scenario completes as described.",
         // API scenarios: codegenService passes source_rationale straight through as

@@ -14,6 +14,7 @@ function resetData() {
   db.prepare('DELETE FROM auto_heal_actions').run();
   db.prepare('DELETE FROM change_detections').run();
   db.prepare('DELETE FROM execution_evidence').run();
+  db.prepare('DELETE FROM bug_findings').run(); // FK to execution_runs, must go first
   db.prepare('DELETE FROM execution_runs').run();
   db.prepare('DELETE FROM test_case_data_rows').run();
   db.prepare('DELETE FROM test_case_duplicate_flags').run();

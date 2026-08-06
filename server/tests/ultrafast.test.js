@@ -8,6 +8,8 @@ import { getUltrafastConfidenceThreshold, setUltrafastConfidenceThreshold } from
 function resetData() {
   db.prepare('DELETE FROM auto_heal_actions').run();
   db.prepare('DELETE FROM change_detections').run();
+  db.prepare('DELETE FROM execution_evidence').run(); // FK to execution_runs, must go first
+  db.prepare('DELETE FROM bug_findings').run(); // FK to execution_runs, must go first
   db.prepare('DELETE FROM execution_runs').run();
   db.prepare('DELETE FROM execution_profiles').run();
   db.prepare('DELETE FROM environments').run();
