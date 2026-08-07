@@ -784,6 +784,39 @@ CREATE TABLE IF NOT EXISTS fast_mode_executions (
 );
 `);
 
+// Feature #12: Smart Test Presets - pre-configured execution profiles
+db.exec(`
+CREATE TABLE IF NOT EXISTS execution_presets (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  description TEXT,
+  type TEXT NOT NULL,  -- smoke | regression | full | ci_cd | development | nightly | custom
+  is_builtin INTEGER NOT NULL DEFAULT 0,
+  test_selection_strategy TEXT NOT NULL,
+  parallel_workers INTEGER NOT NULL,
+  timeout_seconds INTEGER NOT NULL,
+  fast_mode_config_json TEXT NOT NULL,
+  capture_artifacts TEXT NOT NULL,  -- minimal | screenshots | full | video
+  gate_on_failure INTEGER NOT NULL,
+  retry_strategy TEXT NOT NULL,  -- no-retry | failed-only | all
+  notify_on_complete INTEGER NOT NULL,
+  estimated_duration_seconds INTEGER,
+  estimated_cost REAL,
+  best_for_json TEXT NOT NULL,  -- JSON array
+  created_by TEXT,
+  is_active INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS preset_usage (
+  id TEXT PRIMARY KEY,
+  preset_id TEXT NOT NULL,
+  used_at TEXT NOT NULL,
+  FOREIGN KEY (preset_id) REFERENCES execution_presets(id)
+);
+`);
+
 // Seed a default user per SRS user class (FR-8.1) so RBAC is usable out of the box
 const userCount = (db.prepare("SELECT COUNT(*) as count FROM users").get() as any).count as number;
 if (userCount === 0) {
