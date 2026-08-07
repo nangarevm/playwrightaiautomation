@@ -285,6 +285,15 @@ export default function Crawler() {
     setSelected(new Set(ids));
   }
 
+  // Select all scenarios from all pages (convenience for full crawl testing)
+  function selectAllPages() {
+    if (!detail) return;
+    const ids = detail.pages.flatMap((p) =>
+      p.scenarios.filter((s) => !s.generated_test_case_id).map((s) => s.id)
+    );
+    setSelected(new Set(ids));
+  }
+
   function clearSelection() {
     setSelected(new Set());
   }
@@ -602,7 +611,10 @@ export default function Crawler() {
             <p className="font-medium text-sm">Review & curate ({visibleScenarioCount} scenario(s) across {detail.pages.length} page(s))</p>
             <div className="flex gap-2 flex-wrap">
               <button className="rounded-md border border-ink/20 text-ink/70 px-3 py-1.5 text-xs" onClick={selectAll}>
-                Select all
+                Select all (filtered)
+              </button>
+              <button className="rounded-md border border-ink/20 text-ink/70 px-3 py-1.5 text-xs font-medium" onClick={selectAllPages} title="Select all scenarios from all pages, ignoring current filter">
+                Select all pages
               </button>
               <button className="rounded-md border border-ink/20 text-ink/70 px-3 py-1.5 text-xs disabled:opacity-40" disabled={selected.size === 0} onClick={clearSelection}>
                 Clear

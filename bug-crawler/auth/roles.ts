@@ -44,8 +44,8 @@ export async function switchToRole(page: Page, role: Role): Promise<void> {
   if (role.userId === null) return; // already the default identity on a fresh page load
 
   await page.goto("/");
-  await page.getByTestId("nav-settings").click();
-  await page.getByTestId("tab-team").click();
-  await page.getByTestId("mode-enterprise").click();
+  await page.getByTestId("nav-settings").first().click();
+  await page.getByTestId("tab-team").first().click();
+  await page.getByTestId("mode-enterprise").first().click();
   await page.getByTestId("user-switcher").selectOption(role.userId);
 }

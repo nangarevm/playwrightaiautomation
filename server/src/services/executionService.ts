@@ -1076,13 +1076,33 @@ export function runExecution(scriptId: string, targetUrl: string, input: any = {
 export async function runExecutionBatch(scriptIds: string[], targetUrl: string, input: any = {}): Promise<any> {
   if (scriptIds.length === 0) throw new Error("scriptIds must be a non-empty array");
 
-  const scripts = scriptIds.map((id) => db.prepare("SELECT * FROM automation_scripts WHERE id = ?").get(id) as any).filter(Boolean);
+  // FR-TBD: Prioritize smoke tests first, then remaining tests
+  // Sort scripts by test case category: smoke tests first, then regression, then others
+  const scriptDetails = scriptIds.map((id) => {
+    const script = db.prepare("SELECT * FROM automation_scripts WHERE id = ?").get(id) as any;
+    const tc = script ? (db.prepare("SELECT category FROM test_cases WHERE id = ?").get(script.test_case_id) as { category: string } | undefined) : null;
+    return { id, script, category: tc?.category ?? null };
+  }).filter((s) => s.script);
+
+  // Sort: Smoke first (priority 0), then Regression (priority 1), then others (priority 2)
+  scriptDetails.sort((a, b) => {
+    const aPriority = a.category === "Smoke" ? 0 : a.category === "Regression" ? 1 : 2;
+    const bPriority = b.category === "Smoke" ? 0 : b.category === "Regression" ? 1 : 2;
+    return aPriority - bPriority;
+  });
+
+  const scripts = scriptDetails.map((s) => s.script).filter(Boolean);
+  const sortedScriptIds = scriptDetails.map((s) => s.id);
+
   if (scripts.length === 0) throw new Error("No matching scripts found");
 
   const relFiles = scripts.map((s) => path.relative(SERVER_ROOT, s.file_path).replace(/\\/g, "/"));
   const profile = input.profile_id ? (db.prepare("SELECT * FROM execution_profiles WHERE id = ?").get(input.profile_id) as any) : null;
   const config = profile ? { ...profile } : normalizeProfile(input);
   const requestedConcurrency = Math.max(1, Number(config.concurrency || 1));
+  
+  // Store original order for audit/logging (smoke tests prioritized)
+  const testOrderInfo = { total: scripts.length, smokeCount: scriptDetails.filter((s) => s.category === "Smoke").length };
 
   const runOnce = (workers: number): Promise<{ durationMs: number; passed: number; failed: number }> => {
     return new Promise((resolve) => {

@@ -293,7 +293,7 @@ function buildCrawledPlaywrightScript(
         stepLines.push(`  // ${collapseWhitespace(step)}`);
         continue;
       }
-      stepLines.push(`  await ${locator}.click();`);
+      stepLines.push(`  await ${locator}.first().click();`);
       stepLines.push(`  await page.waitForLoadState('domcontentloaded');`);
       if (/click|toggle|select/.test(stepLower)) locatorIdx++;
     } else {

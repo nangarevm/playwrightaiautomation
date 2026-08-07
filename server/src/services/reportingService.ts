@@ -131,6 +131,62 @@ export function updateFlakyFlagForScript(scriptId: string, recentRunsPerScript =
   return isFlaky;
 }
 
+// Tag-based reporting: group test results by module/tag
+export function getTagBasedCoverage(range?: DateRange) {
+  const { clause, params } = dateRangeClause(range);
+  
+  // Get all screens with their modules
+  const screens = db.prepare("SELECT id, module_name, url_or_path FROM screens WHERE module_name IS NOT NULL").all() as Array<{
+    id: string;
+    module_name: string;
+    url_or_path: string | null;
+  }>;
+
+  const tagMap = new Map<string, { 
+    tag: string;
+    testCaseCount: number;
+    acceptedCount: number;
+    passCount: number;
+    failCount: number;
+    coverage: string;
+  }>();
+
+  // Get test cases by screen/tag
+  for (const screen of screens) {
+    const testCases = db.prepare(
+      "SELECT id, status FROM test_cases WHERE screen_id = ?"
+    ).all(screen.id) as Array<{ id: string; status: string }>;
+
+    const acceptedCases = testCases.filter((t) => t.status === "accepted" || t.status === "edited");
+    
+    // Get pass/fail count for cases tagged to this screen
+    let passCount = 0,
+      failCount = 0;
+    for (const tc of acceptedCases) {
+      const runStats = db.prepare(
+        `SELECT COUNT(CASE WHEN status = 'passed' THEN 1 END) as passed,
+                COUNT(CASE WHEN status IN ('failed', 'error') THEN 1 END) as failed
+         FROM execution_runs WHERE test_case_id = ? ${clause ? `AND ${clause.replace("created_at", "execution_runs.created_at")}` : ""}`
+      ).get(tc.id, ...Object.values(params)) as any;
+      passCount += runStats?.passed ?? 0;
+      failCount += runStats?.failed ?? 0;
+    }
+
+    const coverage = testCases.length === 0 ? "0%" : `${Math.round((acceptedCases.length / testCases.length) * 100)}%`;
+    
+    tagMap.set(screen.module_name, {
+      tag: screen.module_name,
+      testCaseCount: testCases.length,
+      acceptedCount: acceptedCases.length,
+      passCount,
+      failCount,
+      coverage,
+    });
+  }
+
+  return Array.from(tagMap.values()).sort((a, b) => b.testCaseCount - a.testCaseCount);
+}
+
 // FR-6.3: requirement coverage mapped to user stories (ticket IDs found in traceability_context)
 export function getRequirementCoverage() {
   const rows = db.prepare("SELECT id, title, status, traceability_context FROM test_cases").all() as Array<{

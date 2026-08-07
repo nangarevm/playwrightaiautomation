@@ -9,6 +9,7 @@ import {
   getDashboardSummary,
   getHoursSavedEstimate,
   getRequirementCoverage,
+  getTagBasedCoverage,
 } from "../services/reportingService.js";
 import { getLlmUsageSummary } from "../services/llmGatewayService.js";
 import { getUserNotificationPref, sendScheduledDigests, setUserNotificationPref } from "../services/digestService.js";
@@ -31,6 +32,12 @@ reportingRouter.get("/flaky", (_req, res) => {
 // FR-6.3: requirement coverage mapped to user stories
 reportingRouter.get("/coverage", (_req, res) => {
   res.json(getRequirementCoverage());
+});
+
+// Tag-based coverage: group test results by module/tag
+reportingRouter.get("/tag-coverage", (req, res) => {
+  const { startDate, endDate } = req.query as { startDate?: string; endDate?: string };
+  res.json(getTagBasedCoverage({ startDate, endDate }));
 });
 
 // FR-6.6: hours-saved estimate. Optional ?startDate=&endDate= computes it "per period" (see

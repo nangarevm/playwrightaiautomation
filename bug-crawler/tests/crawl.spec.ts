@@ -34,7 +34,7 @@ for (const role of ROLES) {
         await test.step(`navigate to ${route.id}`, async () => {
           await page.goto("/");
           for (const testId of route.clickPath) {
-            await page.getByTestId(testId).click();
+            await page.getByTestId(testId).first().click();
           }
           await page.waitForLoadState("networkidle");
         });

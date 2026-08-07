@@ -35,7 +35,7 @@ test("discover virtual routes", async ({ page }) => {
 
   for (const navTestId of navTestIds) {
     await page.goto("/");
-    await page.getByTestId(navTestId).click();
+    await page.getByTestId(navTestId).first().click();
     await page.waitForLoadState("networkidle");
 
     // Only tabs currently visible belong to this section -- previously
