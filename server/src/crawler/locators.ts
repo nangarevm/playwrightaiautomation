@@ -59,6 +59,7 @@ export async function extractElementLocators(page: Page, handle: Locator): Promi
               ? "combobox"
               : null);
     const id = el.id || null;
+    const name = el.getAttribute("name") || null;
     // Collapse multi-line/wrapped element text so scenario titles/steps stay single-line.
     const text = (el.textContent || "").replace(/\s+/g, " ").trim().slice(0, 60);
     const ariaLabel = el.getAttribute("aria-label");
@@ -104,6 +105,7 @@ export async function extractElementLocators(page: Page, handle: Locator): Promi
       testId,
       role,
       id,
+      name,
       accessibleName,
       elementType,
       required: el.hasAttribute("required"),
@@ -123,18 +125,40 @@ export async function extractElementLocators(page: Page, handle: Locator): Promi
   if (info.role && info.accessibleName) {
     locators.push(`page.getByRole(${JSON.stringify(info.role)}, { name: ${JSON.stringify(info.accessibleName)} })`);
   }
-  // 3. id
+  // 3. id (prefer over generic CSS, most specific)
   if (info.id) {
     locators.push(`page.locator("#${escapeForAttrSelector(info.id)}")`);
+  }
+  // 3b. name attribute (for form inputs, often more reliable than type-only selectors)
+  if (info.name && (info.tag === "input" || info.tag === "select" || info.tag === "textarea")) {
+    locators.push(`page.locator("[name=${JSON.stringify(info.name)}]")`);
   }
   // 4. label/visible text
   if (info.accessibleName) {
     locators.push(`page.getByText(${JSON.stringify(info.accessibleName)}, { exact: false })`);
   }
   // 5. CSS selector fallback (only if we still have fewer than 3 candidates)
+  // For form inputs, prioritize more specific selectors over generic type selectors
   if (locators.length < 3) {
-    const css = info.id ? `#${escapeForAttrSelector(info.id)}` : `${info.tag}${info.inputType ? `[type="${info.inputType}"]` : ""}`;
-    locators.push(`page.locator(${JSON.stringify(css)})`);
+    let css: string | null = null;
+    
+    // Prefer id-based selectors for unambiguous targeting
+    if (info.id) {
+      css = `#${escapeForAttrSelector(info.id)}`;
+    }
+    // For inputs within forms, use form context to disambiguate
+    else if (info.tag === "input" && info.closestFormLabel) {
+      // Use form with input type: more specific than bare input[type="text"]
+      css = `form:has-text("${info.closestFormLabel}") ${info.tag}${info.inputType ? `[type="${info.inputType}"]` : ""}`;
+    }
+    // Fallback: generic tag selector (only for non-input or standalone elements)
+    else if (info.tag !== "input" || !info.inputType) {
+      css = info.tag;
+    }
+    
+    if (css) {
+      locators.push(`page.locator(${JSON.stringify(css)})`);
+    }
   }
   // 6. XPath, last resort, only if nothing better was found at all
   if (locators.length === 0) {
