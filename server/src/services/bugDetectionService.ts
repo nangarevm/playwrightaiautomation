@@ -18,6 +18,8 @@ import { nanoid } from "nanoid";
 import { db } from "../db.js";
 import { getScreen } from "./screensService.js";
 import { fileGenericBug } from "./integrationsService.js";
+import type { SpellingIssue } from "../crawler/types.js";
+import { originOf, normalizeUrl } from "../crawler/urlUtils.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const UPLOAD_DIR = path.join(__dirname, "..", "uploads");
@@ -204,6 +206,7 @@ export async function fuzzApiEndpoints(baseUrl: string, endpointTemplates: strin
 }
 
 const SPINNER_GRACE_MS = 1500;
+const SCAN_NAV_TIMEOUT_MS = 30000;
 
 // UI exploratory scan: load a cataloged Screen's URL headlessly and watch for
 // the same class of bug a manual exploratory tester would catch by just
@@ -211,8 +214,13 @@ const SPINNER_GRACE_MS = 1500;
 // images, a load spinner that never resolves. The whole session is screen-
 // recorded (attached to every finding from this scan) and each individual
 // finding also gets its own screenshot taken at the moment it's detected.
-export async function scanScreenForUiBugs(screen: { id: string; name: string; url_or_path: string | null }, runId?: string): Promise<BugFindingRow[]> {
+export async function scanScreenForUiBugs(
+  screen: { id: string; name: string; url_or_path: string | null },
+  runId?: string,
+  catalogScreenId?: string | null
+): Promise<BugFindingRow[]> {
   if (!screen.url_or_path) return [];
+  const screenId = catalogScreenId ?? null;
   const findings: BugFindingRow[] = [];
   const browser = await chromium.launch({ headless: true });
   const context = await browser.newContext({
@@ -234,18 +242,29 @@ export async function scanScreenForUiBugs(screen: { id: string; name: string; ur
     const consoleErrors: string[] = [];
     const pageErrors: string[] = [];
     const serverErrors: Array<{ url: string; status: number }> = [];
+    const clientErrors: Array<{ url: string; status: number }> = [];
+    const failedRequests: Array<{ url: string; error: string }> = [];
 
     page.on("console", (msg) => { if (msg.type() === "error") consoleErrors.push(msg.text().slice(0, 300)); });
     page.on("pageerror", (err) => pageErrors.push(err.message.slice(0, 300)));
-    page.on("response", (res) => { if (res.status() >= 500) serverErrors.push({ url: res.url(), status: res.status() }); });
+    page.on("response", (res) => {
+      if (res.status() >= 500) serverErrors.push({ url: res.url(), status: res.status() });
+      else if (res.status() >= 400 && res.request().resourceType() === "document") {
+        clientErrors.push({ url: res.url(), status: res.status() });
+      }
+    });
+    page.on("requestfailed", (req) => {
+      failedRequests.push({ url: req.url(), error: (req.failure()?.errorText || "request failed").slice(0, 200) });
+    });
 
     const baseSteps = [
       `Navigate to: ${screen.url_or_path}`,
-      "Wait for the page to finish loading (network idle).",
+      "Wait for the page to finish loading.",
     ];
 
+    let mainResponse: import("playwright").Response | null = null;
     try {
-      await page.goto(screen.url_or_path, { waitUntil: "networkidle", timeout: 15000 });
+      mainResponse = await page.goto(screen.url_or_path, { waitUntil: "domcontentloaded", timeout: SCAN_NAV_TIMEOUT_MS });
     } catch (navErr: any) {
       const screenshotUrl = await screenshotNow();
       const finding = recordBugFinding({
@@ -253,7 +272,7 @@ export async function scanScreenForUiBugs(screen: { id: string; name: string; ur
         severity: "critical",
         title: `${screen.name} failed to load`,
         detail: `Navigating to ${screen.url_or_path} did not complete: ${navErr.message}`,
-        screenId: screen.id,
+        screenId,
         runId,
         evidence: { url: screen.url_or_path, error: navErr.message },
         stepsToReproduce: [...baseSteps, `Observe: navigation never completes -- ${navErr.message}`],
@@ -262,6 +281,23 @@ export async function scanScreenForUiBugs(screen: { id: string; name: string; ur
       findings.push(finding);
       autoFileIfSevere(finding);
       return findings;
+    }
+
+    if (mainResponse && mainResponse.status() >= 400) {
+      const screenshotUrl = await screenshotNow();
+      const finding = recordBugFinding({
+        source: "ui_exploratory",
+        severity: mainResponse.status() >= 500 ? "critical" : "high",
+        title: `${screen.name} returned HTTP ${mainResponse.status()}`,
+        detail: `The main document at ${screen.url_or_path} returned HTTP ${mainResponse.status()} instead of a successful response.`,
+        screenId,
+        runId,
+        evidence: { url: screen.url_or_path, status: mainResponse.status() },
+        stepsToReproduce: [...baseSteps, `Observe: HTTP ${mainResponse.status()} on the main page load.`],
+        screenshotUrl,
+      });
+      findings.push(finding);
+      autoFileIfSevere(finding);
     }
 
     const brokenImages: string[] = await page
@@ -279,7 +315,7 @@ export async function scanScreenForUiBugs(screen: { id: string; name: string; ur
         severity: "critical",
         title: `Server error(s) while loading ${screen.name}`,
         detail: serverErrors.map((e) => `HTTP ${e.status} — ${e.url}`).join("\n"),
-        screenId: screen.id,
+        screenId,
         runId,
         evidence: { serverErrors },
         stepsToReproduce: [...baseSteps, `Observe: ${serverErrors.length} request(s) returned a 5xx server error -- see the response network tab for ${serverErrors.map((e) => e.url).join(", ")}`],
@@ -295,7 +331,7 @@ export async function scanScreenForUiBugs(screen: { id: string; name: string; ur
         severity: "high",
         title: `JavaScript error on ${screen.name}`,
         detail: pageErrors.join("\n"),
-        screenId: screen.id,
+        screenId,
         runId,
         evidence: { pageErrors },
         stepsToReproduce: [...baseSteps, "Observe: an uncaught JavaScript exception is thrown -- open the browser console to see it.", `Error message: ${pageErrors[0]}`],
@@ -312,7 +348,7 @@ export async function scanScreenForUiBugs(screen: { id: string; name: string; ur
           severity: "medium",
           title: `Broken image(s) on ${screen.name}`,
           detail: brokenImages.join("\n"),
-          screenId: screen.id,
+          screenId,
           runId,
           evidence: { brokenImages },
           stepsToReproduce: [...baseSteps, `Observe: the following image(s) fail to load (broken/404): ${brokenImages.join(", ")}`],
@@ -320,6 +356,25 @@ export async function scanScreenForUiBugs(screen: { id: string; name: string; ur
         })
       );
     }
+
+    const brokenLinks = await checkBrokenInternalLinks(page, screen.url_or_path);
+    if (brokenLinks.length) {
+      const screenshotUrl = await screenshotNow();
+      findings.push(
+        recordBugFinding({
+          source: "ui_exploratory",
+          severity: "medium",
+          title: `Broken internal link(s) on ${screen.name}`,
+          detail: brokenLinks.map((l) => `HTTP ${l.status} — ${l.url} (${l.label})`).join("\n"),
+          screenId,
+          runId,
+          evidence: { brokenLinks },
+          stepsToReproduce: [...baseSteps, `Observe: ${brokenLinks.length} same-origin link(s) return 4xx/5xx instead of loading.`],
+          screenshotUrl,
+        })
+      );
+    }
+
     if (stuckSpinners > 0) {
       const screenshotUrl = await screenshotNow();
       findings.push(
@@ -328,7 +383,7 @@ export async function scanScreenForUiBugs(screen: { id: string; name: string; ur
           severity: "medium",
           title: `Stuck loading indicator on ${screen.name}`,
           detail: `${stuckSpinners} loading indicator(s) still animating ${SPINNER_GRACE_MS}ms after the page reported idle.`,
-          screenId: screen.id,
+          screenId,
           runId,
           evidence: { stuckSpinners },
           stepsToReproduce: [...baseSteps, `Wait an additional ${SPINNER_GRACE_MS}ms.`, `Observe: ${stuckSpinners} spinner/progress indicator(s) still animating instead of resolving.`],
@@ -343,10 +398,63 @@ export async function scanScreenForUiBugs(screen: { id: string; name: string; ur
           severity: "low",
           title: `Console error(s) on ${screen.name}`,
           detail: consoleErrors.slice(0, 10).join("\n"),
-          screenId: screen.id,
+          screenId,
           runId,
           evidence: { consoleErrors: consoleErrors.slice(0, 10) },
           stepsToReproduce: [...baseSteps, "Open the browser DevTools console.", `Observe: ${consoleErrors[0]}`],
+        })
+      );
+    }
+
+    if (clientErrors.length) {
+      const screenshotUrl = await screenshotNow();
+      findings.push(
+        recordBugFinding({
+          source: "ui_exploratory",
+          severity: "high",
+          title: `Client error loading ${screen.name}`,
+          detail: clientErrors.map((e) => `HTTP ${e.status} — ${e.url}`).join("\n"),
+          screenId,
+          runId,
+          evidence: { clientErrors },
+          stepsToReproduce: [...baseSteps, `Observe: page load returned HTTP ${clientErrors[0].status}.`],
+          screenshotUrl,
+        })
+      );
+    }
+
+    const criticalFailedRequests = failedRequests.filter((r) => !/favicon|analytics|tracking|google-analytics|doubleclick/i.test(r.url));
+    if (criticalFailedRequests.length > 0) {
+      const screenshotUrl = await screenshotNow();
+      findings.push(
+        recordBugFinding({
+          source: "ui_exploratory",
+          severity: "medium",
+          title: `Failed network request(s) on ${screen.name}`,
+          detail: criticalFailedRequests.slice(0, 8).map((r) => `${r.error} — ${r.url}`).join("\n"),
+          screenId,
+          runId,
+          evidence: { failedRequests: criticalFailedRequests.slice(0, 8) },
+          stepsToReproduce: [...baseSteps, "Open DevTools Network tab.", `Observe: ${criticalFailedRequests.length} request(s) failed to load.`],
+          screenshotUrl,
+        })
+      );
+    }
+
+    const emptyBody = await page.locator("body").evaluate((el) => (el.textContent || "").trim().length < 20).catch(() => false);
+    if (emptyBody) {
+      const screenshotUrl = await screenshotNow();
+      findings.push(
+        recordBugFinding({
+          source: "ui_exploratory",
+          severity: "high",
+          title: `${screen.name} appears blank or nearly empty`,
+          detail: "The page body has very little visible text after load — the page may be broken or failed to render content.",
+          screenId,
+          runId,
+          evidence: { emptyBody: true },
+          stepsToReproduce: [...baseSteps, "Observe: the page body is blank or shows almost no content."],
+          screenshotUrl,
         })
       );
     }
@@ -382,5 +490,121 @@ export async function scanScreenForUiBugs(screen: { id: string; name: string; ur
 export async function runBugScanForScreen(screenId: string, runId?: string): Promise<BugFindingRow[]> {
   const screen = getScreen(screenId) as { id: string; name: string; url_or_path: string | null } | undefined;
   if (!screen) throw new Error("Screen not found.");
-  return scanScreenForUiBugs(screen, runId);
+  return scanScreenForUiBugs(screen, runId, screenId);
+}
+
+async function checkBrokenInternalLinks(
+  page: import("playwright").Page,
+  pageUrl: string
+): Promise<Array<{ url: string; label: string; status: number }>> {
+  const origin = originOf(pageUrl);
+  if (!origin) return [];
+
+  const links = await page
+    .evaluate(() =>
+      Array.from(document.querySelectorAll("a[href]"))
+        .map((a) => ({
+          href: (a as HTMLAnchorElement).href,
+          label: (a.textContent || "").replace(/\s+/g, " ").trim().slice(0, 60),
+        }))
+        .filter((l) => l.href.startsWith("http"))
+    )
+    .catch(() => [] as Array<{ href: string; label: string }>);
+
+  const sameOriginLinks = links.filter((l) => {
+    try {
+      return new URL(l.href).origin === origin && !l.href.includes("#");
+    } catch {
+      return false;
+    }
+  });
+
+  const broken: Array<{ url: string; label: string; status: number }> = [];
+  const checked = new Set<string>();
+  for (const link of sameOriginLinks.slice(0, 15)) {
+    if (checked.has(link.href)) continue;
+    checked.add(link.href);
+    try {
+      const res = await page.request.get(link.href, { timeout: 8000 });
+      if (res.status() >= 400) broken.push({ url: link.href, label: link.label || link.href, status: res.status() });
+    } catch {
+      broken.push({ url: link.href, label: link.label || link.href, status: 0 });
+    }
+  }
+  return broken;
+}
+
+export function fileSpellingFindings(screenId: string, screenName: string, issues: SpellingIssue[]): BugFindingRow[] {
+  const findings: BugFindingRow[] = [];
+  const seen = new Set<string>();
+  for (const issue of issues.slice(0, 20)) {
+    const key = `${issue.word}::${issue.context}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    findings.push(
+      recordBugFinding({
+        source: "ui_exploratory",
+        severity: "low",
+        title: `Spelling issue on ${screenName}: "${issue.word}"`,
+        detail: `Misspelled "${issue.word}" in ${issue.context}${issue.suggestions?.[0] ? ` (suggested: "${issue.suggestions[0]}")` : ""}`,
+        screenId,
+        evidence: { issue },
+        stepsToReproduce: [
+          `Navigate to the screen: ${screenName}`,
+          `Look for the text in context: ${issue.context}`,
+          `Observe the misspelling "${issue.word}"`,
+        ],
+      })
+    );
+  }
+  return findings;
+}
+
+// After a crawl completes: scan every cataloged page for UI bugs, file spelling
+// issues captured during crawl, and fuzz API endpoints observed in network capture.
+export async function runPostCrawlBugScan(
+  siteId: string,
+  opts?: { changeStatuses?: string[] }
+): Promise<BugFindingRow[]> {
+  const site = db.prepare("SELECT * FROM crawl_sites WHERE id = ?").get(siteId) as { url: string } | undefined;
+  if (!site) return [];
+
+  let pages = db.prepare("SELECT * FROM crawl_pages WHERE site_id = ? AND change_status != 'removed'").all(siteId) as any[];
+  if (opts?.changeStatuses?.length) {
+    const allowed = new Set(opts.changeStatuses);
+    pages = pages.filter((p) => allowed.has(p.change_status));
+  }
+
+  const allFindings: BugFindingRow[] = [];
+  const apiTemplates = new Set<string>();
+
+  for (const page of pages) {
+    const screen = db
+      .prepare("SELECT id, name, url_or_path FROM screens WHERE url_or_path = ? OR url_or_path = ? ORDER BY updated_at DESC LIMIT 1")
+      .get(page.url, normalizeUrl(page.url)) as { id: string; name: string; url_or_path: string } | undefined;
+
+    const screenId = screen?.id ?? null;
+    const screenName = screen?.name ?? (page.title || page.url);
+    const scanTarget = { id: screenId ?? `page-${page.id}`, name: screenName, url_or_path: page.url };
+
+    const spellingIssues: SpellingIssue[] = JSON.parse(page.spelling_issues_json || "[]");
+    if (spellingIssues.length && screenId) allFindings.push(...fileSpellingFindings(screenId, screenName, spellingIssues));
+
+    const uiFindings = await scanScreenForUiBugs(scanTarget, undefined, screenId);
+    allFindings.push(...uiFindings);
+
+    const apis = JSON.parse(page.apis_json || "[]") as Array<{ method: string; endpoint: string }>;
+    for (const api of apis) {
+      if (api.endpoint.includes(":id") || /\/\d+/.test(api.endpoint)) {
+        apiTemplates.add(api.endpoint);
+      }
+    }
+  }
+
+  if (apiTemplates.size > 0) {
+    const fuzzed = await fuzzApiEndpoints(site.url, Array.from(apiTemplates).slice(0, 10));
+    allFindings.push(...fuzzed);
+  }
+
+  return allFindings;
 }

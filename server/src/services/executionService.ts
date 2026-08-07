@@ -6,7 +6,7 @@ import { fileURLToPath } from "url";
 import { db } from "../db.js";
 import { recordTimeBreakdownForRun, updateFlakyFlagForScript } from "./reportingService.js";
 import { autoFileBugOnRegression, notifyAllOnRunComplete } from "./integrationsService.js";
-import { runBugScanForScreen } from "./bugDetectionService.js";
+import { runBugScanForScreen, recordBugFinding } from "./bugDetectionService.js";
 import { decryptSecret } from "./secretsService.js";
 import { getEnvironment, preflightHealthCheck } from "./environmentsService.js";
 import { logAudit } from "./adminService.js";
@@ -88,6 +88,17 @@ const RETRY_STRATEGIES = new Set(["no-retry", "retry-flaky", "retry-all", "smart
 
 export function getNpxCommand(): string {
   return process.platform === "win32" ? "npx.cmd" : "npx";
+}
+
+/** Strip huge Playwright stdout/stderr from HTTP trigger responses (kept on the run row). */
+export function summarizeRunForClient(runResult: any) {
+  if (!runResult || typeof runResult !== "object") return runResult;
+  const { stdout, stderr, ...rest } = runResult;
+  return {
+    ...rest,
+    stdoutBytes: typeof stdout === "string" ? stdout.length : 0,
+    stderrBytes: typeof stderr === "string" ? stderr.length : 0,
+  };
 }
 
 // Escapes a test title for safe use as a literal match inside Playwright's --grep regex.
@@ -568,9 +579,34 @@ function processExecutionQueueLazy() {
 // sitting in the DB forever (see FR-4.5).
 export function runExecution(scriptId: string, targetUrl: string, input: any = {}, existingRunId?: string): Promise<any> {
   return new Promise((resolve) => {
+    try {
     const script = db.prepare("SELECT * FROM automation_scripts WHERE id = ?").get(scriptId) as any;
     if (!script) {
       resolve({ error: "Script not found" });
+      return;
+    }
+
+    if (!script.file_path || typeof script.file_path !== "string") {
+      const id = nanoid(10);
+      const now = new Date().toISOString();
+      const message = "Script file path is missing -- regenerate automation for this test case";
+      db.prepare(`
+        INSERT INTO execution_runs (id, script_id, status, duration_ms, stdout, stderr, created_at)
+        VALUES (@id, @script_id, 'error', 0, '', @stderr, @created_at)
+      `).run({ id, script_id: scriptId, stderr: message, created_at: now });
+      resolve({ id, status: "error", error: message, durationMs: 0 });
+      return;
+    }
+    const scriptPath = path.isAbsolute(script.file_path) ? script.file_path : path.join(SERVER_ROOT, script.file_path);
+    if (!fs.existsSync(scriptPath)) {
+      const id = nanoid(10);
+      const now = new Date().toISOString();
+      const message = `Script file not found on disk (${path.basename(script.file_path)}) -- regenerate automation`;
+      db.prepare(`
+        INSERT INTO execution_runs (id, script_id, status, duration_ms, stdout, stderr, created_at)
+        VALUES (@id, @script_id, 'error', 0, '', @stderr, @created_at)
+      `).run({ id, script_id: scriptId, stderr: message, created_at: now });
+      resolve({ id, status: "error", error: message, durationMs: 0 });
       return;
     }
 
@@ -594,7 +630,7 @@ export function runExecution(scriptId: string, targetUrl: string, input: any = {
       return;
     }
 
-    const relFile = path.relative(SERVER_ROOT, script.file_path).replace(/\\/g, "/");
+    const relFile = path.relative(SERVER_ROOT, scriptPath).replace(/\\/g, "/");
     const startedAt = Date.now();
     const profile = input.profile_id ? (db.prepare("SELECT * FROM execution_profiles WHERE id = ?").get(input.profile_id) as any) : null;
     const config = profile ? { ...profile } : normalizeProfile(input);
@@ -752,7 +788,9 @@ export function runExecution(scriptId: string, targetUrl: string, input: any = {
       });
     }
 
-    const child = execFile(
+    let child: ChildProcess;
+    try {
+      child = execFile(
       getNpxCommand(),
       args,
       {
@@ -805,23 +843,26 @@ export function runExecution(scriptId: string, targetUrl: string, input: any = {
         const classifyTestFailure = (message: string | null): { failureClass: string; failureLabel: string } => {
           if (!message) return { failureClass: "unknown", failureLabel: "No error detail captured" };
           const m = message.toLowerCase();
-          // The generated script itself doesn't even run/parse -- always a script
-          // bug, never a product defect (e.g. a malformed API URL passed to
-          // apiRequestContext.get, or invalid syntax in the emitted file).
           if (/syntaxerror|typeerror.*invalid url|invalid url/.test(m)) {
             return { failureClass: "automation_issue", failureLabel: "Automation script issue -- the generated script itself is malformed (syntax/invalid input), not a product defect" };
           }
           if (/net::err_|err_connection_refused|err_name_not_resolved|err_connection_timed_out|err_connection_reset|err_internet_disconnected/.test(m)) {
             return { failureClass: "environment_issue", failureLabel: "Target unreachable (network/environment issue, not a product defect)" };
           }
+          if (/returned http [45]\d\d|response\.ok|tohavetitle.*received|tobevisible.*received|not visible|404|page not found|internal server error/.test(m)) {
+            return { failureClass: "possible_bug", failureLabel: "Possible product bug -- page content or HTTP response did not match expectations" };
+          }
+          if (/expect\(.*\)\.|assert/.test(m)) {
+            return { failureClass: "possible_bug", failureLabel: "Possible product bug -- an assertion did not match actual page/API content" };
+          }
           if (/(getbylabel|getbyrole|getbytext|getbytestid|getbyplaceholder|locator\()/.test(m) && /(timeout|waiting for)/.test(m)) {
             return { failureClass: "automation_issue", failureLabel: "Automation script issue -- the generated locator didn't match anything on the page" };
           }
-          if (/test timeout of \d+ms exceeded/.test(m) && !/expect\(/.test(m)) {
-            return { failureClass: "automation_issue", failureLabel: "Automation script issue -- step timed out before reaching an assertion" };
-          }
-          if (/expect\(.*\)\.|assert/.test(m) || /returned http 5\d\d|response\.ok/.test(m)) {
-            return { failureClass: "possible_bug", failureLabel: "Possible product bug -- an assertion did not match actual page/API content" };
+          if (/test timeout of \d+ms exceeded/.test(m)) {
+            if (/(getbylabel|getbyrole|getbytext|getbytestid|getbyplaceholder|locator\()/.test(m)) {
+              return { failureClass: "automation_issue", failureLabel: "Automation script issue -- step timed out before reaching an assertion" };
+            }
+            return { failureClass: "possible_bug", failureLabel: "Possible product bug -- the page did not become ready within the time limit (slow load, broken page, or blocked content)" };
           }
           return { failureClass: "unknown", failureLabel: "Uncategorized failure -- review the error detail" };
         };
@@ -892,6 +933,24 @@ export function runExecution(scriptId: string, targetUrl: string, input: any = {
                 failure_label: ft.failureLabel,
                 created_at: evNow,
               });
+
+              // Surface likely product defects in the Bugs tab, not only as test-run noise.
+              if (ft.failureClass === "possible_bug") {
+                recordBugFinding({
+                  source: "regression",
+                  severity: "high",
+                  title: `Possible product defect: ${ft.title}`,
+                  detail: ft.errorMessage || ft.failureLabel,
+                  screenId: testCase?.screen_id ?? null,
+                  runId,
+                  evidence: { testTitle: ft.title, testFile: ft.file, failureClass: ft.failureClass },
+                  stepsToReproduce: [
+                    `Run the automated test: ${ft.title}`,
+                    `Target URL: ${targetUrl}`,
+                    `Observe failure: ${ft.failureLabel}`,
+                  ],
+                });
+              }
             }
           }
         } catch {
@@ -979,7 +1038,33 @@ export function runExecution(scriptId: string, targetUrl: string, input: any = {
         });
       }
     );
+    } catch (spawnErr: any) {
+      db.prepare(`
+        UPDATE execution_runs SET status = 'error', duration_ms = 0, stderr = @stderr WHERE id = @id
+      `).run({ id: runId, stderr: String(spawnErr?.message || spawnErr).slice(0, 8000) });
+      resolve({
+        id: runId,
+        status: "error",
+        error: spawnErr?.message || "Failed to start Playwright process",
+        durationMs: 0,
+      });
+      return;
+    }
+
+    child.on("error", (spawnErr) => {
+      runningProcesses.delete(runId);
+      const durationMs = Date.now() - startedAt;
+      const message = spawnErr?.message || "Playwright process failed to start";
+      db.prepare(`
+        UPDATE execution_runs SET status = 'error', duration_ms = @duration_ms, stderr = @stderr WHERE id = @id
+      `).run({ id: runId, duration_ms: durationMs, stderr: message.slice(0, 8000) });
+      resolve({ id: runId, status: "error", error: message, durationMs });
+    });
+
     runningProcesses.set(runId, child);
+    } catch (err: any) {
+      resolve({ status: "error", error: err?.message || "Execution failed to start" });
+    }
   });
 }
 
@@ -991,13 +1076,33 @@ export function runExecution(scriptId: string, targetUrl: string, input: any = {
 export async function runExecutionBatch(scriptIds: string[], targetUrl: string, input: any = {}): Promise<any> {
   if (scriptIds.length === 0) throw new Error("scriptIds must be a non-empty array");
 
-  const scripts = scriptIds.map((id) => db.prepare("SELECT * FROM automation_scripts WHERE id = ?").get(id) as any).filter(Boolean);
+  // FR-TBD: Prioritize smoke tests first, then remaining tests
+  // Sort scripts by test case category: smoke tests first, then regression, then others
+  const scriptDetails = scriptIds.map((id) => {
+    const script = db.prepare("SELECT * FROM automation_scripts WHERE id = ?").get(id) as any;
+    const tc = script ? (db.prepare("SELECT category FROM test_cases WHERE id = ?").get(script.test_case_id) as { category: string } | undefined) : null;
+    return { id, script, category: tc?.category ?? null };
+  }).filter((s) => s.script);
+
+  // Sort: Smoke first (priority 0), then Regression (priority 1), then others (priority 2)
+  scriptDetails.sort((a, b) => {
+    const aPriority = a.category === "Smoke" ? 0 : a.category === "Regression" ? 1 : 2;
+    const bPriority = b.category === "Smoke" ? 0 : b.category === "Regression" ? 1 : 2;
+    return aPriority - bPriority;
+  });
+
+  const scripts = scriptDetails.map((s) => s.script).filter(Boolean);
+  const sortedScriptIds = scriptDetails.map((s) => s.id);
+
   if (scripts.length === 0) throw new Error("No matching scripts found");
 
   const relFiles = scripts.map((s) => path.relative(SERVER_ROOT, s.file_path).replace(/\\/g, "/"));
   const profile = input.profile_id ? (db.prepare("SELECT * FROM execution_profiles WHERE id = ?").get(input.profile_id) as any) : null;
   const config = profile ? { ...profile } : normalizeProfile(input);
   const requestedConcurrency = Math.max(1, Number(config.concurrency || 1));
+  
+  // Store original order for audit/logging (smoke tests prioritized)
+  const testOrderInfo = { total: scripts.length, smokeCount: scriptDetails.filter((s) => s.category === "Smoke").length };
 
   const runOnce = (workers: number): Promise<{ durationMs: number; passed: number; failed: number }> => {
     return new Promise((resolve) => {

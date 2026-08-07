@@ -285,6 +285,15 @@ export default function Crawler() {
     setSelected(new Set(ids));
   }
 
+  // Select all scenarios from all pages (convenience for full crawl testing)
+  function selectAllPages() {
+    if (!detail) return;
+    const ids = detail.pages.flatMap((p) =>
+      p.scenarios.filter((s) => !s.generated_test_case_id).map((s) => s.id)
+    );
+    setSelected(new Set(ids));
+  }
+
   function clearSelection() {
     setSelected(new Set());
   }
@@ -462,6 +471,9 @@ export default function Crawler() {
   const smokeCount = allScenarios.filter((s) => s.tier === "smoke").length;
   const functionalCount = allScenarios.filter((s) => s.tier === "functional").length;
   const regressionCount = allScenarios.filter((s) => s.tier === "regression").length;
+  const negativeCount = allScenarios.filter((s) => s.type === "negative").length;
+  const edgeCount = allScenarios.filter((s) => s.type === "edge").length;
+  const flowCount = allScenarios.filter((s) => s.type === "flow").length;
 
   return (
     <div className="space-y-6">
@@ -599,7 +611,10 @@ export default function Crawler() {
             <p className="font-medium text-sm">Review & curate ({visibleScenarioCount} scenario(s) across {detail.pages.length} page(s))</p>
             <div className="flex gap-2 flex-wrap">
               <button className="rounded-md border border-ink/20 text-ink/70 px-3 py-1.5 text-xs" onClick={selectAll}>
-                Select all
+                Select all (filtered)
+              </button>
+              <button className="rounded-md border border-ink/20 text-ink/70 px-3 py-1.5 text-xs font-medium" onClick={selectAllPages} title="Select all scenarios from all pages, ignoring current filter">
+                Select all pages
               </button>
               <button className="rounded-md border border-ink/20 text-ink/70 px-3 py-1.5 text-xs disabled:opacity-40" disabled={selected.size === 0} onClick={clearSelection}>
                 Clear
@@ -659,10 +674,9 @@ export default function Crawler() {
             )}
           </div>
 
-          {/* Smoke = the one core happy path per page/form. Functional = everything
-              else generated at crawl time (edge/negative/boundary/multi-step/API).
-              Regression = scenarios carried forward unchanged from a page that
-              didn't change on a re-crawl -- see crawlerService.ts's persistCrawlResult. */}
+          {/* Smoke = page-load for every discovered page. Functional = clicks/
+              negatives/API. Regression = happy-path + re-verify. Flow scenarios
+              (type=flow) are multi-page or in-page journeys, usually under Regression. */}
           <div className="flex items-center gap-2 flex-wrap">
             <span className="text-xs text-ink/50">Test suite:</span>
             <div className="flex items-center rounded-full border border-line bg-white/60 p-0.5 text-xs w-fit">
@@ -675,25 +689,28 @@ export default function Crawler() {
               <button
                 className={`rounded-full px-3 py-1 font-medium ${tierFilter === "smoke" ? "bg-ink text-paper" : "text-ink/60"}`}
                 onClick={() => setTierFilter("smoke")}
-                title="Core critical flows confirming the app is functional"
+                title="Page-load smoke: every discovered page must load"
               >
                 Smoke ({smokeCount})
               </button>
               <button
                 className={`rounded-full px-3 py-1 font-medium ${tierFilter === "functional" ? "bg-ink text-paper" : "text-ink/60"}`}
                 onClick={() => setTierFilter("functional")}
-                title="Edge cases, negative/error handling, boundary conditions, multi-step and cross-page flows"
+                title="Clicks, negatives, edge cases, API checks"
               >
                 Functional ({functionalCount})
               </button>
               <button
                 className={`rounded-full px-3 py-1 font-medium ${tierFilter === "regression" ? "bg-ink text-paper" : "text-ink/60"}`}
                 onClick={() => setTierFilter("regression")}
-                title="Previously-working scenarios carried forward from an unchanged page on a re-crawl"
+                title="Happy-path + re-verify + flow journeys"
               >
                 Regression ({regressionCount})
               </button>
             </div>
+            <span className="text-xs text-ink/40">
+              Flow: {flowCount} · Negative: {negativeCount} · Edge: {edgeCount} · every page gets smoke + regression + negative/edge baselines
+            </span>
           </div>
 
           {detail.pages.map((page) => {
@@ -771,7 +788,7 @@ export default function Crawler() {
                               <label className="flex items-center gap-2">
                                 <input type="checkbox" checked={selected.has(s.id)} onChange={() => toggle(s.id)} disabled={Boolean(s.generated_test_case_id)} />
                                 <span className="font-medium">{s.title}</span>
-                                <Pill tone={s.type === "negative" ? "bad" : s.type === "flow" ? "warn" : s.type === "api" ? "neutral" : "good"}>{s.type}</Pill>
+                                  <Pill tone={s.type === "negative" ? "bad" : s.type === "edge" ? "warn" : s.type === "flow" ? "warn" : s.type === "api" ? "neutral" : "good"}>{s.type}</Pill>
                                 {s.tier && (
                                   <Pill tone={s.tier === "regression" ? "warn" : s.tier === "smoke" ? "good" : "neutral"}>{s.tier}</Pill>
                                 )}

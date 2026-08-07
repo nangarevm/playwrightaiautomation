@@ -8,6 +8,8 @@ import { sanitizeForLlm } from "./safetyService.js";
 import { commitGeneratedScriptToGit } from "./integrationsService.js";
 import { withLlmGateway } from "./llmGatewayService.js";
 import { tagScriptToScreen } from "./screensService.js";
+import { getDefaultScriptLanguage } from "../llm/modelConfig.js";
+import type { ScriptLanguage } from "../llm/modelConfig.js";
 
 interface GeneratedArtifactRecord {
   language: string;
@@ -40,16 +42,70 @@ fs.mkdirSync(GENERATED_DIR, { recursive: true });
 // Minimal static scanner. In production this would call out to a real SAST
 // tool (e.g. semgrep). Flags patterns that should never appear in
 // AI-generated Playwright automation code.
-const DANGEROUS_PATTERNS: { pattern: RegExp; reason: string }[] = [
+//
+// External-host check is allowlist-aware: crawled sites (and TARGET_URL) are
+// legitimate destinations for generated scripts. Only unexpected third-party
+// hosts should be flagged.
+const ALWAYS_DANGEROUS: { pattern: RegExp; reason: string }[] = [
   { pattern: /child_process/, reason: "spawns OS processes" },
   { pattern: /\beval\s*\(/, reason: "uses eval()" },
   { pattern: /require\(['"]fs['"]\).*(unlink|rm|rmdir)/s, reason: "deletes files from disk" },
   { pattern: /process\.env\.[A-Z_]*(SECRET|TOKEN|KEY)[A-Z_]*\s*(=|\+=)/, reason: "writes to a secret-looking env var" },
-  { pattern: /https?:\/\/(?!localhost|127\.0\.0\.1)/, reason: "references an external network host not equal to the target-under-test" },
 ];
 
-export function staticSecurityScan(code: string): { status: "passed" | "flagged"; notes: string } {
-  const hits = DANGEROUS_PATTERNS.filter((d) => d.pattern.test(code)).map((d) => d.reason);
+const DEFAULT_ALLOWED_HOSTS = new Set(["localhost", "127.0.0.1"]);
+
+export function hostFromUrl(raw: string | null | undefined): string | null {
+  if (!raw) return null;
+  try {
+    const withProtocol = /^https?:\/\//i.test(raw) ? raw : `https://${raw}`;
+    return new URL(withProtocol).hostname.toLowerCase();
+  } catch {
+    return null;
+  }
+}
+
+export function collectAllowedHosts(...candidates: Array<string | null | undefined>): Set<string> {
+  const hosts = new Set(DEFAULT_ALLOWED_HOSTS);
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+    // Pull every URL-looking token out of rationale / hints, not just a single host.
+    const matches = String(candidate).matchAll(/https?:\/\/[^\s)'"`]+/gi);
+    for (const match of matches) {
+      const host = hostFromUrl(match[0]);
+      if (host) hosts.add(host);
+    }
+    const bare = hostFromUrl(candidate);
+    if (bare) hosts.add(bare);
+  }
+  return hosts;
+}
+
+export function staticSecurityScan(
+  code: string,
+  options?: { allowedHosts?: Iterable<string> }
+): { status: "passed" | "flagged"; notes: string } {
+  const hits = ALWAYS_DANGEROUS.filter((d) => d.pattern.test(code)).map((d) => d.reason);
+
+  const allowed = new Set(DEFAULT_ALLOWED_HOSTS);
+  for (const host of options?.allowedHosts ?? []) {
+    if (host) allowed.add(String(host).toLowerCase());
+  }
+
+  const urlMatches = code.matchAll(/https?:\/\/[^\s)'"`]+/gi);
+  const disallowedHosts = new Set<string>();
+  for (const match of urlMatches) {
+    const host = hostFromUrl(match[0]);
+    if (!host) continue;
+    if (allowed.has(host)) continue;
+    disallowedHosts.add(host);
+  }
+  if (disallowedHosts.size > 0) {
+    hits.push(
+      `references an external network host not equal to the target-under-test (${Array.from(disallowedHosts).join(", ")})`
+    );
+  }
+
   if (hits.length === 0) return { status: "passed", notes: "No disallowed patterns detected." };
   return { status: "flagged", notes: `Flagged for: ${hits.join("; ")}` };
 }
@@ -119,7 +175,10 @@ ${sharedSteps.map((s) => `  // ${s}`).join("\n")}
   return filePath;
 }
 
-export async function generateAutomationScript(testCaseId: string, options: { framework?: "playwright" | "selenium" | "cypress" } = {}) {
+export async function generateAutomationScript(
+  testCaseId: string,
+  options: { framework?: "playwright" | "selenium" | "cypress"; language?: ScriptLanguage } = {}
+) {
   const tc = db.prepare("SELECT * FROM test_cases WHERE id = ?").get(testCaseId) as any;
   if (!tc) throw new Error("Test case not found");
   if (tc.status !== "accepted" && tc.status !== "edited") {
@@ -136,43 +195,37 @@ export async function generateAutomationScript(testCaseId: string, options: { fr
     category: tc.category,
   };
 
-  // FR-3.2: optional Selenium/Cypress export, in addition to the default Playwright trio
-  const requestedFramework = options.framework;
+  // FR-3.2: optional Selenium/Cypress export; default Playwright in one language per LLM call.
+  const requestedFramework = options.framework ?? "playwright";
+  const language = options.language ?? getDefaultScriptLanguage();
 
   // FR-9.5/9.6/9.7: route script generation through the same LLM gateway test-case
-  // generation already uses. This matters specifically for the AI Crawler: its scenario
-  // templates ("Submit X with only Y empty", "Upload a <format> file to Z") repeat across
-  // every field/form/environment it discovers, and re-crawling a staging vs. prod copy of
-  // the same app (or the same field template on many forms) produces near-identical
-  // title+steps text -- a semantic cache hit skips the LLM call entirely (0 tokens) instead
-  // of re-generating essentially the same script. Previously this call bypassed the gateway
-  // entirely (see logScriptGenerationUsage's old comment: "no semantic cache/compression"),
-  // which was true for one-off manual test cases but leaves real savings on the table for
-  // the crawler's naturally repetitive, template-driven output.
-  const cacheKey = sanitizedTestCase.title + " " + sanitizedTestCase.steps.join(" ");
+  // generation already uses. Cache key includes language/framework so different
+  // export targets never share the same cached script.
+  const cacheKey = [sanitizedTestCase.title, ...sanitizedTestCase.steps, language, requestedFramework].join(" ");
   type Artifact = { language: string; framework: string; code: string; fileName: string };
   const artifacts = await withLlmGateway<Artifact[]>(
     "script_generation",
     { inputId: tc.id, provider: llm.name, prompt: cacheKey, category: sanitizedTestCase.category },
-    async () => {
-      let result: Artifact[];
-      if (requestedFramework && requestedFramework !== "playwright") {
-        result = [{
-          language: "javascript",
-          framework: requestedFramework,
-          code: await llm.generatePlaywrightScript(sanitizedTestCase, { language: "javascript", framework: requestedFramework }),
-          fileName: `${tc.id}.${requestedFramework === "cypress" ? "cy.js" : "selenium.js"}`,
-        }];
-      } else {
-        const rawArtifacts = await llm.generateAutomationArtifacts?.(sanitizedTestCase, { apiSpecHint: tc.source_rationale }) ?? [];
-        result = rawArtifacts.length > 0 ? rawArtifacts : [{
-          language: "typescript",
-          framework: "playwright",
-          code: await llm.generatePlaywrightScript(sanitizedTestCase, { language: "typescript", framework: "playwright" }),
-          fileName: `${tc.id}.spec.ts`,
-        }];
-      }
-      return { result, outputText: result.map((a) => a.code).join("\n") };
+    async (_preparedPrompt, tier) => {
+      const code = await llm.generatePlaywrightScript(sanitizedTestCase, {
+        tier,
+        language,
+        framework: requestedFramework,
+        apiSpecHint: tc.source_rationale,
+      });
+      const fileName =
+        requestedFramework === "cypress"
+          ? `${tc.id}.cy.js`
+          : requestedFramework === "selenium"
+            ? `${tc.id}.selenium.js`
+            : language === "python"
+              ? `${tc.id}.py`
+              : language === "javascript"
+                ? `${tc.id}.spec.js`
+                : `${tc.id}.spec.ts`;
+      const result: Artifact[] = [{ language, framework: requestedFramework, code, fileName }];
+      return { result, outputText: code };
     }
   );
 
@@ -194,7 +247,24 @@ export async function generateAutomationScript(testCaseId: string, options: { fr
   // the whole generation call closed (nothing partially written/committed)
   // rather than being silently persisted with a 201, which is what happened
   // before this pass.
-  const scans = artifacts.map((artifact) => ({ artifact, scan: staticSecurityScan(artifact.code) }));
+  //
+  // Allow the crawled page URL / screen URL / TARGET_URL so Generate+Run against
+  // a real site is not false-flagged as "unexpected external host".
+  const screen = tc.screen_id
+    ? (db.prepare("SELECT url_or_path FROM screens WHERE id = ?").get(tc.screen_id) as { url_or_path: string | null } | undefined)
+    : undefined;
+  const crawlUrlMatch = String(tc.source_rationale || "").match(/CRAWL_URL=(\S+)/);
+  const allowedHosts = collectAllowedHosts(
+    tc.source_rationale,
+    crawlUrlMatch?.[1],
+    screen?.url_or_path,
+    process.env.TARGET_URL
+  );
+
+  const scans = artifacts.map((artifact) => ({
+    artifact,
+    scan: staticSecurityScan(artifact.code, { allowedHosts }),
+  }));
   const flagged = scans.find((s) => s.scan.status === "flagged");
   if (flagged) {
     throw new SecurityScanFailedError(flagged.scan.notes);

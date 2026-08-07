@@ -89,6 +89,12 @@ const uploadDocs = multer({
 
 app.use(cors());
 app.use(express.json({ limit: "2mb" }));
+app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
+  if (err?.type === "entity.parse.failed" || err instanceof SyntaxError) {
+    return res.status(400).json(errBody(400, err.message || "Invalid JSON body"));
+  }
+  next(err);
+});
 app.use(attachUser); // FR-8.1: resolve X-User-Id into req.user (defaults to a permissive Tester identity)
 app.use(rateLimitMiddleware); // Dev TDD §6.5: 429 RATE_LIMITED, per-identity fixed window
 app.use(enforceReadOnlyRoles); // FR-8.1: Manager/Stakeholder role is read-only
@@ -221,9 +227,17 @@ process.on("unhandledRejection", (err) => {
   console.error("[unhandled rejection]", err);
 });
 
-app.listen(PORT, () => {
+const server = app.listen(PORT, () => {
   console.log(`AI Test Automation Platform server listening on http://localhost:${PORT}`);
   console.log(`Demo app-under-test available at http://localhost:${PORT}/demo/login.html`);
+});
+
+server.on("error", (err: NodeJS.ErrnoException) => {
+  if (err.code === "EADDRINUSE") {
+    console.error(`[server] Port ${PORT} is already in use -- another server instance is still running.`);
+    process.exit(1);
+  }
+  throw err;
 });
 
 // FR-4.16: check every minute for scheduled Execution Profiles due to run

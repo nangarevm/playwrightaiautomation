@@ -12,6 +12,12 @@ export interface CrawlOptions {
   maxPages?: number;
   captureApi?: boolean;
   concurrency?: number;
+  /** incremental (default on re-run): skip deep interaction when page structure matches baseline. full: always deep-scan. */
+  mode?: "incremental" | "full";
+  /** Previously discovered page URLs for this site -- seeded first on re-crawl so coverage isn't lost. */
+  knownUrls?: string[];
+  /** Baseline lookup used during discovery for early unchanged short-circuit (incremental mode). */
+  getBaseline?: (url: string) => { hash: string; elements: ElementRecord[] } | null;
   onProgress?: (progress: CrawlProgress) => void;
 }
 
@@ -60,15 +66,14 @@ export interface ComponentInventoryItem {
 export interface ScenarioRecord {
   id: string;
   title: string;
-  type: "positive" | "negative" | "flow" | "api";
+  type: "positive" | "negative" | "edge" | "flow" | "api";
   // Coarser than `type`: which of the three test suites this belongs to.
-  // "smoke" = the one core happy-path check per page/form (does the critical
-  // flow work at all); "functional" = everything else generated at crawl time
-  // (edge cases, negative/validation, boundary/format coverage, multi-step
-  // cross-page journeys, API checks); "regression" is never assigned at
-  // generation time -- it's applied at persistence time (crawlerService.ts)
-  // to scenarios carried forward unchanged from a page that didn't change on
-  // a re-crawl, i.e. "this previously worked, re-verify it still does."
+  // "smoke" = page-load check for every discovered page (does the URL render);
+  // "functional" = edge/negative/boundary/API/click coverage generated at crawl;
+  // "regression" = happy-path and re-verify scenarios assigned on first crawl
+  // (and also applied at persistence on re-crawl for unchanged pages).
+  // Multi-page / in-page journeys use type === "flow" (usually tier regression).
+  // type "negative" / "edge" always map to Negative / Edge Case categories.
   tier: "smoke" | "functional" | "regression";
   flowGroup: string;
   steps: string[];
@@ -107,7 +112,7 @@ export interface PageRecord {
   elements: ElementRecord[];
   apis: ApiCallRecord[];
   scenarios: ScenarioRecord[];
-  changeStatus: "new" | "changed" | "unchanged";
+  changeStatus: "new" | "changed" | "unchanged" | "removed";
   diff?: PageDiff;
   spellingIssues: SpellingIssue[];
 }

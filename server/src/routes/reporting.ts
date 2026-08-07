@@ -9,7 +9,10 @@ import {
   getDashboardSummary,
   getHoursSavedEstimate,
   getRequirementCoverage,
+  getTagBasedCoverage,
 } from "../services/reportingService.js";
+import { generateUltrafastBugReport, collectCrawlBugsForSite, collectTestExecutionBugs, formatBugReport } from "../services/ultrafastBugReportService.js";
+import { db } from "../db.js";
 import { getLlmUsageSummary } from "../services/llmGatewayService.js";
 import { getUserNotificationPref, sendScheduledDigests, setUserNotificationPref } from "../services/digestService.js";
 
@@ -31,6 +34,70 @@ reportingRouter.get("/flaky", (_req, res) => {
 // FR-6.3: requirement coverage mapped to user stories
 reportingRouter.get("/coverage", (_req, res) => {
   res.json(getRequirementCoverage());
+});
+
+// Tag-based coverage: group test results by module/tag
+reportingRouter.get("/tag-coverage", (req, res) => {
+  const { startDate, endDate } = req.query as { startDate?: string; endDate?: string };
+  res.json(getTagBasedCoverage({ startDate, endDate }));
+});
+
+// Ultrafast mode bug report: comprehensive bug analysis from crawl + execution
+reportingRouter.get("/ultrafast-bug-report", (req, res) => {
+  try {
+    const { siteId, format } = req.query as { siteId?: string; format?: "json" | "html" | "pdf" };
+    
+    if (!siteId) {
+      return res.status(400).json({ error: "siteId query parameter is required" });
+    }
+
+    // Collect bugs from crawl
+    const crawlBugs = db.prepare(
+      `SELECT DISTINCT b.* FROM bug_findings b 
+       JOIN screens s ON b.screen_id = s.id 
+       WHERE s.crawl_site_id = ?`
+    ).all(siteId) as any[];
+
+    // Collect bugs from recent test executions for this site
+    const recentRuns = db.prepare(
+      `SELECT DISTINCT er.id FROM execution_runs er
+       JOIN automation_scripts a ON er.script_id = a.id
+       JOIN test_cases tc ON a.test_case_id = tc.id
+       WHERE tc.id IN (
+         SELECT id FROM test_cases WHERE screen_id IN (
+           SELECT id FROM screens WHERE crawl_site_id = ?
+         )
+       )
+       ORDER BY er.created_at DESC LIMIT 20`
+    ).all(siteId) as Array<{ id: string }>;
+
+    const executionBugs = [];
+    for (const run of recentRuns) {
+      const bugs = db.prepare(
+        `SELECT ee.id, ee.test_title as title, ee.error_message as detail, 
+                ee.duration_ms, er.id as testCaseId
+         FROM execution_evidence ee
+         JOIN execution_runs er ON ee.run_id = er.id
+         WHERE er.id = ? AND ee.error_message IS NOT NULL`
+      ).all(run.id) as any[];
+      executionBugs.push(...bugs);
+    }
+
+    const bugReport = generateUltrafastBugReport(siteId, crawlBugs, executionBugs);
+    const formattedReport = formatBugReport(bugReport, format || "json");
+
+    if (format === "html") {
+      res.setHeader("Content-Type", "text/html");
+      res.send(formattedReport);
+    } else if (format === "pdf") {
+      res.setHeader("Content-Type", "application/pdf");
+      res.send(formattedReport); // Would need pdfkit integration
+    } else {
+      res.json(JSON.parse(formattedReport));
+    }
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // FR-6.6: hours-saved estimate. Optional ?startDate=&endDate= computes it "per period" (see

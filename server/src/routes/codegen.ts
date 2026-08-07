@@ -12,8 +12,11 @@ codegenRouter.get("/", (_req, res) => {
 
 codegenRouter.post("/:testCaseId/generate", async (req, res) => {
   try {
-    const { framework } = req.body as { framework?: "playwright" | "selenium" | "cypress" };
-    const result = await generateAutomationScript(req.params.testCaseId, { framework });
+    const { framework, language } = req.body as {
+      framework?: "playwright" | "selenium" | "cypress";
+      language?: "typescript" | "javascript" | "python";
+    };
+    const result = await generateAutomationScript(req.params.testCaseId, { framework, language });
     res.status(201).json(result);
   } catch (err: any) {
     if (err instanceof SecurityScanFailedError) {

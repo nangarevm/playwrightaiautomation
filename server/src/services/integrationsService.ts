@@ -474,7 +474,7 @@ async function ensureGitRepo() {
 
 export async function commitGeneratedScriptToGit(fileName: string, testCaseId: string, testCaseTitle: string) {
   await ensureGitRepo();
-  await git(["add", fileName]);
+  await git(["add", "--", fileName]);
   try {
     await git(["commit", "-m", `codegen: ${testCaseTitle} (test case ${testCaseId})`, "--", fileName]);
   } catch (err: any) {

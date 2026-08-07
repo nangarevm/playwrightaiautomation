@@ -16,12 +16,14 @@ import {
   preflightGuardEnvironment,
   stopExecution,
   stopAllExecutions,
+  summarizeRunForClient,
 } from "../services/executionService.js";
 import { requireRole, getUltrafastConfidenceThreshold, setUltrafastConfidenceThreshold } from "../services/adminService.js";
 import { createPlatformSecret, listPlatformSecrets, deletePlatformSecret } from "../services/secretsRegistryService.js";
 import { getPoolStatus } from "../services/runnerPoolService.js";
 import { getEnvironment } from "../services/environmentsService.js";
 import { triggerUltrafastRun } from "../services/ultrafastService.js";
+import { SecurityScanFailedError } from "../services/codegenService.js";
 import { errBody } from "../errorCodes.js";
 
 export const executionRouter = Router();
@@ -138,8 +140,16 @@ executionRouter.post("/ultrafast", async (req, res) => {
   try {
     const { script_id, test_case_id, target_url } = req.body as { script_id?: string; test_case_id?: string; target_url?: string };
     const result = await triggerUltrafastRun({ script_id, test_case_id, target_url });
-    res.json(result);
+    try {
+      res.json(result);
+    } catch (jsonErr: any) {
+      console.error("[ultrafast] failed to serialize trigger response:", jsonErr);
+      res.status(500).json(errBody(500, "Run completed but the response could not be serialized -- check server logs"));
+    }
   } catch (err: any) {
+    if (err instanceof SecurityScanFailedError) {
+      return res.status(422).json(errBody(422, err.message, { notes: err.notes }));
+    }
     res.status(400).json(errBody(400, err.message));
   }
 });
@@ -160,7 +170,7 @@ executionRouter.post("/:scriptId/run", async (req, res) => {
     const targetUrl =
       (req.body?.target_url as string) || `http://localhost:${process.env.PORT || 4100}/demo/login.html`;
     const result = await runExecution(req.params.scriptId, targetUrl, body);
-    res.json(result);
+    res.json(summarizeRunForClient(result));
   } catch (err: any) {
     res.status(400).json(errBody(400, err.message));
   }

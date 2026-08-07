@@ -36,30 +36,43 @@ function guessComponentName(el: {
 }
 
 export async function extractElementLocators(page: Page, handle: Locator): Promise<RankedLocators | null> {
+  // IMPORTANT: keep this evaluate callback free of nested function declarations.
+  // tsx/esbuild injects `__name(...)` helpers for named/local functions, and those
+  // helpers do not exist in the browser context -- which previously made every
+  // locator extraction fail with "ReferenceError: __name is not defined" and left
+  // crawl pages with zero elements/forms.
   const info = await handle.evaluate((node: Element) => {
     const el = node as HTMLElement;
     const tag = el.tagName.toLowerCase();
     const testId = el.getAttribute("data-testid") || el.getAttribute("data-test") || el.getAttribute("data-qa");
-    const role = el.getAttribute("role") || (tag === "button" ? "button" : tag === "a" ? "link" : tag === "input" ? (el.getAttribute("type") === "checkbox" ? "checkbox" : "textbox") : tag === "select" ? "combobox" : null);
+    const role =
+      el.getAttribute("role") ||
+      (tag === "button"
+        ? "button"
+        : tag === "a"
+          ? "link"
+          : tag === "input"
+            ? el.getAttribute("type") === "checkbox"
+              ? "checkbox"
+              : "textbox"
+            : tag === "select"
+              ? "combobox"
+              : null);
     const id = el.id || null;
-    // Multi-line/wrapped element text (e.g. a button label that wraps across
-    // lines in the DOM) carries literal newlines/tabs in textContent -- .trim()
-    // only strips the ends, not internal whitespace. Collapsing to single spaces
-    // here (not just at codegen time) keeps every downstream consumer of this
-    // label -- scenario titles/steps, generated code comments -- newline-free.
-    const collapseWhitespace = (s: string) => s.replace(/\s+/g, " ").trim();
-    const text = collapseWhitespace(el.textContent || "").slice(0, 60);
+    const name = el.getAttribute("name") || null;
+    // Collapse multi-line/wrapped element text so scenario titles/steps stay single-line.
+    const text = (el.textContent || "").replace(/\s+/g, " ").trim().slice(0, 60);
     const ariaLabel = el.getAttribute("aria-label");
     const placeholder = el.getAttribute("placeholder");
 
     let labelText: string | null = null;
     if (id) {
       const labelEl = document.querySelector(`label[for="${CSS.escape(id)}"]`);
-      if (labelEl) labelText = collapseWhitespace(labelEl.textContent || "");
+      if (labelEl) labelText = (labelEl.textContent || "").replace(/\s+/g, " ").trim();
     }
     if (!labelText) {
       const closestLabel = el.closest("label");
-      if (closestLabel) labelText = collapseWhitespace(closestLabel.textContent || "");
+      if (closestLabel) labelText = (closestLabel.textContent || "").replace(/\s+/g, " ").trim();
     }
 
     const accessibleName = ariaLabel || labelText || text || placeholder || null;
@@ -68,7 +81,7 @@ export async function extractElementLocators(page: Page, handle: Locator): Promi
     const closestFormLabel =
       closestForm?.getAttribute("aria-label") ||
       closestForm?.getAttribute("name") ||
-      collapseWhitespace(closestForm?.querySelector("h1,h2,h3,legend")?.textContent || "") ||
+      (closestForm?.querySelector("h1,h2,h3,legend")?.textContent || "").replace(/\s+/g, " ").trim() ||
       (closestForm ? "Form" : null);
 
     const closestSection = el.closest("[role='navigation'], nav, header, footer, section, [aria-label]");
@@ -92,6 +105,7 @@ export async function extractElementLocators(page: Page, handle: Locator): Promi
       testId,
       role,
       id,
+      name,
       accessibleName,
       elementType,
       required: el.hasAttribute("required"),
@@ -111,18 +125,40 @@ export async function extractElementLocators(page: Page, handle: Locator): Promi
   if (info.role && info.accessibleName) {
     locators.push(`page.getByRole(${JSON.stringify(info.role)}, { name: ${JSON.stringify(info.accessibleName)} })`);
   }
-  // 3. id
+  // 3. id (prefer over generic CSS, most specific)
   if (info.id) {
     locators.push(`page.locator("#${escapeForAttrSelector(info.id)}")`);
+  }
+  // 3b. name attribute (for form inputs, often more reliable than type-only selectors)
+  if (info.name && (info.tag === "input" || info.tag === "select" || info.tag === "textarea")) {
+    locators.push(`page.locator("[name=${JSON.stringify(info.name)}]")`);
   }
   // 4. label/visible text
   if (info.accessibleName) {
     locators.push(`page.getByText(${JSON.stringify(info.accessibleName)}, { exact: false })`);
   }
   // 5. CSS selector fallback (only if we still have fewer than 3 candidates)
+  // For form inputs, prioritize more specific selectors over generic type selectors
   if (locators.length < 3) {
-    const css = info.id ? `#${escapeForAttrSelector(info.id)}` : `${info.tag}${info.inputType ? `[type="${info.inputType}"]` : ""}`;
-    locators.push(`page.locator(${JSON.stringify(css)})`);
+    let css: string | null = null;
+    
+    // Prefer id-based selectors for unambiguous targeting
+    if (info.id) {
+      css = `#${escapeForAttrSelector(info.id)}`;
+    }
+    // For inputs within forms, use form context to disambiguate
+    else if (info.tag === "input" && info.closestFormLabel) {
+      // Use form with input type: more specific than bare input[type="text"]
+      css = `form:has-text("${info.closestFormLabel}") ${info.tag}${info.inputType ? `[type="${info.inputType}"]` : ""}`;
+    }
+    // Fallback: generic tag selector (only for non-input or standalone elements)
+    else if (info.tag !== "input" || !info.inputType) {
+      css = info.tag;
+    }
+    
+    if (css) {
+      locators.push(`page.locator(${JSON.stringify(css)})`);
+    }
   }
   // 6. XPath, last resort, only if nothing better was found at all
   if (locators.length === 0) {

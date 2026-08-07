@@ -659,6 +659,12 @@ ensureColumn("crawl_pages", "component_inventory_json", "TEXT NOT NULL DEFAULT '
 ensureColumn("crawl_scenarios", "tier", "TEXT");
 db.prepare("UPDATE crawl_scenarios SET tier = 'functional' WHERE tier IS NULL AND type IN ('negative', 'flow', 'api')").run();
 db.prepare("UPDATE crawl_scenarios SET tier = 'smoke' WHERE tier IS NULL AND type = 'positive'").run();
+
+// Re-crawl tracking: last_seen_at marks pages still present; recrawl_summary_json
+// stores new/changed/unchanged/removed counts from the latest run.
+ensureColumn("crawl_pages", "last_seen_at", "TEXT");
+ensureColumn("crawl_sites", "recrawl_summary_json", "TEXT");
+ensureColumn("crawl_sites", "crawl_mode", "TEXT"); // incremental | full
 // Heuristic classification of *why* a test failed -- 'automation_issue' (the
 // generated script's own locator/timeout, not the product), 'environment_issue'
 // (target unreachable/DNS/connection refused), or 'possible_bug' (an assertion

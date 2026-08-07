@@ -19,6 +19,7 @@
 
 import { nanoid } from "nanoid";
 import type { ApiCallRecord, ScenarioRecord } from "./types.js";
+import { isLikelyApiResponse } from "./network.js";
 
 const STATIC_ASSET_EXT = /\.(png|jpe?g|gif|webp|svg|ico|woff2?|ttf|eot|otf|wasm|pbf|mp4|mp3|css|map)(\?|$)/i;
 
@@ -48,6 +49,10 @@ export function buildApiScenariosForSite(siteHost: string, pages: PageApiInput[]
       if (STATIC_ASSET_EXT.test(pathname) || INFRA_PATH_PREFIX.test(pathname)) continue;
 
       const method = call.method.toUpperCase();
+      // Backstop: older crawl rows may include HTML document prefetches captured before
+      // network.ts filtered on response content-type.
+      if (!isLikelyApiResponse("", `https://${call.host}${pathname}`)) continue;
+
       const key = `${method} ${pathname}`;
       if (seen.has(key)) continue;
       seen.add(key);

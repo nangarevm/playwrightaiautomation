@@ -5,10 +5,12 @@
 // owns all persistence, so this module stays independently testable.
 
 import { runDiscoveryCrawl } from "./discovery.js";
-import { buildCrudFlowScenario, buildFlowScenariosForSite, buildScenariosForPage } from "./scenarios.js";
+import { buildCrudFlowScenario, buildFlowScenariosForSite, buildIntraPageFlowScenario, buildScenariosForPage } from "./scenarios.js";
 import { buildApiScenariosForSite } from "./apiScenarios.js";
 import { classifyChange, diffElements, hashElements, type ChangeStatus } from "./diff.js";
 import { collectPageSpellingIssues } from "./spellcheck.js";
+import { dedupeScenariosFuzzy, scenarioFingerprint } from "./scenarioDedup.js";
+import { normalizeUrl } from "./urlUtils.js";
 import type { ApiCallRecord, ComponentInventoryItem, CrawlOptions, ElementRecord, PageDiff, ScenarioRecord, SpellingIssue } from "./types.js";
 
 export interface CrawledPageOutput {
@@ -31,6 +33,14 @@ export interface CrawlRunOutput {
   authenticated: boolean;
   authMessage: string;
   pages: CrawledPageOutput[];
+  /** Re-crawl summary: how many pages were new/changed/unchanged this run. */
+  summary: {
+    mode: "incremental" | "full";
+    newPages: number;
+    changedPages: number;
+    unchangedPages: number;
+    reusedBaselines: number;
+  };
 }
 
 export interface BaselineLookup {
@@ -38,23 +48,31 @@ export interface BaselineLookup {
 }
 
 export async function runCrawl(options: CrawlOptions, getBaseline: BaselineLookup): Promise<CrawlRunOutput> {
-  const { pages, edges, authenticated, authMessage } = await runDiscoveryCrawl(options);
+  const mode = options.mode ?? "full";
+  const { pages, edges, authenticated, authMessage } = await runDiscoveryCrawl({
+    ...options,
+    mode,
+    getBaseline,
+  });
 
+  let reusedBaselines = 0;
   const output: CrawledPageOutput[] = pages.map((discovered) => {
     const hash = hashElements(discovered.elements);
     const baseline = getBaseline(discovered.url);
-    const changeStatus = classifyChange(baseline?.hash, hash);
+    // Reused baseline pages are unchanged by definition -- skip re-hash surprises
+    // from shallow vs deep locator differences.
+    const changeStatus: ChangeStatus = discovered.reusedBaseline
+      ? "unchanged"
+      : classifyChange(baseline?.hash, hash);
+    if (discovered.reusedBaseline) reusedBaselines++;
 
-    // Phase 4: only pages that are new or actually changed get full scenario
-    // (re-)generation -- an unchanged page keeps whatever scenarios it already
-    // had (the caller leaves those rows untouched), which is what makes a
-    // re-run fast instead of re-generating everything from scratch.
     let scenarios: ScenarioRecord[] = [];
     let diff: PageDiff | null = null;
     if (changeStatus !== "unchanged") {
-      scenarios = buildScenariosForPage(discovered.title, discovered.elements, discovered.formCount);
+      scenarios = dedupeScenariosFuzzy(buildScenariosForPage(discovered.title, discovered.elements, discovered.formCount, discovered.url));
       const crudFlow = buildCrudFlowScenario(discovered.title, discovered.elements);
       if (crudFlow) scenarios.push(crudFlow);
+      scenarios = dedupeScenariosFuzzy(scenarios);
     }
     if (changeStatus === "changed" && baseline) {
       diff = diffElements(baseline.elements, discovered.elements);
@@ -76,16 +94,11 @@ export async function runCrawl(options: CrawlOptions, getBaseline: BaselineLooku
       scenarios,
       changeStatus,
       diff,
-      spellingIssues: collectPageSpellingIssues(discovered.title, discovered.elements),
+      spellingIssues: changeStatus === "unchanged" ? [] : collectPageSpellingIssues(discovered.title, discovered.elements),
       componentInventory: discovered.componentInventory,
     };
   });
 
-  // Phase 9: API scenarios are deduped across the WHOLE site (the same
-  // backend endpoint is typically called from most pages), so this runs once
-  // over every page's captured calls rather than per-page like buildScenariosForPage
-  // above. Same unchanged-page policy as UI scenarios: an endpoint first seen
-  // only on an unchanged page isn't (re)attached this run.
   const siteHost = safeHost(options.url);
   if (siteHost) {
     const apiScenariosByPage = buildApiScenariosForSite(
@@ -99,27 +112,41 @@ export async function runCrawl(options: CrawlOptions, getBaseline: BaselineLooku
     }
   }
 
-  // Full-application-flow scenarios: walk the navigation graph captured during
-  // discovery to find multi-page journeys (e.g. login -> browse -> checkout ->
-  // confirmation) rather than only ever generating same-page scenarios. Each
-  // journey is attached to its starting page's scenario list (crawl_scenarios.
-  // page_id is NOT NULL, so a multi-page scenario needs exactly one owning
-  // page row -- the entry page is the natural owner). Same unchanged-page
-  // policy as the rest of this function: only regenerated when the entry page
-  // itself is new/changed, so a stable site doesn't get duplicate journeys on
-  // every re-run.
-  const normalizedEntryUrl = normalizeUrlForFlow(options.url);
-  const entryPageOutput = output.find((p) => p.url === normalizedEntryUrl);
-  if (entryPageOutput && entryPageOutput.changeStatus !== "unchanged") {
+  const siteFlowFingerprints = new Set<string>();
+  for (const page of output) {
+    if (page.changeStatus === "unchanged") continue;
     const flowResults = buildFlowScenariosForSite(
-      normalizedEntryUrl,
+      page.url,
       output.map((p) => ({ url: p.url, title: p.title, elements: p.elements })),
       edges
     );
     for (const { scenario, entryUrl } of flowResults) {
+      const fp = scenarioFingerprint(scenario);
+      if (siteFlowFingerprints.has(fp)) continue;
+      siteFlowFingerprints.add(fp);
       const owner = output.find((p) => p.url === entryUrl);
       owner?.scenarios.push(scenario);
     }
+  }
+
+  // Guarantee the flow slot is never empty for a page that has interactive
+  // elements when the site graph didn't yield a multi-page journey for it.
+  for (const page of output) {
+    if (page.changeStatus === "unchanged") continue;
+    const hasFlow = page.scenarios.some((s) => s.type === "flow");
+    if (hasFlow) continue;
+    const intra = buildIntraPageFlowScenario(page.title, page.elements);
+    if (intra) {
+      const fp = scenarioFingerprint(intra);
+      if (!siteFlowFingerprints.has(fp)) {
+        siteFlowFingerprints.add(fp);
+        page.scenarios.push(intra);
+      }
+    }
+  }
+
+  for (const page of output) {
+    page.scenarios = dedupeScenariosFuzzy(page.scenarios);
   }
 
   return {
@@ -129,17 +156,19 @@ export async function runCrawl(options: CrawlOptions, getBaseline: BaselineLooku
     authenticated,
     authMessage,
     pages: output,
+    summary: {
+      mode,
+      newPages: output.filter((p) => p.changeStatus === "new").length,
+      changedPages: output.filter((p) => p.changeStatus === "changed").length,
+      unchangedPages: output.filter((p) => p.changeStatus === "unchanged").length,
+      reusedBaselines,
+    },
   };
-}
-
-function normalizeUrlForFlow(rawUrl: string): string {
-  return /^https?:\/\//i.test(rawUrl) ? rawUrl : `https://${rawUrl}`;
 }
 
 function safeHost(rawUrl: string): string | null {
   try {
-    const normalized = /^https?:\/\//i.test(rawUrl) ? rawUrl : `https://${rawUrl}`;
-    return new URL(normalized).host;
+    return new URL(normalizeUrl(rawUrl)).host;
   } catch {
     return null;
   }

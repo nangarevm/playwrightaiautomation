@@ -19,21 +19,33 @@ export const crawlerRouter = Router();
 // the crawler is automatically treated as a diff-mode re-run -- no manual
 // toggle required.
 crawlerRouter.post("/run", async (req, res) => {
-  const { url, username, password, maxPages, captureApi, concurrency } = req.body as {
+  const { url, username, password, maxPages, captureApi, concurrency, mode } = req.body as {
     url?: string;
     username?: string;
     password?: string;
     maxPages?: number;
     captureApi?: boolean;
     concurrency?: number;
+    mode?: "incremental" | "full";
   };
   if (!url || typeof url !== "string") {
     return res.status(400).json(errBody(400, "A valid URL is required."));
   }
+  if (mode && mode !== "incremental" && mode !== "full") {
+    return res.status(400).json(errBody(400, "mode must be 'incremental' or 'full'."));
+  }
 
   try {
-    const { siteId, isRerun } = await startCrawl({ url, username, password, maxPages, captureApi, concurrency });
-    res.status(202).json({ siteId, isRerun, status: "running" });
+    const { siteId, isRerun, mode: resolvedMode } = await startCrawl({
+      url,
+      username,
+      password,
+      maxPages,
+      captureApi,
+      concurrency,
+      mode,
+    });
+    res.status(202).json({ siteId, isRerun, mode: resolvedMode, status: "running" });
   } catch (err: any) {
     res.status(400).json(errBody(400, err.message || "Failed to start crawl."));
   }
