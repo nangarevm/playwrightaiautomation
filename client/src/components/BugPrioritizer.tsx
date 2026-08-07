@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { BugDetailPanel } from "./BugDetailPanel.js";
 
 export interface BugItem {
   id: string;
@@ -7,6 +8,15 @@ export interface BugItem {
   category: string;
   description?: string;
   screenName?: string;
+  screenshot?: string;
+  errorMessage?: string;
+  stackTrace?: string;
+  affectedFeature?: string;
+  stepsToReproduce?: string[];
+  suggestedFix?: string;
+  testName?: string;
+  testStep?: number;
+  discoveredAt?: string;
 }
 
 interface BugPrioritizerProps {
@@ -18,6 +28,7 @@ export function BugPrioritizer({ bugs, onBugSelect }: BugPrioritizerProps) {
   const [selectedSeverity, setSelectedSeverity] = useState<string | null>(null);
   const [selectedCategory, setSelectedCategory] = useState<string | null>(null);
   const [expandedBugId, setExpandedBugId] = useState<string | null>(null);
+  const [selectedBugForDetail, setSelectedBugForDetail] = useState<BugItem | null>(null);
 
   // Sort bugs by severity
   const severityOrder = { critical: 0, high: 1, medium: 2, low: 3 };
@@ -187,6 +198,7 @@ export function BugPrioritizer({ bugs, onBugSelect }: BugPrioritizerProps) {
               key={bug.id}
               className={`rounded-lg border-2 p-3 cursor-pointer transition hover:shadow-md ${getSeverityColor(bug.severity)}`}
               onClick={() => {
+                setSelectedBugForDetail(bug);
                 setExpandedBugId(expandedBugId === bug.id ? null : bug.id);
                 onBugSelect?.(bug);
               }}
@@ -216,6 +228,9 @@ export function BugPrioritizer({ bugs, onBugSelect }: BugPrioritizerProps) {
           ))
         )}
       </div>
+
+      {/* Bug Detail Panel */}
+      <BugDetailPanel bug={selectedBugForDetail} onClose={() => setSelectedBugForDetail(null)} />
     </div>
   );
 }
