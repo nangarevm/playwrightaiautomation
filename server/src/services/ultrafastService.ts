@@ -29,6 +29,7 @@ import { runExecution, suggestExecutionProfile, summarizeRunForClient } from "./
 import { applyTestCaseReview, TestCaseReviewError } from "./testCaseFeatures.js";
 import { logSystemAudit, getUltrafastConfidenceThreshold } from "./adminService.js";
 import { generateAutomationScript, SecurityScanFailedError } from "./codegenService.js";
+import { generateUltrafastBugReport, collectCrawlBugsForSite, collectTestExecutionBugs } from "./ultrafastBugReportService.js";
 
 export interface ResolvedDefaults {
   profileId: string | null;
@@ -237,11 +238,48 @@ export async function triggerUltrafastRun(input: UltrafastTriggerInput) {
   // no separate publish/export click required.
   const reportUrl = `/api/reporting/export.html?runId=${runResult.id}`;
 
+  // Ultrafast enhancement: Collect and aggregate bugs from crawl + execution
+  let bugReport = null;
+  try {
+    const screen = testCase.screen_id ? (db.prepare("SELECT * FROM screens WHERE id = ?").get(testCase.screen_id) as any) : null;
+    const crawlSiteId = screen?.crawl_site_id || null;
+    
+    if (crawlSiteId) {
+      const crawlBugs = db.prepare(
+        `SELECT DISTINCT b.* FROM bug_findings b 
+         JOIN screens s ON b.screen_id = s.id 
+         WHERE s.crawl_site_id = ?`
+      ).all(crawlSiteId) as any[];
+      
+      const executionBugs = db.prepare(
+        `SELECT ee.id, ee.test_title as title, ee.error_message as detail, 
+                er.id as testCaseId, ee.duration_ms
+         FROM execution_evidence ee
+         JOIN execution_runs er ON ee.run_id = er.id
+         WHERE er.id = ? AND ee.error_message IS NOT NULL`
+      ).all(runResult.id) as any[];
+      
+      bugReport = generateUltrafastBugReport(crawlSiteId, crawlBugs, executionBugs);
+    }
+  } catch (err: any) {
+    // Bug report generation is best-effort -- don't fail the execution if it fails
+    console.warn(`[ultrafast] bug report generation failed: ${err.message}`);
+  }
+
   return {
     run: summarizeRunForClient(runResult),
     resolvedProfile: { id: resolved.profileId, reason: resolved.profileReason },
     resolvedEnvironment: { id: resolved.environmentId, reason: resolved.environmentReason },
     reviewOutcome,
     reportUrl,
+    bugReport: bugReport ? {
+      totalBugs: bugReport.totalBugsFound,
+      critical: bugReport.severityCounts.critical,
+      high: bugReport.severityCounts.high,
+      medium: bugReport.severityCounts.medium,
+      low: bugReport.severityCounts.low,
+      bugReportUrl: `/api/reporting/ultrafast-bug-report?siteId=${bugReport.siteId}`,
+      summary: `Found ${bugReport.totalBugsFound} issues: ${bugReport.severityCounts.critical} critical, ${bugReport.severityCounts.high} high priority`
+    } : null
   };
 }
