@@ -729,6 +729,23 @@ CREATE TABLE IF NOT EXISTS assertion_results (
 );
 `);
 
+// Feature #9: Cost Transparency Dashboard - tracks execution costs
+db.exec(`
+CREATE TABLE IF NOT EXISTS execution_costs (
+  id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL,
+  estimated_cost REAL NOT NULL,
+  actual_cost REAL NOT NULL,
+  costs_accumulated REAL NOT NULL,
+  test_count INTEGER NOT NULL,
+  cost_per_test REAL NOT NULL,
+  breakdown_json TEXT NOT NULL,  -- JSON breakdown of cost components
+  timestamp INTEGER NOT NULL,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY (run_id) REFERENCES execution_runs(id)
+);
+`);
+
 // Seed a default user per SRS user class (FR-8.1) so RBAC is usable out of the box
 const userCount = (db.prepare("SELECT COUNT(*) as count FROM users").get() as any).count as number;
 if (userCount === 0) {
