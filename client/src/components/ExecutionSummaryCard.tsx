@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { BugPrioritizer } from "./BugPrioritizer.js";
 
 interface ExecutionResult {
   testsPassed: number;
@@ -18,10 +19,19 @@ interface ExecutionSummaryCardProps {
   result: ExecutionResult;
   runId: string;
   testCaseTitle?: string;
+  bugs?: Array<{
+    id: string;
+    title: string;
+    severity: "critical" | "high" | "medium" | "low";
+    category: string;
+    description?: string;
+    screenName?: string;
+  }>;
 }
 
-export function ExecutionSummaryCard({ result, runId, testCaseTitle }: ExecutionSummaryCardProps) {
+export function ExecutionSummaryCard({ result, runId, testCaseTitle, bugs = [] }: ExecutionSummaryCardProps) {
   const [isExpanded, setIsExpanded] = useState(false);
+  const [showBugs, setShowBugs] = useState(false);
 
   const passRate = result.totalTests > 0 ? Math.round((result.testsPassed / result.totalTests) * 100) : 0;
   const manualQACost = (result.totalTests * 15); // Estimate: $15 per test for manual QA
@@ -206,6 +216,19 @@ export function ExecutionSummaryCard({ result, runId, testCaseTitle }: Execution
           </div>
         ))}
       </div>
+
+      {/* Bug Details (if bugs found) */}
+      {bugs.length > 0 && (
+        <div className="border-t border-line pt-4">
+          <button
+            onClick={() => setShowBugs(!showBugs)}
+            className="text-sm font-semibold text-ink hover:text-ink/70 mb-3 flex items-center gap-2"
+          >
+            {showBugs ? "▼" : "▶"} Detailed Bug Analysis ({bugs.length})
+          </button>
+          {showBugs && <BugPrioritizer bugs={bugs} />}
+        </div>
+      )}
 
       {/* Actions */}
       <div className="flex gap-3 pt-2">
