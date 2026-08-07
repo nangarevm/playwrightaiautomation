@@ -636,7 +636,14 @@ export async function generateTestsFromScenarios(scenarioIds: string[], actorUse
         // Roll back the orphaned test case so a later Generate+Run can retry cleanly
         // instead of linking to a case with no automation script.
         db.prepare("DELETE FROM test_cases WHERE id = ?").run(testCaseId);
-        throw genErr;
+        // Report the failure, don't throw -- allow batch processing to continue
+        results.push({
+          scenarioId,
+          ok: false,
+          testCaseId,
+          error: genErr.message || "Failed to generate automation script (test case deleted, can retry)",
+        });
+        continue;
       }
     } catch (err: any) {
       results.push({ scenarioId, ok: false, error: err.message });
