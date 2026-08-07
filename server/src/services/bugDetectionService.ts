@@ -21,6 +21,8 @@ import { fileGenericBug } from "./integrationsService.js";
 import type { SpellingIssue } from "../crawler/types.js";
 import { originOf, normalizeUrl } from "../crawler/urlUtils.js";
 import { analyzeVisualDifferences, detectImageLoadingIssues, detectTextRenderingIssues } from "./visualDetectionService.js";
+import { analyzeConsoleError, summarizeErrors, groupErrorsByCategory, detectRelatedErrors, type ConsoleError } from "./consoleErrorService.js";
+import { validateInteraction, validateInteractionSequence, detectInteractionPatterns, type InteractionEvent } from "./interactionValidationService.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const UPLOAD_DIR = path.join(__dirname, "..", "uploads");
@@ -240,13 +242,24 @@ export async function scanScreenForUiBugs(
 
   const page = await context.newPage();
   try {
-    const consoleErrors: string[] = [];
+    const consoleErrors: ConsoleError[] = [];
     const pageErrors: string[] = [];
     const serverErrors: Array<{ url: string; status: number }> = [];
     const clientErrors: Array<{ url: string; status: number }> = [];
     const failedRequests: Array<{ url: string; error: string }> = [];
 
-    page.on("console", (msg) => { if (msg.type() === "error") consoleErrors.push(msg.text().slice(0, 300)); });
+    page.on("console", (msg) => {
+      if (msg.type() === "error") {
+        consoleErrors.push({
+          type: (msg.type() as any) || "error",
+          message: msg.text().slice(0, 500),
+          source: msg.location()?.url,
+          line: msg.location()?.lineNumber,
+          column: msg.location()?.columnNumber,
+          timestamp: Date.now(),
+        });
+      }
+    });
     page.on("pageerror", (err) => pageErrors.push(err.message.slice(0, 300)));
     page.on("response", (res) => {
       if (res.status() >= 500) serverErrors.push({ url: res.url(), status: res.status() });
@@ -393,16 +406,51 @@ export async function scanScreenForUiBugs(
       );
     }
     if (consoleErrors.length) {
+      const summary = summarizeErrors(consoleErrors);
+      const grouped = groupErrorsByCategory(consoleErrors);
+      const related = detectRelatedErrors(summary.topErrors);
+      
       findings.push(
         recordBugFinding({
           source: "ui_exploratory",
-          severity: "low",
-          title: `Console error(s) on ${screen.name}`,
-          detail: consoleErrors.slice(0, 10).join("\n"),
+          severity: summary.bySeverity.critical || summary.bySeverity.high ? "high" : "medium",
+          title: `Console error(s) on ${screen.name} (${summary.total} total)`,
+          detail: `
+Summary:
+- Total errors: ${summary.total}
+- Critical: ${summary.bySeverity.critical || 0}
+- High: ${summary.bySeverity.high || 0}
+
+Top Errors:
+${summary.topErrors.map((e, i) => `${i + 1}. [${e.severity.toUpperCase()}] ${e.errorType}: ${e.message}`).join("\n")}
+
+Categories:
+${Object.entries(grouped)
+  .filter(([, errors]) => errors.length > 0)
+  .map(([category, errors]) => `- ${category}: ${errors.length}`)
+  .join("\n")}
+          `.trim(),
           screenId,
           runId,
-          evidence: { consoleErrors: consoleErrors.slice(0, 10) },
-          stepsToReproduce: [...baseSteps, "Open the browser DevTools console.", `Observe: ${consoleErrors[0]}`],
+          evidence: {
+            total: summary.total,
+            byType: summary.byType,
+            byCategory: summary.byCategory,
+            bySeverity: summary.bySeverity,
+            topErrors: summary.topErrors.map((e) => ({
+              type: e.errorType,
+              severity: e.severity,
+              message: e.message,
+              category: e.category,
+              fix: e.suggestedFix,
+            })),
+            relatedErrorGroups: related.map((group) => ({
+              count: group.length,
+              type: group[0].errorType,
+              origin: group[0].originFunction,
+            })),
+          },
+          stepsToReproduce: [...baseSteps, "Open the browser DevTools console.", `Observe: ${summary.total} console error(s) found`, `Most severe: ${summary.topErrors[0]?.message || "N/A"}`],
         })
       );
     }

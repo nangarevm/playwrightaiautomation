@@ -674,6 +674,26 @@ ensureColumn("crawl_sites", "crawl_mode", "TEXT"); // incremental | full
 ensureColumn("execution_evidence", "failure_class", "TEXT");
 ensureColumn("execution_evidence", "failure_label", "TEXT");
 
+// Feature #7: Interaction Validation - stores validation results for user interactions
+// detected during test execution (clicks, form inputs, navigation, etc.)
+db.exec(`
+CREATE TABLE IF NOT EXISTS interaction_validations (
+  id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL,
+  test_file TEXT,
+  interaction_type TEXT NOT NULL,  -- click | input | submit | navigate | scroll | hover | focus | blur
+  element_selector TEXT,
+  element_text TEXT,
+  is_valid INTEGER NOT NULL,
+  violations_json TEXT NOT NULL DEFAULT '[]',  -- JSON array of violations
+  warnings_json TEXT NOT NULL DEFAULT '[]',    -- JSON array of warnings
+  suggestions_json TEXT NOT NULL DEFAULT '[]', -- JSON array of suggestions
+  duration_ms INTEGER,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY (run_id) REFERENCES execution_runs(id)
+);
+`);
+
 // Seed a default user per SRS user class (FR-8.1) so RBAC is usable out of the box
 const userCount = (db.prepare("SELECT COUNT(*) as count FROM users").get() as any).count as number;
 if (userCount === 0) {
