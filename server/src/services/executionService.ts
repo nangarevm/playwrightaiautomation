@@ -10,6 +10,7 @@ import { runBugScanForScreen, recordBugFinding } from "./bugDetectionService.js"
 import { decryptSecret } from "./secretsService.js";
 import { getEnvironment, preflightHealthCheck } from "./environmentsService.js";
 import { logAudit } from "./adminService.js";
+import { startRealtimeTracking, emitProgress, stopRealtimeTracking } from "./realtimeExecutionService.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SERVER_ROOT = path.join(__dirname, "..", "..");
@@ -776,6 +777,9 @@ export function runExecution(scriptId: string, targetUrl: string, input: any = {
       });
     }
 
+    // Start real-time tracking for this run
+    startRealtimeTracking(runId);
+
     // FR-4.4: log which CI tool triggered this run, so results are attributable per-tool
     // in the audit trail as well as on the run record. Honest caveat (also in the route
     // comment): this is generic-webhook-based CI attribution via a `source` field/header,
@@ -987,6 +991,9 @@ export function runExecution(scriptId: string, targetUrl: string, input: any = {
           gate_result: gateResult,
           browser_launch_count: browserLaunchCount,
         });
+
+        // Stop real-time tracking for this run
+        stopRealtimeTracking(runId);
 
         db.prepare("UPDATE automation_scripts SET last_run_status = ? WHERE id = ?").run(status, scriptId);
 

@@ -2,6 +2,7 @@ import { useRef, useState } from "react";
 import { useApp } from "../../context/AppState.js";
 import { api } from "../../api.js";
 import { Pill } from "../../components/Pill.js";
+import { UltrafastLiveModal } from "../../components/UltrafastLiveModal.js";
 import Crawler from "../Crawler.js";
 
 interface StepState {
@@ -47,6 +48,9 @@ export function UltrafastRunner() {
   const stopRequestedRef = useRef(false);
   const [stopRequested, setStopRequested] = useState(false);
   const [stoppedEarly, setStoppedEarly] = useState(false);
+  // Real-time execution modal
+  const [liveRunId, setLiveRunId] = useState<string | null>(null);
+  const [showLiveView, setShowLiveView] = useState(false);
 
   function setStep(key: StepState["key"], status: StepState["status"], detail?: string) {
     setSteps((prev) => prev.map((s) => (s.key === key ? { ...s, status, detail } : s)));
@@ -78,6 +82,13 @@ export function UltrafastRunner() {
         const tc = cases[i];
         setStep("execute", "active", `${i + 1}/${cases.length}`);
         const result = await api.triggerUltrafast({ testCaseId: tc.id });
+        
+        // Show live view for first run
+        if (result?.run?.id && i === 0) {
+          setLiveRunId(result.run.id);
+          setShowLiveView(true);
+        }
+        
         runResults.push({
           testCaseTitle: tc.title,
           status: result?.run?.status ?? null,
@@ -217,6 +228,13 @@ export function UltrafastRunner() {
           )}
         </>
       )}
+
+      {/* Real-time execution live view modal */}
+      <UltrafastLiveModal 
+        runId={liveRunId} 
+        isOpen={showLiveView} 
+        onClose={() => setShowLiveView(false)} 
+      />
     </div>
   );
 }
