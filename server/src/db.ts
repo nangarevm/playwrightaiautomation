@@ -694,6 +694,41 @@ CREATE TABLE IF NOT EXISTS interaction_validations (
 );
 `);
 
+// Feature #8: User-Defined Assertions - QA-Lead-managed custom validation rules
+db.exec(`
+CREATE TABLE IF NOT EXISTS assertion_rules (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  description TEXT,
+  type TEXT NOT NULL,  -- element_visible | element_contains_text | page_title_equals | etc.
+  target TEXT NOT NULL,  -- CSS selector or custom target
+  expected_value TEXT,  -- Expected value for assertion
+  custom_code TEXT,  -- For custom_javascript type
+  error_message TEXT,
+  severity TEXT NOT NULL DEFAULT 'high',  -- critical | high | medium | low
+  applicable_to TEXT NOT NULL DEFAULT 'All',  -- JSON array of test categories
+  is_active INTEGER NOT NULL DEFAULT 1,
+  created_by TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS assertion_results (
+  id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL,
+  rule_id TEXT NOT NULL,
+  test_name TEXT,
+  passed INTEGER NOT NULL,
+  message TEXT,
+  actual_value TEXT,
+  expected_value TEXT,
+  duration_ms INTEGER,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY (run_id) REFERENCES execution_runs(id),
+  FOREIGN KEY (rule_id) REFERENCES assertion_rules(id)
+);
+`);
+
 // Seed a default user per SRS user class (FR-8.1) so RBAC is usable out of the box
 const userCount = (db.prepare("SELECT COUNT(*) as count FROM users").get() as any).count as number;
 if (userCount === 0) {
