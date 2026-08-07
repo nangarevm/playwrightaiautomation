@@ -116,7 +116,9 @@ export async function runDiscoveryCrawl(options: CrawlOptions): Promise<{ pages:
   const normalizedUrl = normalizeUrl(options.url);
   const maxPages = Math.max(1, options.maxPages ?? 50);
   // Optimized for "crawl all pages": default to 5 concurrent pages instead of 3, max 8
-  const concurrency = Math.max(1, Math.min(options.concurrency ?? 5, 8));
+  let concurrency = Math.max(1, Math.min(options.concurrency ?? 5, 8));
+  let detectedPlatform = "custom";
+  let platformTimeouts = { pageLoadTimeout: 20000, networkIdleTimeout: 5000 };
 
   const browser: Browser = await chromium.launch({ headless: true });
   const context: BrowserContext = await browser.newContext({ viewport: { width: 1280, height: 800 } });
