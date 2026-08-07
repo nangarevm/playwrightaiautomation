@@ -20,6 +20,7 @@ import { getScreen } from "./screensService.js";
 import { fileGenericBug } from "./integrationsService.js";
 import type { SpellingIssue } from "../crawler/types.js";
 import { originOf, normalizeUrl } from "../crawler/urlUtils.js";
+import { analyzeVisualDifferences, detectImageLoadingIssues, detectTextRenderingIssues } from "./visualDetectionService.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const UPLOAD_DIR = path.join(__dirname, "..", "uploads");
