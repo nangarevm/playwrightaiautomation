@@ -3,6 +3,7 @@ import { api, CrawlSite, CrawlSiteDetail } from "../api.js";
 import { Pill } from "../components/Pill.js";
 import { AllureReportPanel } from "../components/AllureReportPanel.js";
 import { BugReportPanel } from "../components/BugReportPanel.js";
+import { CRAWL_PRESETS, type PresetId, getDefaultPreset } from "../config/crawlPresets.js";
 
 // AI Crawler end-to-end flow (project brief Phase 8): onboarding -> live crawl
 // progress -> curate-before-generate review -> one-click test generation + run ->
@@ -31,14 +32,19 @@ export default function Crawler() {
   const [multiUrls, setMultiUrls] = useState("");
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
-  const [maxPages, setMaxPages] = useState(10);
+  const [maxPages, setMaxPages] = useState(50);
   const [crawlAllPages, setCrawlAllPages] = useState(false);
   const [captureApi, setCaptureApi] = useState(false);
-  const [knownSite, setKnownSite] = useState<{ known: boolean; site: CrawlSite | null } | null>(null);
+  
+  // Smart presets
+  const [selectedPreset, setSelectedPreset] = useState<PresetId>("comprehensive");
+  const [useCustomPages, setUseCustomPages] = useState(false);
 
   const [site, setSite] = useState<CrawlSite | null>(null);
   const [detail, setDetail] = useState<CrawlSiteDetail | null>(null);
   const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [knownSite, setKnownSite] = useState<{ known: boolean; site: CrawlSite | null } | null>(null);
+  const [discoveredPages, setDiscoveredPages] = useState<{ url: string; title: string }[]>([]);
   // UI scenarios come from discovered form/element interactions; API scenarios
   // come from the same-origin XHR/fetch calls captured during the crawl
   // (--capture-api). Same underlying scenario list, same curate/generate/run/
@@ -108,7 +114,6 @@ export default function Crawler() {
 
   const [batchQueue, setBatchQueue] = useState<BatchItem[]>([]);
   const [batchRunning, setBatchRunning] = useState(false);
-  const [discoveredPages, setDiscoveredPages] = useState<{ url: string; title: string }[]>([]);
 
   // Download generated test cases straight from this tab -- reuses the same
   // multi-format bulk export the Library page uses, scoped to whichever test
@@ -132,6 +137,21 @@ export default function Crawler() {
       window.clearInterval(pollRef.current);
       pollRef.current = null;
     }
+  }
+
+  // Get effective crawler configuration from selected preset or custom settings
+  function getEffectiveConfig() {
+    if (useCustomPages) {
+      return {
+        maxPages: maxPages,
+        crawlAllPages: crawlAllPages,
+      };
+    }
+    const preset = CRAWL_PRESETS[selectedPreset];
+    return {
+      maxPages: preset.maxPages,
+      crawlAllPages: preset.maxPages === 999999,
+    };
   }
 
   async function startCrawl() {
@@ -218,6 +238,7 @@ export default function Crawler() {
     setError(null);
     setBatchRunning(true);
     setBatchQueue(urls.map((u) => ({ url: u, status: "queued" })));
+    const config = getEffectiveConfig();
 
     for (let i = 0; i < urls.length; i++) {
       setBatchQueue((prev) => prev.map((item, idx) => (idx === i ? { ...item, status: "running" } : item)));
@@ -226,7 +247,7 @@ export default function Crawler() {
           url: urls[i],
           username: username || undefined,
           password: password || undefined,
-          maxPages: crawlAllPages ? 999999 : (Number(maxPages) || 10),
+          maxPages: config.crawlAllPages ? 999999 : config.maxPages,
           captureApi,
         });
         const finalSite = await pollUntilDone(res.siteId, (s) =>
@@ -499,6 +520,75 @@ export default function Crawler() {
 
       {error && <div className="rounded-md border border-alert bg-alert/5 p-3 text-sm text-alert">{error}</div>}
 
+      {/* Step 0: Crawl Preset Selection */}
+      <div className="rounded-lg border border-line bg-white/60 shadow-panel p-4 space-y-4">
+        <h3 className="font-medium text-sm">Crawl Preset</h3>
+        
+        {/* Preset Selection Grid */}
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
+          {Object.values(CRAWL_PRESETS).map((preset) => (
+            <button
+              key={preset.id}
+              onClick={() => { setSelectedPreset(preset.id); setUseCustomPages(false); }}
+              className={`rounded-lg border-2 p-3 text-left transition ${
+                selectedPreset === preset.id && !useCustomPages
+                  ? "border-ink bg-ink/5"
+                  : "border-line hover:border-ink/50"
+              }`}
+            >
+              <div className="text-lg mb-1">{preset.icon}</div>
+              <div className="text-xs font-medium">{preset.label}</div>
+              <div className="text-[10px] text-ink/60 mt-1">
+                {preset.maxPages === 999999 ? "Unlimited" : preset.maxPages} pages
+              </div>
+              <div className="text-[10px] text-ink/50 mt-1">
+                {preset.estimatedTime}
+              </div>
+            </button>
+          ))}
+        </div>
+        
+        {/* Selected Preset Details */}
+        {!useCustomPages && (
+          <div className="rounded border border-line/70 bg-ink/[0.02] p-3 space-y-2">
+            <p className="text-sm font-medium">{CRAWL_PRESETS[selectedPreset].label}</p>
+            <p className="text-xs text-ink/70">{CRAWL_PRESETS[selectedPreset].description}</p>
+            <div className="flex gap-4 text-xs text-ink/60">
+              <span>⏱️ {CRAWL_PRESETS[selectedPreset].estimatedTime}</span>
+              <span>💰 {CRAWL_PRESETS[selectedPreset].estimatedCost}</span>
+            </div>
+          </div>
+        )}
+        
+        {/* Custom Option */}
+        <label className="flex items-center gap-2 text-xs">
+          <input
+            type="checkbox"
+            checked={useCustomPages}
+            onChange={(e) => setUseCustomPages(e.target.checked)}
+          />
+          <span className="font-medium">Use custom max pages:</span>
+          <input
+            type="number"
+            min={1}
+            disabled={!useCustomPages}
+            value={maxPages}
+            onChange={(e) => setMaxPages(Number(e.target.value))}
+            className="w-20 px-2 py-1 rounded border border-line disabled:opacity-50"
+          />
+        </label>
+        
+        <label className="flex items-center gap-2 text-xs">
+          <input
+            type="checkbox"
+            checked={crawlAllPages}
+            onChange={(e) => setCrawlAllPages(e.target.checked)}
+            disabled={useCustomPages}
+          />
+          <span>Crawl all pages (unlimited discovery)</span>
+        </label>
+      </div>
+
       {/* Step 1: Onboarding */}
       <div className="rounded-lg border border-line bg-white/60 shadow-panel p-4 space-y-3">
         <div className="flex items-center rounded-full border border-line bg-white/60 p-0.5 text-xs w-fit">
@@ -528,11 +618,7 @@ export default function Crawler() {
           </label>
         )}
 
-        <div className="grid gap-3 md:grid-cols-3">
-          <label className="text-xs text-ink/60 space-y-1">
-            <span>Max pages {urlMode === "multi" && "(per URL)"}</span>
-            <input type="number" min={1} disabled={crawlAllPages} className="w-full rounded-md border border-line px-2 py-1.5 text-sm disabled:opacity-50" value={maxPages} onChange={(e) => setMaxPages(Number(e.target.value))} />
-          </label>
+        <div className="grid gap-3 md:grid-cols-2">
           <label className="text-xs text-ink/60 space-y-1">
             <span>Username (optional)</span>
             <input className="w-full rounded-md border border-line px-2 py-1.5 text-sm" value={username} onChange={(e) => setUsername(e.target.value)} />
@@ -542,11 +628,6 @@ export default function Crawler() {
             <input type="password" className="w-full rounded-md border border-line px-2 py-1.5 text-sm" value={password} onChange={(e) => setPassword(e.target.value)} />
           </label>
         </div>
-        <label className="flex items-center gap-2 text-xs text-ink/70">
-          <input type="checkbox" checked={crawlAllPages} onChange={(e) => setCrawlAllPages(e.target.checked)} />
-          <span className="font-medium">Crawl all pages</span>
-          <span className="text-ink/50">(ignores max pages limit — discovers and crawls every reachable page)</span>
-        </label>
         <label className="flex items-center gap-1.5 text-xs text-ink/70">
           <input type="checkbox" checked={captureApi} onChange={(e) => setCaptureApi(e.target.checked)} />
           Capture API calls per interaction (--capture-api) — required for API scenarios below to appear
