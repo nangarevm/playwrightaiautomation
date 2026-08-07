@@ -108,6 +108,7 @@ export default function Crawler() {
 
   const [batchQueue, setBatchQueue] = useState<BatchItem[]>([]);
   const [batchRunning, setBatchRunning] = useState(false);
+  const [discoveredPages, setDiscoveredPages] = useState<{ url: string; title: string }[]>([]);
 
   // Download generated test cases straight from this tab -- reuses the same
   // multi-format bulk export the Library page uses, scoped to whichever test
@@ -138,6 +139,7 @@ export default function Crawler() {
     setGenResults(null);
     setDetail(null);
     setSelected(new Set());
+    setDiscoveredPages([]);
     try {
       const res = await api.crawlerRun({
         url: url.trim(),
@@ -153,6 +155,15 @@ export default function Crawler() {
         try {
           const updated = await api.crawlerGetSite(res.siteId);
           setSite(updated);
+          
+          // Fetch detailed page info to show discovered pages
+          if (updated.pages_discovered > discoveredPages.length) {
+            const d = await api.crawlerGetSiteDetail(res.siteId);
+            if (d && d.pages) {
+              setDiscoveredPages(d.pages.map((p) => ({ url: p.url, title: p.title || p.url })));
+            }
+          }
+          
           if (updated.status === "completed" || updated.status === "failed") {
             stopPolling();
             if (updated.status === "completed") {
@@ -164,7 +175,7 @@ export default function Crawler() {
           stopPolling();
           setError(e.message);
         }
-      }, 1500);
+      }, 500); // Faster polling for real-time updates
     } catch (e: any) {
       setError(e.message);
     }
@@ -596,17 +607,57 @@ export default function Crawler() {
 
       {/* Step 2: live progress */}
       {urlMode === "single" && site && (
-        <div className="rounded-lg border border-line bg-white/60 shadow-panel p-4 space-y-2">
+        <div className="rounded-lg border border-line bg-white/60 shadow-panel p-4 space-y-3">
           <div className="flex items-center justify-between">
             <p className="font-medium text-sm">Crawl status</p>
             <Pill tone={site.status === "completed" ? "good" : site.status === "failed" ? "bad" : "warn"}>{site.status}</Pill>
           </div>
-          <p className="text-xs text-ink/60">
-            Discovered {site.pages_discovered} page(s), {site.forms_discovered} form(s), {site.scenarios_discovered} scenario(s),{" "}
-            {site.spelling_issues_found} spelling issue(s)
-            {site.current_page ? ` — currently on ${site.current_page}` : ""}
-          </p>
+          
+          {/* Progress metrics */}
+          <div className="grid gap-2 md:grid-cols-4">
+            <div className="rounded border border-line/70 bg-ink/[0.02] p-2">
+              <p className="text-[11px] uppercase tracking-wide text-ink/50">Pages</p>
+              <p className="text-lg font-semibold text-ink">{site.pages_discovered}</p>
+            </div>
+            <div className="rounded border border-line/70 bg-ink/[0.02] p-2">
+              <p className="text-[11px] uppercase tracking-wide text-ink/50">Forms</p>
+              <p className="text-lg font-semibold text-ink">{site.forms_discovered}</p>
+            </div>
+            <div className="rounded border border-line/70 bg-ink/[0.02] p-2">
+              <p className="text-[11px] uppercase tracking-wide text-ink/50">Scenarios</p>
+              <p className="text-lg font-semibold text-ink">{site.scenarios_discovered}</p>
+            </div>
+            <div className="rounded border border-line/70 bg-ink/[0.02] p-2">
+              <p className="text-[11px] uppercase tracking-wide text-ink/50">Spelling issues</p>
+              <p className="text-lg font-semibold text-ink">{site.spelling_issues_found}</p>
+            </div>
+          </div>
+
+          {site.current_page && (
+            <div className="rounded border border-line/70 bg-signal/5 p-2">
+              <p className="text-xs text-ink/60">Currently crawling:</p>
+              <p className="text-sm font-medium text-signal truncate">{site.current_page}</p>
+            </div>
+          )}
+          
           {site.error && <p className="text-xs text-alert">{site.error}</p>}
+
+          {/* Discovered pages list */}
+          {discoveredPages.length > 0 && (
+            <div className="rounded border border-line/70 bg-white/50 p-3 space-y-2 max-h-64 overflow-y-auto">
+              <p className="text-xs font-medium text-ink/70">Discovered Pages ({discoveredPages.length})</p>
+              <ul className="space-y-1">
+                {discoveredPages.map((page, i) => (
+                  <li key={i} className="text-xs text-ink/60 flex items-start gap-2">
+                    <span className="text-ink/40 shrink-0">✓</span>
+                    <span className="truncate" title={page.url}>
+                      {page.title}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
         </div>
       )}
 
