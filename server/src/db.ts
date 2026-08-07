@@ -765,6 +765,25 @@ CREATE TABLE IF NOT EXISTS page_change_detections (
 );
 `);
 
+// Feature #11: Fast Mode - tracks execution with different speed modes
+db.exec(`
+CREATE TABLE IF NOT EXISTS fast_mode_executions (
+  id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL,
+  mode TEXT NOT NULL,  -- balanced | performance | thorough | custom
+  strategy TEXT NOT NULL,  -- all-tests | critical-path | smoke-only | custom-selection
+  parallel_workers INTEGER NOT NULL,
+  test_selection_percent REAL NOT NULL,
+  actual_tests INTEGER NOT NULL,
+  actual_duration_seconds INTEGER NOT NULL,
+  actual_cost REAL NOT NULL,
+  tests_passed INTEGER NOT NULL,
+  tests_failed INTEGER NOT NULL,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY (run_id) REFERENCES execution_runs(id)
+);
+`);
+
 // Seed a default user per SRS user class (FR-8.1) so RBAC is usable out of the box
 const userCount = (db.prepare("SELECT COUNT(*) as count FROM users").get() as any).count as number;
 if (userCount === 0) {
