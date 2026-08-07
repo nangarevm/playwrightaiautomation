@@ -664,6 +664,8 @@ db.prepare("UPDATE crawl_scenarios SET tier = 'smoke' WHERE tier IS NULL AND typ
 // stores new/changed/unchanged/removed counts from the latest run.
 ensureColumn("crawl_pages", "last_seen_at", "TEXT");
 ensureColumn("crawl_sites", "recrawl_summary_json", "TEXT");
+ensureColumn("crawl_sites", "last_full_crawl_date", "TEXT");
+ensureColumn("crawl_pages", "is_persisted_from_previous_crawl", "INTEGER NOT NULL DEFAULT 0");
 ensureColumn("crawl_sites", "crawl_mode", "TEXT"); // incremental | full
 // Heuristic classification of *why* a test failed -- 'automation_issue' (the
 // generated script's own locator/timeout, not the product), 'environment_issue'
@@ -743,6 +745,23 @@ CREATE TABLE IF NOT EXISTS execution_costs (
   timestamp INTEGER NOT NULL,
   created_at TEXT NOT NULL,
   FOREIGN KEY (run_id) REFERENCES execution_runs(id)
+);
+`);
+
+// Feature #10: Incremental Crawl - tracks page change detection
+db.exec(`
+CREATE TABLE IF NOT EXISTS page_change_detections (
+  id TEXT PRIMARY KEY,
+  site_id TEXT NOT NULL,
+  page_id TEXT NOT NULL,
+  url TEXT NOT NULL,
+  status TEXT NOT NULL,  -- unchanged | changed | new
+  old_dom_hash TEXT,
+  new_dom_hash TEXT,
+  changes_json TEXT NOT NULL DEFAULT '[]',
+  created_at TEXT NOT NULL,
+  FOREIGN KEY (site_id) REFERENCES crawl_sites(id),
+  FOREIGN KEY (page_id) REFERENCES crawl_pages(id)
 );
 `);
 
