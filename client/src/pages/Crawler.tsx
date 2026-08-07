@@ -32,6 +32,7 @@ export default function Crawler() {
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [maxPages, setMaxPages] = useState(10);
+  const [crawlAllPages, setCrawlAllPages] = useState(false);
   const [captureApi, setCaptureApi] = useState(false);
   const [knownSite, setKnownSite] = useState<{ known: boolean; site: CrawlSite | null } | null>(null);
 
@@ -142,7 +143,7 @@ export default function Crawler() {
         url: url.trim(),
         username: username || undefined,
         password: password || undefined,
-        maxPages: Number(maxPages) || 10,
+        maxPages: crawlAllPages ? 999999 : (Number(maxPages) || 10),
         captureApi,
       });
       const initial = await api.crawlerGetSite(res.siteId);
@@ -214,7 +215,7 @@ export default function Crawler() {
           url: urls[i],
           username: username || undefined,
           password: password || undefined,
-          maxPages: Number(maxPages) || 10,
+          maxPages: crawlAllPages ? 999999 : (Number(maxPages) || 10),
           captureApi,
         });
         const finalSite = await pollUntilDone(res.siteId, (s) =>
@@ -519,7 +520,7 @@ export default function Crawler() {
         <div className="grid gap-3 md:grid-cols-3">
           <label className="text-xs text-ink/60 space-y-1">
             <span>Max pages {urlMode === "multi" && "(per URL)"}</span>
-            <input type="number" min={1} className="w-full rounded-md border border-line px-2 py-1.5 text-sm" value={maxPages} onChange={(e) => setMaxPages(Number(e.target.value))} />
+            <input type="number" min={1} disabled={crawlAllPages} className="w-full rounded-md border border-line px-2 py-1.5 text-sm disabled:opacity-50" value={maxPages} onChange={(e) => setMaxPages(Number(e.target.value))} />
           </label>
           <label className="text-xs text-ink/60 space-y-1">
             <span>Username (optional)</span>
@@ -530,6 +531,11 @@ export default function Crawler() {
             <input type="password" className="w-full rounded-md border border-line px-2 py-1.5 text-sm" value={password} onChange={(e) => setPassword(e.target.value)} />
           </label>
         </div>
+        <label className="flex items-center gap-2 text-xs text-ink/70">
+          <input type="checkbox" checked={crawlAllPages} onChange={(e) => setCrawlAllPages(e.target.checked)} />
+          <span className="font-medium">Crawl all pages</span>
+          <span className="text-ink/50">(ignores max pages limit — discovers and crawls every reachable page)</span>
+        </label>
         <label className="flex items-center gap-1.5 text-xs text-ink/70">
           <input type="checkbox" checked={captureApi} onChange={(e) => setCaptureApi(e.target.checked)} />
           Capture API calls per interaction (--capture-api) — required for API scenarios below to appear
