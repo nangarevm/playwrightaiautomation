@@ -115,7 +115,10 @@ async function simplePool<T>(items: T[], size: number, worker: (item: T) => Prom
 export async function runDiscoveryCrawl(options: CrawlOptions): Promise<{ pages: DiscoveredPage[]; edges: NavEdge[]; authenticated: boolean; authMessage: string }> {
   const normalizedUrl = normalizeUrl(options.url);
   const maxPages = Math.max(1, options.maxPages ?? 50);
-  const concurrency = Math.max(1, Math.min(options.concurrency ?? 3, 6));
+  // Optimized for "crawl all pages": default to 5 concurrent pages instead of 3, max 8
+  let concurrency = Math.max(1, Math.min(options.concurrency ?? 5, 8));
+  let detectedPlatform = "custom";
+  let platformTimeouts = { pageLoadTimeout: 20000, networkIdleTimeout: 5000 };
 
   const browser: Browser = await chromium.launch({ headless: true });
   const context: BrowserContext = await browser.newContext({ viewport: { width: 1280, height: 800 } });
@@ -194,12 +197,13 @@ export async function runDiscoveryCrawl(options: CrawlOptions): Promise<{ pages:
         const page = await context.newPage();
         const capture = options.captureApi ? attachNetworkCapture(page) : null;
         try {
-          await page.goto(targetUrl, { waitUntil: "domcontentloaded", timeout: 25000 }).catch(async () => {
-            await page.goto(targetUrl, { waitUntil: "load", timeout: 25000 });
+          // Optimized timeouts: faster overall, with fallback to load
+          await page.goto(targetUrl, { waitUntil: "domcontentloaded", timeout: 20000 }).catch(async () => {
+            await page.goto(targetUrl, { waitUntil: "load", timeout: 20000 });
           });
-          // Give SPAs a moment to hydrate; networkidle is too strict on analytics-heavy sites.
-          await page.waitForLoadState("networkidle", { timeout: 8000 }).catch(() => undefined);
-          await page.waitForTimeout(600);
+          // Reduced wait for SPA hydration and network settling
+          await page.waitForLoadState("networkidle", { timeout: 5000 }).catch(() => undefined);
+          await page.waitForTimeout(400);
           await dismissConsentOverlays(page);
 
           const title = (await page.title().catch(() => "")) || new URL(targetUrl).pathname || targetUrl;

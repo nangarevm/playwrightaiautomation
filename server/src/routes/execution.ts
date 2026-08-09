@@ -24,6 +24,7 @@ import { getPoolStatus } from "../services/runnerPoolService.js";
 import { getEnvironment } from "../services/environmentsService.js";
 import { triggerUltrafastRun } from "../services/ultrafastService.js";
 import { SecurityScanFailedError } from "../services/codegenService.js";
+import { startRealtimeTracking, stopRealtimeTracking, getRunEmitter, getRunProgress } from "../services/realtimeExecutionService.js";
 import { errBody } from "../errorCodes.js";
 
 export const executionRouter = Router();
@@ -261,4 +262,49 @@ executionRouter.post("/scheduler/tick", requireRole("QA Lead"), async (_req, res
 // FR-4.8: manually trigger retention-based artifact cleanup (also runs automatically on an interval)
 executionRouter.post("/artifacts/cleanup", requireRole("QA Lead"), (_req, res) => {
   res.json(cleanupExpiredArtifacts());
+});
+
+// Real-time execution progress streaming (Server-Sent Events)
+// Sends live updates during test execution to update dashboard
+executionRouter.get("/:runId/stream", (req, res) => {
+  const runId = req.params.runId;
+
+  // Verify run exists
+  const run = db.prepare("SELECT id FROM execution_runs WHERE id = ?").get(runId) as any;
+  if (!run) {
+    return res.status(404).json(errBody(404, "Run not found"));
+  }
+
+  // Setup SSE headers
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+
+  // Start tracking this run
+  startRealtimeTracking(runId);
+
+  // Send initial progress
+  const initialProgress = getRunProgress(runId);
+  if (initialProgress) {
+    res.write(`data: ${JSON.stringify({ type: "progress", ...initialProgress })}\n\n`);
+  }
+
+  // Setup event listener
+  const emitter = getRunEmitter(runId);
+  if (emitter) {
+    const onProgress = (event: any) => {
+      res.write(`data: ${JSON.stringify(event)}\n\n`);
+    };
+
+    emitter.on("progress", onProgress);
+
+    // Cleanup on client disconnect
+    req.on("close", () => {
+      emitter.removeListener("progress", onProgress);
+      stopRealtimeTracking(runId);
+      res.end();
+    });
+  } else {
+    res.end();
+  }
 });

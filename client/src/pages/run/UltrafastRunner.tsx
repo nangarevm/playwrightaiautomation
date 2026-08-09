@@ -2,6 +2,8 @@ import { useRef, useState } from "react";
 import { useApp } from "../../context/AppState.js";
 import { api } from "../../api.js";
 import { Pill } from "../../components/Pill.js";
+import { UltrafastLiveModal } from "../../components/UltrafastLiveModal.js";
+import { ExecutionSummaryCard } from "../../components/ExecutionSummaryCard.js";
 import Crawler from "../Crawler.js";
 
 interface StepState {
@@ -34,6 +36,16 @@ export function UltrafastRunner() {
   const { draftInput, setDraftInput, businessRules, withBusy, busy, error, needsReviewLaterCases } = useApp();
   const [steps, setSteps] = useState<StepState[]>(BASE_STEPS);
   const [results, setResults] = useState<RunResult[] | null>(null);
+  // Summary metrics for execution summary card
+  const [executionSummary, setExecutionSummary] = useState<{
+    testsPassed: number;
+    testsFailed: number;
+    totalTests: number;
+    bugsFound: number;
+    costAccumulated: number;
+    bugsByCriticality?: { critical: number; high: number; medium: number; low: number };
+  } | null>(null);
+  const [lastRunId, setLastRunId] = useState<string | null>(null);
   // The AI Crawler lives here now, not in Library: crawling a site is an input
   // source for the automatic pipeline (discover pages -> curate -> generate ->
   // run, all inside Crawler's own "Generate + Run" action), the same role the
@@ -47,6 +59,9 @@ export function UltrafastRunner() {
   const stopRequestedRef = useRef(false);
   const [stopRequested, setStopRequested] = useState(false);
   const [stoppedEarly, setStoppedEarly] = useState(false);
+  // Real-time execution modal
+  const [liveRunId, setLiveRunId] = useState<string | null>(null);
+  const [showLiveView, setShowLiveView] = useState(false);
 
   function setStep(key: StepState["key"], status: StepState["status"], detail?: string) {
     setSteps((prev) => prev.map((s) => (s.key === key ? { ...s, status, detail } : s)));
@@ -73,11 +88,34 @@ export function UltrafastRunner() {
 
       setStep("execute", "active");
       const runResults: RunResult[] = [];
+      let testsPassed = 0;
+      let testsFailed = 0;
+      let bugsFound = 0;
+      let costAccumulated = 0;
+      let lastRunIdTracked = "";
+
       for (let i = 0; i < cases.length; i++) {
         if (stopRequestedRef.current) break;
         const tc = cases[i];
         setStep("execute", "active", `${i + 1}/${cases.length}`);
         const result = await api.triggerUltrafast({ testCaseId: tc.id });
+        
+        // Show live view for first run
+        if (result?.run?.id && i === 0) {
+          setLiveRunId(result.run.id);
+          setShowLiveView(true);
+          lastRunIdTracked = result.run.id;
+        }
+        
+        // Track metrics for summary
+        if (result?.run?.status === "passed") {
+          testsPassed++;
+        } else if (result?.run?.status === "failed") {
+          testsFailed++;
+        }
+        // Estimate cost: $0.50 per test on Ultrafast
+        costAccumulated += 0.5;
+        
         runResults.push({
           testCaseTitle: tc.title,
           status: result?.run?.status ?? null,
@@ -85,6 +123,7 @@ export function UltrafastRunner() {
           needsReview: !result?.run,
         });
       }
+      
       if (stopRequestedRef.current) {
         setStoppedEarly(true);
         setStep("execute", "error", `Stopped — ${runResults.length}/${cases.length} run`);
@@ -92,6 +131,17 @@ export function UltrafastRunner() {
         setStep("execute", "done", `${runResults.length}/${cases.length} run`);
         setStep("report", "done");
       }
+      
+      // Create execution summary
+      setExecutionSummary({
+        testsPassed,
+        testsFailed,
+        totalTests: cases.length,
+        bugsFound: bugsFound, // Will be fetched from API in feature #3
+        costAccumulated,
+        bugsByCriticality: { critical: 0, high: 0, medium: 0, low: 0 },
+      });
+      setLastRunId(lastRunIdTracked);
       setResults(runResults);
     });
   }
@@ -158,6 +208,14 @@ export function UltrafastRunner() {
             {stoppedEarly && <p className="text-sm text-alert">Stopped by request — remaining test cases were not run.</p>}
           </div>
 
+          {executionSummary && results && (
+            <ExecutionSummaryCard 
+              result={executionSummary} 
+              runId={lastRunId || ""}
+              testCaseTitle={results[0]?.testCaseTitle}
+            />
+          )}
+
           {(isRunning || results) && (
             <div className="rounded-lg border border-line bg-white/60 shadow-panel p-4">
               <p className="text-xs font-semibold uppercase tracking-wide text-ink/60 mb-3">Progress</p>
@@ -217,6 +275,13 @@ export function UltrafastRunner() {
           )}
         </>
       )}
+
+      {/* Real-time execution live view modal */}
+      <UltrafastLiveModal 
+        runId={liveRunId} 
+        isOpen={showLiveView} 
+        onClose={() => setShowLiveView(false)} 
+      />
     </div>
   );
 }
