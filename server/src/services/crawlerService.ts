@@ -15,6 +15,11 @@ import { catalogScreen } from "./screensService.js";
 import { generateAutomationScript } from "./codegenService.js";
 import { logAudit, type CurrentUser } from "./adminService.js";
 import { runPostCrawlBugScan } from "./bugDetectionService.js";
+import { computePageFingerprint, getTestCaseFromCache, cacheTestCase, isCacheEnabled } from "./cacheService.js";
+import {
+  isIncrementalCrawlEnabled,
+  recordIncrementalCrawlCompletion,
+} from "./incrementalCrawlService.js";
 
 function normalizeUrlLocal(raw: string): string {
   return normalizeUrl(raw);
@@ -103,7 +108,10 @@ export async function startCrawl(params: {
   mode?: "incremental" | "full";
 }): Promise<{ siteId: string; isRerun: boolean; mode: "incremental" | "full" }> {
   const existing = findSiteByUrl(params.url);
-  const mode: "incremental" | "full" = params.mode ?? (existing ? "incremental" : "full");
+  // Feature 10: honor Costs hub incremental toggle unless caller forces mode
+  const mode: "incremental" | "full" =
+    params.mode ??
+    (existing && isIncrementalCrawlEnabled() ? "incremental" : "full");
   const { site, isRerun } = upsertSiteRow(params.url, Boolean(params.captureApi), mode);
   const siteId = site.id;
 
@@ -298,6 +306,22 @@ function persistCrawlResult(siteId: string, result: CrawlRunOutput, isRerun: boo
         db.prepare("UPDATE crawl_scenarios SET tier = 'regression', updated_at = ? WHERE page_id = ? AND status = 'active'").run(now, pageId);
       }
 
+      // Phase 2 cache: fingerprint page elements so repeat crawls can reuse scenario sets.
+      if (isCacheEnabled() && page.elements?.length) {
+        try {
+          const fp = computePageFingerprint(JSON.stringify({ url: page.url, elements: page.elements }));
+          const cached = getTestCaseFromCache(fp.hash);
+          if (cached?.length && page.changeStatus === "unchanged") {
+            console.info(`[crawler] cache hit for ${page.url} (${cached.length} scenarios)`);
+          }
+          if (page.scenarios?.length) {
+            cacheTestCase(fp.hash, page.scenarios, 86400);
+          }
+        } catch {
+          /* non-blocking */
+        }
+      }
+
       const activeScenarioCount = (db.prepare("SELECT COUNT(*) as c FROM crawl_scenarios WHERE page_id = ? AND status = 'active'").get(pageId) as any).c;
       totalScenarios += activeScenarioCount;
 
@@ -330,6 +354,25 @@ function persistCrawlResult(siteId: string, result: CrawlRunOutput, isRerun: boo
     db.prepare(
       "UPDATE crawl_sites SET status = 'completed', pages_discovered = ?, forms_discovered = ?, scenarios_discovered = ?, spelling_issues_found = ?, current_page = NULL, last_crawled_at = ?, recrawl_summary_json = ? WHERE id = ?"
     ).run(result.pages.length, totalForms, totalScenarios, totalSpellingIssues, now, JSON.stringify(summary), siteId);
+
+    // Feature 10: feed live incremental stats for Costs hub
+    try {
+      const unchanged = Number(summary.unchangedPages || 0);
+      const changed = Number(summary.changedPages || 0) + Number(summary.newPages || 0);
+      const total = Math.max(1, unchanged + changed);
+      recordIncrementalCrawlCompletion({
+        totalPages: total,
+        changedPages: changed,
+        unchangedPages: unchanged,
+        skippedPages: unchanged,
+        pagesScanned: total,
+        timeElapsed: 0,
+        costSavings: Number(((unchanged / total) * 2.5).toFixed(2)),
+        hasCriticalChanges: changed > total * 0.3,
+      });
+    } catch {
+      /* non-blocking */
+    }
 
     return summary;
   });

@@ -257,6 +257,22 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ target_url: targetUrl, ...options }),
     }),
+  // Run many scripts in one Playwright process with --workers=N (much faster than queueing one-by-one)
+  runExecutionBatch: (
+    scriptIds: string[],
+    targetUrl?: string,
+    options?: { profile_id?: string; concurrency?: number; measureBaseline?: boolean }
+  ) =>
+    req("/execution-runs/batch-run", {
+      method: "POST",
+      body: JSON.stringify({
+        script_ids: scriptIds,
+        target_url: targetUrl,
+        concurrency: options?.concurrency ?? 5,
+        measureBaseline: options?.measureBaseline === true,
+        ...options,
+      }),
+    }),
   triggerScheduler: () => req("/execution-runs/scheduler/tick", { method: "POST" }),
   // FR-4.24/FR-4.25/FR-4.26/FR-4.27/FR-4.30: Ultrafast Mode -- given just a script or test
   // case reference, auto-resolves profile/environment, auto-accepts/queues review, and starts
@@ -476,7 +492,15 @@ export const api = {
   importProject: (payload: any) => req("/admin/project/import", { method: "POST", body: JSON.stringify(payload) }),
 
   // AI Crawler (Phases 1-8 of the crawler build brief)
-  crawlerRun: (payload: { url: string; username?: string; password?: string; maxPages?: number; captureApi?: boolean; concurrency?: number }) =>
+  crawlerRun: (payload: {
+    url: string;
+    username?: string;
+    password?: string;
+    maxPages?: number;
+    captureApi?: boolean;
+    concurrency?: number;
+    mode?: "incremental" | "full";
+  }) =>
     req("/crawler/run", { method: "POST", body: JSON.stringify(payload) }),
   crawlerKnownSite: (url: string) => req(`/crawler/known-site?url=${encodeURIComponent(url)}`),
   crawlerListSites: (): Promise<CrawlSite[]> => req("/crawler/sites"),
@@ -489,6 +513,38 @@ export const api = {
 
   // Bug Detection Engine: proactive UI-exploratory + API-fuzz findings, distinct
   // from FR-7.6's reactive regression auto-filing.
+  // Optimization + monitoring (Phases 1–4 + Costs hub)
+  getOptimizationStatus: () => req("/optimization/status"),
+  getOptimizationMetrics: () => req("/optimization/metrics"),
+  getOptimizationAllPhases: () => req("/optimization/all-phases"),
+  getOptimizationRecommendations: () => req("/optimization/recommendations"),
+  toggleOptimization: (enabled?: boolean) =>
+    req("/optimization/toggle", { method: "POST", body: JSON.stringify({ enabled }) }),
+  toggleOptimizationPhase: (phase: number, enabled: boolean) =>
+    req(`/optimization/toggle-phase/${phase}`, {
+      method: "POST",
+      body: JSON.stringify({ enabled }),
+    }),
+  getFeatureCosts: () => req("/optimization/features/costs"),
+  getFeatureIncremental: () => req("/optimization/features/incremental"),
+  toggleFeatureIncremental: (enabled: boolean) =>
+    req("/optimization/features/incremental/toggle", {
+      method: "POST",
+      body: JSON.stringify({ enabled }),
+    }),
+  getFeatureFastMode: () => req("/optimization/features/fast-mode"),
+  applyFeatureFastMode: (mode: "critical" | "balanced" | "full") =>
+    req("/optimization/features/fast-mode/apply", {
+      method: "POST",
+      body: JSON.stringify({ mode }),
+    }),
+  getFeaturePresets: () => req("/optimization/features/presets"),
+  startFeaturePreset: (preset: string) =>
+    req("/optimization/features/presets/start", {
+      method: "POST",
+      body: JSON.stringify({ preset }),
+    }),
+
   listBugFindings: (params?: { status?: string; severity?: string; screenId?: string }): Promise<BugFindingRow[]> =>
     req(`/bugs${params ? `?${new URLSearchParams(Object.fromEntries(Object.entries(params).filter(([, v]) => v))).toString()}` : ""}`),
   scanScreenForBugs: (screenId: string): Promise<{ findings: BugFindingRow[]; count: number }> =>

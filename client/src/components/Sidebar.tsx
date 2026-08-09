@@ -15,6 +15,7 @@ const NAV: NavItem[] = [
   { key: "home", icon: "🏠", label: "Home" },
   { key: "run", icon: "▶", label: "Run" },
   { key: "library", icon: "📚", label: "Library" },
+  { key: "costs", icon: "💼", label: "Costs & Optimization" },
   { key: "reports", icon: "📄", label: "Reports" },
   { key: "settings", icon: "⚙", label: "Settings" },
 ];

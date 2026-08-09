@@ -2,6 +2,7 @@ import { useState } from "react";
 import { useApp } from "../context/AppState.js";
 import { Pill } from "../components/Pill.js";
 import { AllureReportPanel } from "../components/AllureReportPanel.js";
+import { RealtimeExecutionDashboard } from "../components/RealtimeExecutionDashboard.js";
 import { api } from "../api.js";
 
 const DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
@@ -82,22 +83,46 @@ export default function Execution() {
 
   const scopedScripts = scope === "all" ? scripts : scripts.filter((s) => selectedScriptIds.has(s.id));
 
-  // Runs the scoped (all or selected) scripts directly -- no profile/environment
-  // required first. queueExecution() already falls back to profile defaults and a
-  // demo target URL server-side, and kicks the runner pool immediately, so this
-  // scales fine even for a large batch (queuing is fast; execution happens async
-  // in the background, visible in Recent runs / the Allure report below as it lands).
+  // Fast path: one Playwright process with many workers (8–16). Previous
+  // one-by-one queue + pool size 2 made 300+ tests take ~2.5 hours.
   async function runScopedTests() {
     if (scopedScripts.length === 0) {
       setError(scope === "selected" ? "Select at least one script to run." : "No automation scripts to run yet.");
       return;
     }
     await withBusy("pipeline", async () => {
-      for (const s of scopedScripts) {
-        await api.queueScript(s.id, undefined, {
-          ...(selectedProfileId ? { profile_id: selectedProfileId } : {}),
-          trigger_source: "run-now",
-        });
+      const concurrency =
+        activeProfile?.concurrency && activeProfile.concurrency > 1
+          ? Math.min(5, activeProfile.concurrency)
+          : 5;
+      try {
+        const result = await api.runExecutionBatch(
+          scopedScripts.map((s) => s.id),
+          undefined,
+          {
+            ...(selectedProfileId ? { profile_id: selectedProfileId } : {}),
+            concurrency,
+            measureBaseline: false,
+          }
+        );
+        setError(null);
+        // Surface a quick summary so the user sees workers/time immediately.
+        const mins = result?.concurrentDurationMs
+          ? (result.concurrentDurationMs / 60000).toFixed(1)
+          : "?";
+        console.info(
+          `[Run] ${result?.scriptCount ?? scopedScripts.length} tests | workers=${result?.concurrency ?? concurrency} | ${mins}m | passed=${result?.passed ?? "?"} failed=${result?.failed ?? "?"}`
+        );
+      } catch (err: any) {
+        // Fallback: queue individually if batch endpoint fails (still uses enlarged pool).
+        console.warn("Batch run failed, falling back to queue:", err?.message || err);
+        for (const s of scopedScripts) {
+          await api.queueScript(s.id, undefined, {
+            ...(selectedProfileId ? { profile_id: selectedProfileId } : {}),
+            trigger_source: "run-now",
+            concurrency,
+          });
+        }
       }
     });
   }
@@ -135,12 +160,26 @@ export default function Execution() {
     setShowScheduleEditor(false);
   }
 
+  const liveRunId =
+    runs.find((r) => r.status === "running")?.id ||
+    runs.find((r) => r.status === "queued")?.id ||
+    null;
+
   return (
     <div className="space-y-6">
       <div>
         <h2 className="font-display text-xl tracking-tight">Execution</h2>
         <p className="text-sm text-ink/60">Run profiles, queue, and pipeline controls</p>
       </div>
+
+      {liveRunId && (
+        <RealtimeExecutionDashboard
+          runId={liveRunId}
+          onComplete={() => {
+            /* AppState polling refreshes runs */
+          }}
+        />
+      )}
 
       {/* FR-4.24: speed-mode toggle, positioned ahead of the profile dropdown. Ultrafast skips
           the Execution Settings Panel entirely (FR-4.25); Fast keeps the existing checkpointed

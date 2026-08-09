@@ -13,6 +13,7 @@ import { collectComponentInventory } from "./componentInventory.js";
 import { attachNetworkCapture } from "./network.js";
 import { dedupeKey, fetchSitemapUrls, normalizeUrl, sameOrigin } from "./urlUtils.js";
 import { structureMatches } from "./diff.js";
+import { detectPageType, loadPageWithOptimizedStrategy } from "../services/timeoutOptimizationService.js";
 
 export { dedupeKey, normalizeUrl, sameOrigin } from "./urlUtils.js";
 
@@ -115,8 +116,8 @@ async function simplePool<T>(items: T[], size: number, worker: (item: T) => Prom
 export async function runDiscoveryCrawl(options: CrawlOptions): Promise<{ pages: DiscoveredPage[]; edges: NavEdge[]; authenticated: boolean; authMessage: string }> {
   const normalizedUrl = normalizeUrl(options.url);
   const maxPages = Math.max(1, options.maxPages ?? 50);
-  // Optimized for "crawl all pages": default to 5 concurrent pages instead of 3, max 8
-  let concurrency = Math.max(1, Math.min(options.concurrency ?? 5, 8));
+  // Phase 1 Optimization: Increase from 3-8 to 10-15 for faster discovery
+  let concurrency = Math.max(1, Math.min(options.concurrency ?? 10, 15));
   let detectedPlatform = "custom";
   let platformTimeouts = { pageLoadTimeout: 20000, networkIdleTimeout: 5000 };
 
@@ -197,13 +198,8 @@ export async function runDiscoveryCrawl(options: CrawlOptions): Promise<{ pages:
         const page = await context.newPage();
         const capture = options.captureApi ? attachNetworkCapture(page) : null;
         try {
-          // Optimized timeouts: faster overall, with fallback to load
-          await page.goto(targetUrl, { waitUntil: "domcontentloaded", timeout: 20000 }).catch(async () => {
-            await page.goto(targetUrl, { waitUntil: "load", timeout: 20000 });
-          });
-          // Reduced wait for SPA hydration and network settling
-          await page.waitForLoadState("networkidle", { timeout: 5000 }).catch(() => undefined);
-          await page.waitForTimeout(400);
+          // Phase 1 Optimization: Use smart page loading with optimized timeouts
+          await loadPageWithOptimizedStrategy(page, targetUrl);
           await dismissConsentOverlays(page);
 
           const title = (await page.title().catch(() => "")) || new URL(targetUrl).pathname || targetUrl;

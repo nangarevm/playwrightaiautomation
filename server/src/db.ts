@@ -610,6 +610,13 @@ ensureColumn("org_settings", "economy_tier_length_threshold", "INTEGER NOT NULL 
 // existing checkpointed behavior) rather than silently reinterpreted as Ultrafast.
 ensureColumn("execution_runs", "speed_mode", "TEXT NOT NULL DEFAULT 'fast'");
 ensureColumn("execution_profiles", "default_speed_mode", "TEXT NOT NULL DEFAULT 'fast'");
+// Speed fix: legacy profiles defaulted concurrency=1 which serialized large suites.
+// Normalize to 5 workers (current cap) — also clamp any temporary higher values.
+try {
+  db.prepare("UPDATE execution_profiles SET concurrency = 5 WHERE concurrency IS NULL OR concurrency <= 1 OR concurrency > 5").run();
+} catch {
+  /* best-effort */
+}
 // FR-4.26: QA-Lead-editable confidence threshold Ultrafast Mode uses to auto-accept
 // a generated test case, mirroring the self_heal_confidence_threshold pattern above.
 ensureColumn("org_settings", "ultrafast_confidence_threshold", "REAL NOT NULL DEFAULT 0.85");

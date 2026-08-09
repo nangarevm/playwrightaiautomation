@@ -10,6 +10,9 @@ import { withLlmGateway } from "./llmGatewayService.js";
 import { tagScriptToScreen } from "./screensService.js";
 import { getDefaultScriptLanguage } from "../llm/modelConfig.js";
 import type { ScriptLanguage } from "../llm/modelConfig.js";
+import { optimizePromptWithCompression, isPromptOptimizationEnabled } from "./promptOptimizationService.js";
+import { getPromptResponse, cachePromptResponse, isCacheEnabled } from "./cacheService.js";
+import { selectModel, isModelRoutingEnabled } from "./modelRoutingService.js";
 
 interface GeneratedArtifactRecord {
   language: string;
@@ -203,10 +206,108 @@ export async function generateAutomationScript(
   // generation already uses. Cache key includes language/framework so different
   // export targets never share the same cached script.
   const cacheKey = [sanitizedTestCase.title, ...sanitizedTestCase.steps, language, requestedFramework].join(" ");
+
+  // Phase 2: prompt cache → compress → model route (must run on hot path, not import-only).
+  let effectivePrompt = cacheKey;
+  if (isPromptOptimizationEnabled()) {
+    try {
+      const { optimized } = optimizePromptWithCompression(cacheKey);
+      if (optimized?.trim()) effectivePrompt = optimized;
+    } catch {
+      /* keep original prompt */
+    }
+  }
+  if (isModelRoutingEnabled()) {
+    try {
+      const complexity = Math.min(1, (sanitizedTestCase.steps.length || 1) / 20);
+      const pageType =
+        String(sanitizedTestCase.category || "").toLowerCase().includes("api")
+          ? "api"
+          : "interactive";
+      const decision = selectModel(pageType as any, complexity);
+      console.info(`[codegen] model route → ${decision.model} (${decision.reason})`);
+    } catch {
+      /* non-blocking */
+    }
+  }
+  if (isCacheEnabled()) {
+    const cachedCode = getPromptResponse(effectivePrompt);
+    if (cachedCode && cachedCode.length > 40) {
+      const fileName =
+        requestedFramework === "cypress"
+          ? `${tc.id}.cy.js`
+          : requestedFramework === "selenium"
+            ? `${tc.id}.selenium.js`
+            : language === "python"
+              ? `${tc.id}.py`
+              : language === "javascript"
+                ? `${tc.id}.spec.js`
+                : `${tc.id}.spec.ts`;
+      const artifacts = [{ language, framework: requestedFramework, code: cachedCode, fileName }];
+      // Fall through to security scan / persist using cached artifact.
+      const screen = tc.screen_id
+        ? (db.prepare("SELECT url_or_path FROM screens WHERE id = ?").get(tc.screen_id) as { url_or_path: string | null } | undefined)
+        : undefined;
+      const crawlUrlMatch = String(tc.source_rationale || "").match(/CRAWL_URL=(\S+)/);
+      const allowedHosts = collectAllowedHosts(
+        tc.source_rationale,
+        crawlUrlMatch?.[1],
+        screen?.url_or_path,
+        process.env.TARGET_URL
+      );
+      const fixturePath = tc.screen_id ? ensureScreenFixture(tc.screen_id) : null;
+      const scan = staticSecurityScan(cachedCode, { allowedHosts });
+      if (scan.status === "flagged") throw new SecurityScanFailedError(scan.notes);
+      const filePath = path.join(GENERATED_DIR, fileName);
+      const codeWithFixtureRef = fixturePath
+        ? `// FR-3.7: shares setup steps with other scripts on this screen via ${path.relative(GENERATED_DIR, fixturePath)}\n${cachedCode}`
+        : cachedCode;
+      fs.writeFileSync(filePath, codeWithFixtureRef, "utf-8");
+      try {
+        await commitGeneratedScriptToGit(fileName, tc.id, tc.title);
+      } catch (err: any) {
+        console.warn(`[codegen] git commit failed for ${fileName}: ${err.message}`);
+      }
+      const id = nanoid(10);
+      const now = new Date().toISOString();
+      db.prepare(`
+        INSERT INTO automation_scripts
+          (id, test_case_id, language, framework, code, file_path, security_scan_status, security_scan_notes, fixture_path, locator_strategy, created_at)
+        VALUES (@id, @test_case_id, @language, @framework, @code, @file_path, @security_scan_status, @security_scan_notes, @fixture_path, @locator_strategy, @created_at)
+      `).run({
+        id,
+        test_case_id: tc.id,
+        language,
+        framework: requestedFramework,
+        code: codeWithFixtureRef,
+        file_path: filePath,
+        security_scan_status: scan.status,
+        security_scan_notes: scan.notes,
+        locator_strategy: classifyLocatorStrategy(cachedCode),
+        fixture_path: fixturePath,
+        created_at: now,
+      });
+      tagScriptToScreen(id, tc.id);
+      return {
+        artifacts: [{
+          language,
+          framework: requestedFramework,
+          code: codeWithFixtureRef,
+          fileName,
+          filePath,
+          security_scan_status: scan.status,
+          security_scan_notes: scan.notes,
+          locator_strategy: classifyLocatorStrategy(cachedCode),
+        }],
+        fromCache: true,
+      };
+    }
+  }
+
   type Artifact = { language: string; framework: string; code: string; fileName: string };
   const artifacts = await withLlmGateway<Artifact[]>(
     "script_generation",
-    { inputId: tc.id, provider: llm.name, prompt: cacheKey, category: sanitizedTestCase.category },
+    { inputId: tc.id, provider: llm.name, prompt: effectivePrompt, category: sanitizedTestCase.category },
     async (_preparedPrompt, tier) => {
       const code = await llm.generatePlaywrightScript(sanitizedTestCase, {
         tier,
@@ -225,6 +326,13 @@ export async function generateAutomationScript(
                 ? `${tc.id}.spec.js`
                 : `${tc.id}.spec.ts`;
       const result: Artifact[] = [{ language, framework: requestedFramework, code, fileName }];
+      if (isCacheEnabled() && code) {
+        try {
+          cachePromptResponse(effectivePrompt, code);
+        } catch {
+          /* ignore cache write failures */
+        }
+      }
       return { result, outputText: code };
     }
   );

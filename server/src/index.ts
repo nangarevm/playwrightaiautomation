@@ -24,6 +24,8 @@ import { environmentsRouter } from "./routes/environments.js";
 import { crawlerRouter } from "./routes/crawler.js";
 import { allureRouter } from "./routes/allure.js";
 import { bugsRouter } from "./routes/bugs.js";
+import { optimizationRouter } from "./routes/optimization.js";
+import realtimeExecutionRouter from "./routes/realtimeExecution.js";
 import { attachUser, enforceReadOnlyRoles } from "./services/adminService.js";
 import { cleanupExpiredArtifacts, runScheduledProfiles } from "./services/executionService.js";
 import { runScheduledCrawlsAndDiffs } from "./services/changeSchedulerService.js";
@@ -209,6 +211,8 @@ app.use("/api/environments", environmentsRouter);
 app.use("/api/crawler", crawlerRouter);
 app.use("/api/allure", allureRouter);
 app.use("/api/bugs", bugsRouter);
+app.use("/api/optimization", optimizationRouter);
+app.use("/api/execution", realtimeExecutionRouter);
 // Embedded Allure report viewer (Phase 8 step 5): served statically so the
 // client can open it in an <iframe> instead of requiring download/unzip/open.
 app.use("/allure-report", express.static(path.join(__dirname, "..", "allure-report")));
