@@ -3,7 +3,18 @@
 // Part of Feature 1: Real-Time Execution Dashboard
 
 import { useEffect, useState } from "react";
-import { ExecutionProgress, BugUpdate } from "../api.js";
+
+interface ExecutionProgress {
+  runId: string;
+  status: "running" | "paused" | "completed" | "failed";
+  totalTests: number;
+  completedTests: number;
+  currentTestName?: string;
+  bugsFoundCount: number;
+  estimatedTimeRemaining?: number;
+  costSoFar?: number;
+  startedAt: number;
+}
 
 interface RealtimeBug {
   bugId: string;
