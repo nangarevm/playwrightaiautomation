@@ -651,3 +651,252 @@ export function generateAssertionCode(rule: AssertionRule, language: "typescript
       return `// Assertion: ${rule.name}`;
   }
 }
+
+/**
+ * FEATURE 8 ENHANCEMENT: Creates assertion rule from user intent
+ */
+export function createAssertionFromIntent(intent: string, qaLeadId: string): Partial<AssertionRule> {
+  const lowerIntent = intent.toLowerCase();
+  
+  // Try to match intent patterns
+  if (lowerIntent.includes("visible")) {
+    return {
+      type: "element_visible",
+      description: intent,
+      severity: "high",
+      created_by: qaLeadId,
+    };
+  }
+  
+  if (lowerIntent.includes("text") || lowerIntent.includes("contains")) {
+    return {
+      type: "element_contains_text",
+      description: intent,
+      severity: "high",
+      created_by: qaLeadId,
+    };
+  }
+  
+  if (lowerIntent.includes("title")) {
+    return {
+      type: "page_title_equals",
+      description: intent,
+      severity: "medium",
+      created_by: qaLeadId,
+    };
+  }
+  
+  if (lowerIntent.includes("url")) {
+    return {
+      type: "page_url_contains",
+      description: intent,
+      severity: "medium",
+      created_by: qaLeadId,
+    };
+  }
+  
+  if (lowerIntent.includes("enabled") || lowerIntent.includes("clickable")) {
+    return {
+      type: "element_enabled",
+      description: intent,
+      severity: "high",
+      created_by: qaLeadId,
+    };
+  }
+  
+  if (lowerIntent.includes("checked") || lowerIntent.includes("selected")) {
+    return {
+      type: "element_checked",
+      description: intent,
+      severity: "medium",
+      created_by: qaLeadId,
+    };
+  }
+  
+  return {
+    type: "custom_javascript",
+    description: intent,
+    severity: "medium",
+    created_by: qaLeadId,
+  };
+}
+
+/**
+ * FEATURE 8 ENHANCEMENT: Validates assertion rule syntax
+ */
+export function validateAssertionRule(rule: Partial<AssertionRule>): {
+  valid: boolean;
+  errors: string[];
+  warnings: string[];
+} {
+  const errors: string[] = [];
+  const warnings: string[] = [];
+
+  if (!rule.name || rule.name.trim() === "") {
+    errors.push("Rule name is required");
+  }
+
+  if (!rule.type) {
+    errors.push("Rule type is required");
+  }
+
+  if (!rule.severity) {
+    errors.push("Severity level is required");
+  }
+
+  // Type-specific validation
+  switch (rule.type) {
+    case "element_visible":
+    case "element_enabled":
+    case "element_checked":
+    case "dom_element_count":
+    case "element_contains_text":
+      if (!rule.target || rule.target.trim() === "") {
+        errors.push("Target selector is required for this rule type");
+      }
+      break;
+
+    case "element_attribute_equals":
+      if (!rule.target || !rule.target.includes("::")) {
+        errors.push("Target must include attribute name (format: selector::attributeName)");
+      }
+      break;
+
+    case "custom_javascript":
+      if (!rule.customCode || rule.customCode.trim() === "") {
+        warnings.push("No custom code provided - rule will always pass");
+      }
+      break;
+
+    case "api_response_status":
+    case "api_response_contains":
+      if (!rule.expectedValue) {
+        errors.push("Expected value is required for this rule type");
+      }
+      break;
+  }
+
+  if (rule.applicable_to && rule.applicable_to.length === 0) {
+    warnings.push("Rule is not applicable to any test categories");
+  }
+
+  return {
+    valid: errors.length === 0,
+    errors,
+    warnings,
+  };
+}
+
+/**
+ * FEATURE 8 ENHANCEMENT: Generates assertion report
+ */
+export function generateAssertionReport(results: AssertionResult[], rules: AssertionRule[]): {
+  summary: string;
+  passed: AssertionResult[];
+  failed: AssertionResult[];
+  critical_failures: AssertionResult[];
+  recommendations: string[];
+} {
+  const passed = results.filter((r) => r.passed);
+  const failed = results.filter((r) => !r.passed);
+  
+  const critical_failures = failed.filter((r) => {
+    const rule = rules.find((ru) => ru.id === r.ruleId);
+    return rule?.severity === "critical";
+  });
+
+  const recommendations: string[] = [];
+
+  if (critical_failures.length > 0) {
+    recommendations.push(
+      `⚠️ ${critical_failures.length} critical assertion(s) failed - blocking issues detected`
+    );
+  }
+
+  if (failed.length > results.length / 2) {
+    recommendations.push(`🔍 More than 50% of assertions failed - review test setup`);
+  }
+
+  if (failed.length === 0 && passed.length > 0) {
+    recommendations.push(`✅ All assertions passed - quality gates met`);
+  }
+
+  const summary =
+    `${passed.length}/${results.length} assertions passed` +
+    (critical_failures.length > 0
+      ? ` (${critical_failures.length} critical failures)`
+      : "");
+
+  return {
+    summary,
+    passed,
+    failed,
+    critical_failures,
+    recommendations,
+  };
+}
+
+/**
+ * FEATURE 8 ENHANCEMENT: Tracks assertion trends over time
+ */
+export function trackAssertionTrends(
+  historical: { date: string; results: AssertionResult[] }[]
+): {
+  trending_up: string[];
+  trending_down: string[];
+  stable: string[];
+  analysis: string;
+} {
+  const ruleStats: Record<string, { passed: number; total: number }[]> = {};
+
+  // Collect stats by rule
+  for (const entry of historical) {
+    for (const result of entry.results) {
+      if (!ruleStats[result.ruleId]) {
+        ruleStats[result.ruleId] = [];
+      }
+      const existing = ruleStats[result.ruleId].find(
+        (s) => s === ruleStats[result.ruleId][ruleStats[result.ruleId].length - 1]
+      );
+      if (existing) {
+        if (result.passed) existing.passed++;
+        existing.total++;
+      } else {
+        ruleStats[result.ruleId].push({
+          passed: result.passed ? 1 : 0,
+          total: 1,
+        });
+      }
+    }
+  }
+
+  const trending_up: string[] = [];
+  const trending_down: string[] = [];
+  const stable: string[] = [];
+
+  // Analyze trends
+  for (const ruleId in ruleStats) {
+    const stats = ruleStats[ruleId];
+    if (stats.length < 2) {
+      stable.push(ruleId);
+      continue;
+    }
+
+    const rate1 = stats[0].passed / stats[0].total;
+    const rate2 = stats[stats.length - 1].passed / stats[stats.length - 1].total;
+    const change = rate2 - rate1;
+
+    if (change > 0.1) trending_up.push(ruleId);
+    else if (change < -0.1) trending_down.push(ruleId);
+    else stable.push(ruleId);
+  }
+
+  const analysis =
+    trending_down.length > 0
+      ? `🔴 Quality declining: ${trending_down.length} assertions getting worse`
+      : trending_up.length > 0
+        ? `🟢 Quality improving: ${trending_up.length} assertions getting better`
+        : `🟡 Quality stable: No significant changes`;
+
+  return { trending_up, trending_down, stable, analysis };
+}
