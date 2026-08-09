@@ -23,9 +23,12 @@ interface BugDetailPanelProps {
   bug: BugDetail | null;
   onClose: () => void;
   onRerun?: () => void;
+  totalBugs?: number;
+  currentBugIndex?: number;
+  onNavigate?: (direction: "prev" | "next") => void;
 }
 
-export function BugDetailPanel({ bug, onClose, onRerun }: BugDetailPanelProps) {
+export function BugDetailPanel({ bug, onClose, onRerun, totalBugs, currentBugIndex, onNavigate }: BugDetailPanelProps) {
   const [activeTab, setActiveTab] = useState<"overview" | "errors" | "trace" | "fix">("overview");
 
   if (!bug) return null;
@@ -65,22 +68,57 @@ export function BugDetailPanel({ bug, onClose, onRerun }: BugDetailPanelProps) {
       <div className="bg-white rounded-lg shadow-xl max-w-2xl w-full max-h-[90vh] overflow-hidden flex flex-col">
         {/* Header */}
         <div className={`p-6 border-b border-line ${getSeverityColor(bug.severity)}`}>
-          <div className="flex items-start justify-between gap-4">
+          <div className="flex items-start justify-between gap-4 mb-4">
             <div className="flex items-start gap-3 flex-1 min-w-0">
               <div className={`w-4 h-4 rounded-full mt-1 flex-shrink-0 ${getSeverityDot(bug.severity)}`} />
               <div className="flex-1 min-w-0">
-                <h2 className="text-lg font-bold break-words">{bug.title}</h2>
-                <p className="text-sm opacity-75 mt-1">{bug.category}</p>
+                <div className="flex items-center gap-2 mb-1">
+                  <h2 className="text-lg font-bold break-words">{bug.title}</h2>
+                  {totalBugs && (
+                    <span className="text-xs opacity-70 bg-white/40 px-2 py-1 rounded-full whitespace-nowrap">
+                      Bug {(currentBugIndex ?? 0) + 1} of {totalBugs}
+                    </span>
+                  )}
+                </div>
+                <p className="text-sm opacity-75">{bug.category}</p>
+                {bug.testStep && (
+                  <p className="text-xs opacity-60 mt-1">
+                    ⚙️ Failed at step {bug.testStep}
+                    {bug.testName && ` in "${bug.testName}"`}
+                  </p>
+                )}
               </div>
             </div>
-            <button onClick={onClose} className="text-2xl text-gray-400 hover:text-gray-600 flex-shrink-0">
-              ✕
-            </button>
+            <div className="flex items-center gap-2 flex-shrink-0">
+              {onNavigate && currentBugIndex !== undefined && totalBugs && totalBugs > 1 && (
+                <>
+                  <button
+                    onClick={() => onNavigate("prev")}
+                    disabled={currentBugIndex === 0}
+                    className="px-3 py-1.5 bg-white/30 hover:bg-white/50 disabled:opacity-40 rounded text-sm font-medium transition"
+                  >
+                    ← Prev
+                  </button>
+                  <button
+                    onClick={() => onNavigate("next")}
+                    disabled={currentBugIndex === (totalBugs ?? 0) - 1}
+                    className="px-3 py-1.5 bg-white/30 hover:bg-white/50 disabled:opacity-40 rounded text-sm font-medium transition"
+                  >
+                    Next →
+                  </button>
+                </>
+              )}
+              <button onClick={onClose} className="text-2xl text-gray-400 hover:text-gray-600">
+                ✕
+              </button>
+            </div>
           </div>
-          <div className="mt-4 flex items-center gap-4 flex-wrap">
-            <span className="text-sm font-bold uppercase">{bug.severity}</span>
-            {bug.testName && <span className="text-xs bg-white/50 px-2 py-1 rounded">Test: {bug.testName}</span>}
-            {bug.screenName && <span className="text-xs bg-white/50 px-2 py-1 rounded">Screen: {bug.screenName}</span>}
+          
+          <div className="flex items-center gap-4 flex-wrap">
+            <span className="text-sm font-bold uppercase px-3 py-1 bg-white/30 rounded">{bug.severity}</span>
+            {bug.testName && <span className="text-xs bg-white/40 px-3 py-1.5 rounded">🧪 Test: {bug.testName}</span>}
+            {bug.screenName && <span className="text-xs bg-white/40 px-3 py-1.5 rounded">🖼️ Screen: {bug.screenName}</span>}
+            {bug.discoveredAt && <span className="text-xs bg-white/40 px-3 py-1.5 rounded">⏰ {new Date(bug.discoveredAt).toLocaleString()}</span>}
           </div>
         </div>
 
@@ -138,27 +176,49 @@ export function BugDetailPanel({ bug, onClose, onRerun }: BugDetailPanelProps) {
         <div className="flex-1 overflow-y-auto p-6 space-y-6">
           {activeTab === "overview" && (
             <div className="space-y-6">
+              {/* Quick Info Cards */}
+              <div className="grid grid-cols-3 gap-3">
+                {bug.testName && (
+                  <div className="bg-blue-50 border border-blue-200 rounded-lg p-3">
+                    <p className="text-xs text-blue-700 font-semibold">Test Name</p>
+                    <p className="text-sm font-mono text-blue-900 mt-1 truncate">{bug.testName}</p>
+                  </div>
+                )}
+                {bug.testStep && (
+                  <div className="bg-orange-50 border border-orange-200 rounded-lg p-3">
+                    <p className="text-xs text-orange-700 font-semibold">Failed Step</p>
+                    <p className="text-2xl font-bold text-orange-900">{bug.testStep}</p>
+                  </div>
+                )}
+                {bug.discoveredAt && (
+                  <div className="bg-green-50 border border-green-200 rounded-lg p-3">
+                    <p className="text-xs text-green-700 font-semibold">Found At</p>
+                    <p className="text-xs text-green-900 mt-1">{new Date(bug.discoveredAt).toLocaleString()}</p>
+                  </div>
+                )}
+              </div>
+
               {bug.description && (
                 <div>
-                  <h3 className="text-sm font-semibold text-ink/60 uppercase tracking-wide mb-2">Description</h3>
-                  <p className="text-sm text-ink/80 leading-relaxed whitespace-pre-wrap">{bug.description}</p>
+                  <h3 className="text-sm font-semibold text-ink/60 uppercase tracking-wide mb-2">📝 Description</h3>
+                  <p className="text-sm text-ink/80 leading-relaxed whitespace-pre-wrap bg-white/60 p-3 rounded border border-line/50">{bug.description}</p>
                 </div>
               )}
 
               {bug.affectedFeature && (
                 <div>
-                  <h3 className="text-sm font-semibold text-ink/60 uppercase tracking-wide mb-2">Affected Feature</h3>
+                  <h3 className="text-sm font-semibold text-ink/60 uppercase tracking-wide mb-2">🎯 Affected Feature</h3>
                   <p className="text-sm bg-blue-50 border border-blue-200 rounded p-3">{bug.affectedFeature}</p>
                 </div>
               )}
 
               {bug.stepsToReproduce && bug.stepsToReproduce.length > 0 && (
                 <div>
-                  <h3 className="text-sm font-semibold text-ink/60 uppercase tracking-wide mb-3">Steps to Reproduce</h3>
+                  <h3 className="text-sm font-semibold text-ink/60 uppercase tracking-wide mb-3">🔄 Steps to Reproduce</h3>
                   <ol className="space-y-2">
                     {bug.stepsToReproduce.map((step, idx) => (
-                      <li key={idx} className="flex gap-3 text-sm">
-                        <span className="font-bold text-ink/40 flex-shrink-0">{idx + 1}.</span>
+                      <li key={idx} className="flex gap-3 text-sm p-2 bg-white/60 rounded border border-line/30">
+                        <span className="font-bold text-ink/40 flex-shrink-0 min-w-fit">Step {idx + 1}:</span>
                         <span className="text-ink/80">{step}</span>
                       </li>
                     ))}
@@ -168,8 +228,8 @@ export function BugDetailPanel({ bug, onClose, onRerun }: BugDetailPanelProps) {
 
               {bug.screenshot && (
                 <div>
-                  <h3 className="text-sm font-semibold text-ink/60 uppercase tracking-wide mb-2">Screenshot</h3>
-                  <div className="bg-gray-100 rounded-lg overflow-hidden border border-line">
+                  <h3 className="text-sm font-semibold text-ink/60 uppercase tracking-wide mb-2">📸 Screenshot</h3>
+                  <div className="bg-gray-100 rounded-lg overflow-hidden border border-line max-h-96 flex items-center justify-center">
                     <img src={bug.screenshot} alt="Bug screenshot" className="max-w-full h-auto" />
                   </div>
                 </div>
