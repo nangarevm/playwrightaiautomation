@@ -425,3 +425,192 @@ export function generateInteractionReport(validations: InteractionValidation[]):
 
   return report;
 }
+
+/**
+ * FEATURE 7 ENHANCEMENT: Detects interaction timing anomalies
+ */
+export function detectTimingAnomalies(interactions: InteractionEvent[]): {
+  sudden: InteractionEvent[];
+  excessive: InteractionEvent[];
+  inconsistent: InteractionEvent[];
+  analysis: string;
+} {
+  const sudden: InteractionEvent[] = [];
+  const excessive: InteractionEvent[] = [];
+  const inconsistent: InteractionEvent[] = [];
+
+  // Calculate average duration by type
+  const avgByType: Record<string, number> = {};
+  const countByType: Record<string, number> = {};
+
+  for (const interaction of interactions) {
+    if (interaction.duration) {
+      avgByType[interaction.type] = (avgByType[interaction.type] || 0) + interaction.duration;
+      countByType[interaction.type] = (countByType[interaction.type] || 0) + 1;
+    }
+  }
+
+  for (const type in avgByType) {
+    avgByType[type] = avgByType[type] / (countByType[type] || 1);
+  }
+
+  // Detect anomalies
+  for (const interaction of interactions) {
+    if (interaction.duration) {
+      const avgForType = avgByType[interaction.type] || 0;
+
+      // Sudden spike
+      if (interaction.duration > avgForType * 3) {
+        sudden.push(interaction);
+      }
+
+      // Excessive duration
+      if (interaction.duration > 10000) {
+        excessive.push(interaction);
+      }
+
+      // Inconsistent (far from average)
+      if (Math.abs(interaction.duration - avgForType) > avgForType * 2) {
+        inconsistent.push(interaction);
+      }
+    }
+  }
+
+  const analysis =
+    sudden.length > 0
+      ? `${sudden.length} sudden spikes detected - possible network or performance issues`
+      : excessive.length > 0
+        ? `${excessive.length} interactions exceeded 10s - very slow`
+        : inconsistent.length > 0
+          ? `${inconsistent.length} inconsistent timings - variability in performance`
+          : `Timing is consistent and normal`;
+
+  return { sudden, excessive, inconsistent, analysis };
+}
+
+/**
+ * FEATURE 7 ENHANCEMENT: Compares interaction behavior across runs
+ */
+export function compareInteractionBehavior(
+  baseline: InteractionEvent[],
+  current: InteractionEvent[]
+): {
+  same: number;
+  changed: InteractionEvent[];
+  failed_now: InteractionEvent[];
+  improved: InteractionEvent[];
+  regression: string;
+} {
+  const changed: InteractionEvent[] = [];
+  const failed_now: InteractionEvent[] = [];
+  const improved: InteractionEvent[] = [];
+  let sameCount = 0;
+
+  // Create map of baseline interactions
+  const baselineMap = new Map(
+    baseline.map((i) => [`${i.type}:${i.elementSelector}`, i])
+  );
+
+  for (const curr of current) {
+    const key = `${curr.type}:${curr.elementSelector}`;
+    const base = baselineMap.get(key);
+
+    if (!base) {
+      continue;
+    }
+
+    if (JSON.stringify(base) === JSON.stringify(curr)) {
+      sameCount++;
+    } else {
+      changed.push(curr);
+
+      // Check if this failed now but didn't before
+      if (curr.errorMessage && !base.errorMessage) {
+        failed_now.push(curr);
+      }
+
+      // Check if this improved
+      if (!curr.errorMessage && base.errorMessage) {
+        improved.push(curr);
+      }
+
+      // Check timing improvement
+      if (
+        curr.duration &&
+        base.duration &&
+        curr.duration < base.duration * 0.8
+      ) {
+        improved.push(curr);
+      }
+    }
+  }
+
+  const regression =
+    failed_now.length > 0
+      ? `⚠️ ${failed_now.length} new failures detected`
+      : improved.length > 0
+        ? `✅ ${improved.length} interactions improved`
+        : `No significant changes`;
+
+  return { same: sameCount, changed, failed_now, improved, regression };
+}
+
+/**
+ * FEATURE 7 ENHANCEMENT: Generates actionable interaction insights
+ */
+export function generateInteractionInsights(
+  interactions: InteractionEvent[],
+  patterns: ReturnType<typeof detectInteractionPatterns>
+): {
+  criticalIssues: string[];
+  recommendations: string[];
+  priority: "critical" | "high" | "medium" | "low";
+} {
+  const criticalIssues: string[] = [];
+  const recommendations: string[] = [];
+
+  // Analyze repeated failures
+  if (patterns.repeatedFailures.length > 0) {
+    const topFailure = patterns.repeatedFailures[0];
+    criticalIssues.push(
+      `${topFailure.type} on ${topFailure.selector || "unknown"} failed ${topFailure.count} times`
+    );
+    recommendations.push(
+      `Investigate and fix ${topFailure.type} interaction for "${topFailure.selector}"`
+    );
+  }
+
+  // Analyze performance
+  if (patterns.performanceBottlenecks.length > 3) {
+    criticalIssues.push(`${patterns.performanceBottlenecks.length} interactions exceed normal timing`);
+    recommendations.push(
+      "Profile application for performance bottlenecks (server, network, rendering)"
+    );
+  }
+
+  // Analyze accessibility
+  if (patterns.accessibilityIssues.length > 0) {
+    criticalIssues.push(
+      `${patterns.accessibilityIssues.length} input field(s) lack proper labels`
+    );
+    recommendations.push("Add aria-labels or associated labels to form inputs");
+  }
+
+  // Analyze unexpected behaviors
+  if (patterns.unexpectedBehaviors.length > 0) {
+    criticalIssues.push(
+      `${patterns.unexpectedBehaviors.length} interactions showed unexpected behavior`
+    );
+    recommendations.push(
+      "Review click handlers and form validation logic"
+    );
+  }
+
+  // Determine priority
+  let priority: "critical" | "high" | "medium" | "low" = "low";
+  if (criticalIssues.length > 3) priority = "critical";
+  else if (criticalIssues.length > 1) priority = "high";
+  else if (criticalIssues.length > 0) priority = "medium";
+
+  return { criticalIssues, recommendations, priority };
+}
