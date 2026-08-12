@@ -22,6 +22,7 @@ import { adminRouter } from "./routes/admin.js";
 import { screensRouter } from "./routes/screens.js";
 import { environmentsRouter } from "./routes/environments.js";
 import { crawlerRouter } from "./routes/crawler.js";
+import { tickWatchedSites } from "./services/crawlerService.js";
 import { allureRouter } from "./routes/allure.js";
 import { bugsRouter } from "./routes/bugs.js";
 import { optimizationRouter } from "./routes/optimization.js";
@@ -269,6 +270,11 @@ setInterval(() => {
 setInterval(() => {
   runScheduledCrawlsAndDiffs().catch((err) => console.warn("[change-detection] scheduled tick failed:", err.message));
 }, 30 * 60_000);
+
+// Watched crawl sites (nightly incremental when due)
+setInterval(() => {
+  tickWatchedSites().catch((err) => console.warn("[crawler-watch] tick failed:", err.message));
+}, 60 * 60_000);
 
 // FR-6.9: check every hour whether a daily digest is due (self-throttles to the
 // configured cadence internally, so an hourly tick is a safe polling interval)

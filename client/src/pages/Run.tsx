@@ -19,13 +19,13 @@ export default function Run() {
   const [step, setStep] = useState<Step>("input");
 
   return (
-    <div className="space-y-6">
-      <div className="flex flex-wrap items-start justify-between gap-4">
+    <div className="space-y-4">
+      <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
-          <h2 className="font-display text-xl tracking-tight">Run</h2>
-          <p className="text-sm text-ink/60">From a requirement to a finished test report</p>
+          <h2 className="font-display text-lg tracking-tight">Run</h2>
+          <p className="text-xs text-ink/60">Input → Generate → Execute → Report</p>
         </div>
-        <div className="flex flex-col items-end gap-1">
+        <div className="flex flex-col items-end gap-0.5">
           <div className="flex items-center rounded-full border border-line bg-white/60 p-0.5 text-xs">
             <button
               className={`rounded-full px-3.5 py-1.5 font-medium ${speedMode === "ultrafast" ? "bg-ink text-paper" : "text-ink/60"}`}
@@ -51,7 +51,7 @@ export default function Run() {
       {speedMode === "ultrafast" ? (
         <UltrafastRunner />
       ) : (
-        <div className="space-y-5">
+        <div className="space-y-3">
           <TabBar<Step>
             tabs={[
               { key: "input", label: "1. Input" },

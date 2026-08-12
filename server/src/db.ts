@@ -674,6 +674,14 @@ ensureColumn("crawl_sites", "recrawl_summary_json", "TEXT");
 ensureColumn("crawl_sites", "last_full_crawl_date", "TEXT");
 ensureColumn("crawl_pages", "is_persisted_from_previous_crawl", "INTEGER NOT NULL DEFAULT 0");
 ensureColumn("crawl_sites", "crawl_mode", "TEXT"); // incremental | full
+ensureColumn("crawl_pages", "etag", "TEXT");
+ensureColumn("crawl_pages", "last_modified", "TEXT");
+ensureColumn("crawl_pages", "a11y_hash", "TEXT");
+ensureColumn("crawl_pages", "change_signals_json", "TEXT NOT NULL DEFAULT '{}'");
+ensureColumn("crawl_sites", "schedule_cron", "TEXT");
+ensureColumn("crawl_sites", "watch_enabled", "INTEGER NOT NULL DEFAULT 0");
+ensureColumn("crawl_sites", "ci_webhook_secret", "TEXT");
+ensureColumn("crawl_sites", "last_progress_json", "TEXT");
 // Heuristic classification of *why* a test failed -- 'automation_issue' (the
 // generated script's own locator/timeout, not the product), 'environment_issue'
 // (target unreachable/DNS/connection refused), or 'possible_bug' (an assertion

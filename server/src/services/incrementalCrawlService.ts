@@ -223,11 +223,16 @@ export function hasCriticalChanges(
   return previousHash !== currentHash;
 }
 
+let lastIncrementalResult: IncrementalCrawlResult | null = null;
+
 /**
  * Record completion of incremental crawl
  */
 export function recordIncrementalCrawlCompletion(result: IncrementalCrawlResult): void {
-  console.log(`Incremental crawl completed: ${result.unchangedPages}/${result.totalPages} pages reused`);
+  lastIncrementalResult = result;
+  console.log(
+    `[incremental] completed: ${result.unchangedPages}/${result.totalPages} reused, ${result.changedPages} changed, ${Math.round(result.timeElapsed / 1000)}s`
+  );
 }
 
 /**
@@ -265,11 +270,14 @@ export function getIncrementalCrawlStats(): {
     let incrementalCrawls = 0;
     let reuseSum = 0;
     let reuseCount = 0;
-    let pagesScanned = 0;
-    let totalPages = 0;
-    let changedPages = 0;
+    let pagesScannedSum = 0;
+    let changedSum = 0;
+    let latestPagesScanned = 0;
+    let latestTotalPages = 0;
+    let latestChanged = 0;
 
-    for (const s of sites) {
+    for (let i = 0; i < sites.length; i++) {
+      const s = sites[i];
       let summary: any = null;
       try {
         summary = s.recrawl_summary_json ? JSON.parse(s.recrawl_summary_json) : null;
@@ -285,11 +293,20 @@ export function getIncrementalCrawlStats(): {
         reuseSum += Math.round((unchanged / total) * 100);
         reuseCount++;
       }
-      if (!pagesScanned) {
-        pagesScanned = unchanged + changed || s.pages_discovered || 0;
-        totalPages = total;
-        changedPages = changed;
+      pagesScannedSum += total;
+      changedSum += changed;
+      if (i === 0) {
+        latestPagesScanned = unchanged + changed || s.pages_discovered || 0;
+        latestTotalPages = total;
+        latestChanged = changed;
       }
+    }
+
+    // Prefer the most recent live completion when present
+    if (lastIncrementalResult) {
+      latestPagesScanned = lastIncrementalResult.pagesScanned || latestPagesScanned;
+      latestTotalPages = lastIncrementalResult.totalPages || latestTotalPages;
+      latestChanged = lastIncrementalResult.changedPages || latestChanged;
     }
 
     const avgReusedPages = reuseCount ? Math.round(reuseSum / reuseCount) : 0;
@@ -306,9 +323,9 @@ export function getIncrementalCrawlStats(): {
       incrementalCrawls,
       avgReusedPages,
       totalCostSavings: Number(((avgReusedPages / 100) * Math.max(1, totalCrawls) * 2.5).toFixed(2)),
-      pagesScanned: pagesScanned || 0,
-      totalPages: totalPages || pagesScanned || 0,
-      changedPages,
+      pagesScanned: latestPagesScanned || pagesScannedSum,
+      totalPages: latestTotalPages || latestPagesScanned || 0,
+      changedPages: latestChanged || changedSum,
       reusePercentage: avgReusedPages,
       lastBaselineDate: last
         ? daysSince === 0

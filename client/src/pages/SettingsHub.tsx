@@ -76,10 +76,10 @@ export default function SettingsHub() {
   const [tab, setTab] = useState<Tab>("environments");
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-4">
       <div>
-        <h2 className="font-display text-xl tracking-tight">Settings</h2>
-        <p className="text-sm text-ink/60">Environments, preferences, and workspace mode</p>
+        <h2 className="font-display text-lg tracking-tight">Settings</h2>
+        <p className="text-xs text-ink/60">Environments, preferences, and workspace</p>
       </div>
 
       <TabBar<Tab>

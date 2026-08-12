@@ -32,8 +32,6 @@ export interface ComponentInventoryItem {
 export async function collectComponentInventory(page: Page): Promise<ComponentInventoryItem[]> {
   const raw = await page
     .evaluate(() => {
-      // Every helper below is inlined at its call site (no named function
-      // declarations/const-arrows) -- see the note above this function for why.
       const modalClassEls = Array.from(document.querySelectorAll("[class]")).filter((el) =>
         (el.getAttribute("class") || "").toLowerCase().includes("modal")
       );
@@ -46,18 +44,79 @@ export async function collectComponentInventory(page: Page): Promise<ComponentIn
       const cardClassEls = Array.from(document.querySelectorAll("[class]")).filter((el) =>
         (el.getAttribute("class") || "").toLowerCase().includes("card")
       );
+      const breadcrumbClassEls = Array.from(document.querySelectorAll("[class]")).filter((el) =>
+        (el.getAttribute("class") || "").toLowerCase().includes("breadcrumb")
+      );
+      const tabClassEls = Array.from(document.querySelectorAll("[class]")).filter((el) => {
+        const c = (el.getAttribute("class") || "").toLowerCase();
+        return c.includes("tab-list") || c.includes("tabs") || el.getAttribute("role") === "tablist";
+      });
+      const searchClassEls = Array.from(document.querySelectorAll("[class]")).filter((el) =>
+        (el.getAttribute("class") || "").toLowerCase().includes("search")
+      );
 
       const buckets: Array<{ kind: string; label: string; els: Element[] }> = [
         { kind: "header", label: "Header", els: Array.from(document.querySelectorAll('header, [role="banner"]')) },
         { kind: "navbar", label: "Navbar", els: Array.from(document.querySelectorAll('nav, [role="navigation"]')) },
+        {
+          kind: "breadcrumbs",
+          label: "Breadcrumbs",
+          els: Array.from(document.querySelectorAll('[aria-label*="breadcrumb" i], nav[aria-label*="breadcrumb" i]')).concat(
+            breadcrumbClassEls
+          ),
+        },
+        { kind: "headings", label: "Headings", els: Array.from(document.querySelectorAll("h1, h2, [role='heading']")) },
         { kind: "forms", label: "Forms", els: Array.from(document.querySelectorAll("form")) },
+        {
+          kind: "inputs",
+          label: "Inputs",
+          els: Array.from(document.querySelectorAll('input:not([type="hidden"]):not([type="submit"]):not([type="button"]), textarea')),
+        },
+        {
+          kind: "search",
+          label: "Search",
+          els: Array.from(
+            document.querySelectorAll('input[type="search"], [role="search"], form[role="search"], input[name*="search" i], input[placeholder*="search" i]')
+          ).concat(searchClassEls),
+        },
         {
           kind: "buttons",
           label: "Buttons",
           els: Array.from(document.querySelectorAll('button, [role="button"], input[type="submit"], input[type="button"]')),
         },
+        {
+          kind: "links",
+          label: "Links",
+          els: Array.from(document.querySelectorAll('a[href]:not([href=""]):not([href="#"])')),
+        },
         { kind: "dropdowns", label: "Dropdowns", els: Array.from(document.querySelectorAll('select, [role="listbox"], [role="combobox"]')) },
+        {
+          kind: "checkboxes",
+          label: "Checkboxes",
+          els: Array.from(document.querySelectorAll('input[type="checkbox"], [role="checkbox"]')),
+        },
+        {
+          kind: "radios",
+          label: "Radio buttons",
+          els: Array.from(document.querySelectorAll('input[type="radio"], [role="radio"]')),
+        },
         { kind: "tables", label: "Tables", els: Array.from(document.querySelectorAll('table, [role="table"], [role="grid"]')) },
+        { kind: "lists", label: "Lists", els: Array.from(document.querySelectorAll("ul, ol, [role='list']")) },
+        {
+          kind: "images",
+          label: "Images",
+          els: Array.from(document.querySelectorAll("img[src], picture img, [role='img']")),
+        },
+        {
+          kind: "videos",
+          label: "Videos",
+          els: Array.from(document.querySelectorAll("video, iframe[src*='youtube'], iframe[src*='vimeo']")),
+        },
+        {
+          kind: "tabs",
+          label: "Tabs",
+          els: Array.from(document.querySelectorAll('[role="tablist"], [role="tab"]')).concat(tabClassEls),
+        },
         {
           kind: "modals",
           label: "Modals",
@@ -71,30 +130,43 @@ export async function collectComponentInventory(page: Page): Promise<ComponentIn
         {
           kind: "pagination",
           label: "Pagination",
-          els: Array.from(document.querySelectorAll('[aria-label*="pagination" i], nav[aria-label*="page" i]')).concat(paginationClassEls),
+          els: Array.from(document.querySelectorAll('[aria-label*="pagination" i], nav[aria-label*="page" i]')).concat(
+            paginationClassEls
+          ),
         },
         {
           kind: "cards",
           label: "Cards",
           els: Array.from(document.querySelectorAll('article, [role="article"]')).concat(cardClassEls),
         },
+        { kind: "iframe", label: "Iframes", els: Array.from(document.querySelectorAll("iframe[src]")) },
         { kind: "footer", label: "Footer", els: Array.from(document.querySelectorAll('footer, [role="contentinfo"]')) },
       ];
 
       const out: Array<{ kind: string; label: string; count: number; samples: string[] }> = [];
       for (const b of buckets) {
-        // De-dup elements matched by more than one selector in the same bucket
-        // (e.g. a `<div role="dialog" class="modal">` matches both modal selectors).
         const unique = Array.from(new Set(b.els));
         const visible = unique.filter((el) => {
           const rect = el.getBoundingClientRect();
+          const style = window.getComputedStyle(el);
+          if (style.display === "none" || style.visibility === "hidden" || Number(style.opacity) === 0) return false;
           return rect.width > 0 && rect.height > 0;
         });
         if (visible.length === 0) continue;
         const samples: string[] = [];
         for (const el of visible) {
-          const t = (el.getAttribute("aria-label") || el.textContent || "").replace(/\s+/g, " ").trim().slice(0, 40);
-          if (t.length > 0) samples.push(t);
+          const t = (
+            el.getAttribute("aria-label") ||
+            el.getAttribute("alt") ||
+            el.getAttribute("placeholder") ||
+            el.getAttribute("name") ||
+            el.textContent ||
+            ""
+          )
+            .replace(/\s+/g, " ")
+            .trim()
+            .slice(0, 40);
+          if (t.length > 0 && !samples.includes(t)) samples.push(t);
           if (samples.length >= 3) break;
         }
         out.push({ kind: b.kind, label: b.label, count: visible.length, samples });
@@ -105,3 +177,30 @@ export async function collectComponentInventory(page: Page): Promise<ComponentIn
 
   return raw;
 }
+
+/** Human-readable catalog of all component kinds the crawler knows how to detect. */
+export const KNOWN_COMPONENT_KINDS: Array<{ kind: string; label: string }> = [
+  { kind: "header", label: "Header" },
+  { kind: "navbar", label: "Navbar" },
+  { kind: "breadcrumbs", label: "Breadcrumbs" },
+  { kind: "headings", label: "Headings" },
+  { kind: "forms", label: "Forms" },
+  { kind: "inputs", label: "Inputs" },
+  { kind: "search", label: "Search" },
+  { kind: "buttons", label: "Buttons" },
+  { kind: "links", label: "Links" },
+  { kind: "dropdowns", label: "Dropdowns" },
+  { kind: "checkboxes", label: "Checkboxes" },
+  { kind: "radios", label: "Radio buttons" },
+  { kind: "tables", label: "Tables" },
+  { kind: "lists", label: "Lists" },
+  { kind: "images", label: "Images" },
+  { kind: "videos", label: "Videos" },
+  { kind: "tabs", label: "Tabs" },
+  { kind: "modals", label: "Modals" },
+  { kind: "filters", label: "Filters" },
+  { kind: "pagination", label: "Pagination" },
+  { kind: "cards", label: "Cards" },
+  { kind: "iframe", label: "Iframes" },
+  { kind: "footer", label: "Footer" },
+];

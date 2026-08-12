@@ -13,6 +13,7 @@ import type { ScriptLanguage } from "../llm/modelConfig.js";
 import { optimizePromptWithCompression, isPromptOptimizationEnabled } from "./promptOptimizationService.js";
 import { getPromptResponse, cachePromptResponse, isCacheEnabled } from "./cacheService.js";
 import { selectModel, isModelRoutingEnabled } from "./modelRoutingService.js";
+import { tryBuildCrawledScriptWithoutLlm } from "../llm/mockProvider.js";
 
 interface GeneratedArtifactRecord {
   language: string;
@@ -305,7 +306,36 @@ export async function generateAutomationScript(
   }
 
   type Artifact = { language: string; framework: string; code: string; fileName: string };
-  const artifacts = await withLlmGateway<Artifact[]>(
+
+  // Crawler scenarios already carry URL + locators — build the script from that
+  // template instead of spending an LLM call (default on; set CRAWL_TEMPLATE_FIRST=false to force LLM).
+  let artifacts: Artifact[] | null = null;
+  const templateFirst = process.env.CRAWL_TEMPLATE_FIRST !== "false";
+  if (templateFirst && requestedFramework === "playwright") {
+    const lang =
+      language === "javascript" ? "javascript" : language === "python" ? "python" : "typescript";
+    const templated = tryBuildCrawledScriptWithoutLlm(sanitizedTestCase, lang, tc.source_rationale);
+    if (templated) {
+      const fileName =
+        language === "python"
+          ? `${tc.id}.py`
+          : language === "javascript"
+            ? `${tc.id}.spec.js`
+            : `${tc.id}.spec.ts`;
+      artifacts = [{ language, framework: requestedFramework, code: templated, fileName }];
+      if (isCacheEnabled()) {
+        try {
+          cachePromptResponse(effectivePrompt, templated);
+        } catch {
+          /* ignore */
+        }
+      }
+      console.info(`[codegen] template-first script for ${tc.id} (no LLM call)`);
+    }
+  }
+
+  if (!artifacts) {
+    artifacts = await withLlmGateway<Artifact[]>(
     "script_generation",
     { inputId: tc.id, provider: llm.name, prompt: effectivePrompt, category: sanitizedTestCase.category },
     async (_preparedPrompt, tier) => {
@@ -336,6 +366,7 @@ export async function generateAutomationScript(
       return { result, outputText: code };
     }
   );
+  }
 
   // Cached artifacts were generated for a different test case id -- every filename/fileName
   // embeds tc.id, so a cache hit needs its artifact filenames rewritten to this test case

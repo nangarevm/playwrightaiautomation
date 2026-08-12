@@ -75,7 +75,12 @@ export async function extractElementLocators(page: Page, handle: Locator): Promi
       if (closestLabel) labelText = (closestLabel.textContent || "").replace(/\s+/g, " ").trim();
     }
 
-    const accessibleName = ariaLabel || labelText || text || placeholder || null;
+    const href = tag === "a" ? el.getAttribute("href") : null;
+    const accessibleNameRaw = ariaLabel || labelText || text || placeholder || null;
+    const accessibleName =
+      accessibleNameRaw && !/^(https?:\/\/|www\.|mailto:)/i.test(accessibleNameRaw.trim())
+        ? accessibleNameRaw
+        : ariaLabel || labelText || placeholder || (text && !/^(https?:\/\/|www\.)/i.test(text) ? text : null);
 
     const closestForm = el.closest("form");
     const closestFormLabel =
@@ -106,6 +111,7 @@ export async function extractElementLocators(page: Page, handle: Locator): Promi
       role,
       id,
       name,
+      href,
       accessibleName,
       elementType,
       required: el.hasAttribute("required"),
@@ -121,9 +127,13 @@ export async function extractElementLocators(page: Page, handle: Locator): Promi
   if (info.testId) {
     locators.push(`page.getByTestId(${JSON.stringify(info.testId)})`);
   }
-  // 2. ARIA role + accessible name
-  if (info.role && info.accessibleName) {
+  // 2. ARIA role + accessible name (skip URL-like names — they fail getByRole matching)
+  if (info.role && info.accessibleName && !/^(https?:\/\/|www\.|mailto:)/i.test(info.accessibleName)) {
     locators.push(`page.getByRole(${JSON.stringify(info.role)}, { name: ${JSON.stringify(info.accessibleName)} })`);
+  }
+  // 2b. Links with no usable accessible name: target by href
+  if (info.tag === "a" && info.href && (!info.accessibleName || /^(https?:\/\/|www\.)/i.test(info.accessibleName))) {
+    locators.push(`page.locator(${JSON.stringify(`a[href="${escapeForAttrSelector(info.href)}"]`)})`);
   }
   // 3. id (prefer over generic CSS, most specific)
   if (info.id) {

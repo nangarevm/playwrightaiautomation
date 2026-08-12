@@ -1287,12 +1287,15 @@ export async function runExecutionBatch(scriptIds: string[], targetUrl: string, 
       : Math.min(5, profileConcurrency)
   );
 
-  const runOnce = (workers: number): Promise<{ durationMs: number; passed: number; failed: number }> => {
+  // Windows CreateProcess argv limit (~8191). Keep each playwright invocation small.
+  const FILE_CHUNK = Math.max(5, Number(input.fileChunkSize) || 25);
+
+  const runFileChunk = (files: string[], workers: number): Promise<{ durationMs: number; passed: number; failed: number }> => {
     return new Promise((resolve) => {
       const startedAt = Date.now();
       execFile(
         getNpxCommand(),
-        ["playwright", "test", ...relFiles, "--reporter=json,allure-playwright", `--workers=${workers}`],
+        ["playwright", "test", ...files, "--reporter=json,allure-playwright", `--workers=${workers}`],
         {
           cwd: SERVER_ROOT,
           env: {
@@ -1318,12 +1321,28 @@ export async function runExecutionBatch(scriptIds: string[], targetUrl: string, 
               }
             }
           } catch {
-            /* best-effort parse */
+            /* best-effort parse — treat opaque failure as all failed in this chunk */
+            if (_error) failed = Math.max(failed, files.length);
           }
           resolve({ durationMs, passed, failed });
         }
       );
     });
+  };
+
+  const runOnce = async (workers: number): Promise<{ durationMs: number; passed: number; failed: number }> => {
+    let durationMs = 0;
+    let passed = 0;
+    let failed = 0;
+    for (let i = 0; i < relFiles.length; i += FILE_CHUNK) {
+      const slice = relFiles.slice(i, i + FILE_CHUNK);
+      const chunkWorkers = Math.min(workers, slice.length);
+      const result = await runFileChunk(slice, chunkWorkers);
+      durationMs += result.durationMs;
+      passed += result.passed;
+      failed += result.failed;
+    }
+    return { durationMs, passed, failed };
   };
 
   // Run once with parallel workers. Sequential baseline is opt-in only —
@@ -1351,7 +1370,12 @@ export async function runExecutionBatch(scriptIds: string[], targetUrl: string, 
     script_id: scripts[0].id, // batch runs summarize under the first script's row; individual script results are in `stdout`
     status: concurrentResult.failed === 0 ? "passed" : "failed",
     duration_ms: concurrentResult.durationMs,
-    stdout: JSON.stringify({ scriptIds, passed: concurrentResult.passed, failed: concurrentResult.failed }),
+    stdout: JSON.stringify({
+      scriptIds,
+      passed: concurrentResult.passed,
+      failed: concurrentResult.failed,
+      fileChunks: Math.ceil(relFiles.length / FILE_CHUNK),
+    }),
     browser_set: "chromium",
     concurrency: requestedConcurrency,
     artifact_capture_mode: config.artifact_capture_mode || "logs-only",
@@ -1375,5 +1399,6 @@ export async function runExecutionBatch(scriptIds: string[], targetUrl: string, 
     speedup: sequentialBaseline ? Number((sequentialBaseline.durationMs / concurrentResult.durationMs).toFixed(2)) : null,
     passed: concurrentResult.passed,
     failed: concurrentResult.failed,
+    fileChunks: Math.ceil(relFiles.length / FILE_CHUNK),
   };
 }

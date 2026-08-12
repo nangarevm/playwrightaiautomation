@@ -7,11 +7,11 @@ import { Pill } from "./Pill.js";
 export function Header() {
   const { error } = useApp();
   return (
-    <header className="border-b border-line bg-paper/95 backdrop-blur sticky top-0 z-10">
-      <div className="px-6 py-3.5 flex items-center justify-between gap-4">
-        <div className="flex items-center gap-3">
-          <span className="font-display text-[11px] font-bold tracking-widest bg-ink text-paper rounded px-1.5 py-0.5">QA</span>
-          <h1 className="text-base font-semibold tracking-tight text-ink">AI Test Automation Platform</h1>
+    <header className="border-b border-line bg-paper/95 backdrop-blur sticky top-0 z-10 h-14 flex items-center">
+      <div className="px-4 w-full flex items-center justify-between gap-3">
+        <div className="flex items-center gap-2">
+          <span className="font-display text-[10px] font-bold tracking-widest bg-ink text-paper rounded px-1 py-0.5">QA</span>
+          <h1 className="text-sm font-semibold tracking-tight text-ink truncate">Test Automation</h1>
         </div>
         {error && <Pill tone="bad">⚠ {error}</Pill>}
       </div>

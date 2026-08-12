@@ -35,6 +35,19 @@ export default function Crawler() {
   const [maxPages, setMaxPages] = useState(50);
   const [crawlAllPages, setCrawlAllPages] = useState(false);
   const [captureApi, setCaptureApi] = useState(false);
+  /** auto = server decides (diff on re-crawl); incremental/full = force */
+  const [crawlMode, setCrawlMode] = useState<"auto" | "incremental" | "full">("auto");
+  /** minimal = few scenarios/page covering load + components + primary flow (saves LLM tokens) */
+  const [coverageMode, setCoverageMode] = useState<"minimal" | "standard" | "full">("minimal");
+  const [lastModeInfo, setLastModeInfo] = useState<{ mode?: string; modeReason?: string; isRerun?: boolean } | null>(null);
+  const [cockpit, setCockpit] = useState<any>(null);
+  const [impactTier, setImpactTier] = useState<"smoke" | "critical" | "full-delta">("critical");
+  const [impactBusy, setImpactBusy] = useState(false);
+  const [impactMsg, setImpactMsg] = useState<string | null>(null);
+  const [impactJobId, setImpactJobId] = useState<string | null>(null);
+  const [impactJob, setImpactJob] = useState<any>(null);
+  const impactPollRef = useRef<number | null>(null);
+  const [ciSecret, setCiSecret] = useState<string | null>(null);
   
   // Smart presets
   const [selectedPreset, setSelectedPreset] = useState<PresetId>("comprehensive");
@@ -139,18 +152,46 @@ export default function Crawler() {
     }
   }
 
+  function stopImpactPolling() {
+    if (impactPollRef.current) {
+      window.clearInterval(impactPollRef.current);
+      impactPollRef.current = null;
+    }
+  }
+
+  function startImpactPolling(siteId: string, jobId: string) {
+    stopImpactPolling();
+    impactPollRef.current = window.setInterval(async () => {
+      try {
+        const res = await api.crawlerGetImpactSuiteJob(siteId, jobId);
+        const job = res?.job;
+        if (!job) return;
+        setImpactJob(job);
+        setImpactMsg(job.message || null);
+        if (job.status === "completed" || job.status === "failed") {
+          stopImpactPolling();
+          setImpactBusy(false);
+        }
+      } catch {
+        /* keep polling through transient errors */
+      }
+    }, 2500);
+  }
+
   // Get effective crawler configuration from selected preset or custom settings
   function getEffectiveConfig() {
     if (useCustomPages) {
       return {
         maxPages: maxPages,
         crawlAllPages: crawlAllPages,
+        concurrency: 5,
       };
     }
     const preset = CRAWL_PRESETS[selectedPreset];
     return {
       maxPages: preset.maxPages,
       crawlAllPages: preset.maxPages === 999999,
+      concurrency: Math.min(5, preset.concurrency || 5),
     };
   }
 
@@ -160,16 +201,23 @@ export default function Crawler() {
     setDetail(null);
     setSelected(new Set());
     setDiscoveredPages([]);
+    setLastModeInfo(null);
     try {
+      const config = getEffectiveConfig();
       const res = await api.crawlerRun({
         url: url.trim(),
         username: username || undefined,
         password: password || undefined,
-        maxPages: crawlAllPages ? 999999 : (Number(maxPages) || 10),
+        maxPages: config.crawlAllPages ? 999999 : config.maxPages,
         captureApi,
+        concurrency: config.concurrency,
+        mode: crawlMode === "auto" ? undefined : crawlMode,
+        coverageMode,
       });
+      setLastModeInfo({ mode: res.mode, modeReason: res.modeReason, isRerun: res.isRerun });
       const initial = await api.crawlerGetSite(res.siteId);
       setSite(initial);
+      api.crawlerGetCockpit(res.siteId).then(setCockpit).catch(() => undefined);
       stopPolling();
       pollRef.current = window.setInterval(async () => {
         try {
@@ -189,6 +237,12 @@ export default function Crawler() {
             if (updated.status === "completed") {
               const d = await api.crawlerGetSiteDetail(res.siteId);
               setDetail(d);
+              api.crawlerGetCockpit(res.siteId).then(setCockpit).catch(() => undefined);
+              api.crawlerPlanImpactSuite(res.siteId, "critical").then((p) => {
+                if (p?.plan?.estimatedTests) {
+                  setImpactMsg(`Impact suite ready: ~${p.plan.estimatedTests} test(s) on changed/new pages`);
+                }
+              }).catch(() => undefined);
             }
           }
         } catch (e: any) {
@@ -201,7 +255,10 @@ export default function Crawler() {
     }
   }
 
-  useEffect(() => () => stopPolling(), []);
+  useEffect(() => () => {
+    stopPolling();
+    stopImpactPolling();
+  }, []);
 
   // Awaitable version of the same poll-until-done loop startCrawl runs live for a
   // single URL -- runBatch (below) awaits one of these per queued URL so it can
@@ -249,6 +306,9 @@ export default function Crawler() {
           password: password || undefined,
           maxPages: config.crawlAllPages ? 999999 : config.maxPages,
           captureApi,
+          concurrency: config.concurrency,
+          mode: crawlMode === "auto" ? undefined : crawlMode,
+          coverageMode,
         });
         const finalSite = await pollUntilDone(res.siteId, (s) =>
           setBatchQueue((prev) =>
@@ -386,6 +446,45 @@ export default function Crawler() {
     }
   }
 
+  /** Add missing component-coverage scenarios from the last crawl inventory (no re-crawl). */
+  async function ensureComponentTests() {
+    if (!site) return;
+    setBusy("component-coverage");
+    setError(null);
+    try {
+      const res = await api.crawlerEnsureComponentCoverage(site.id);
+      await refreshDetail();
+      setProgressMessage(
+        res.added > 0
+          ? `Added ${res.added} component test scenario(s) across ${res.pagesUpdated} page(s). Select them below and Generate + Run.`
+          : "All discovered components already have coverage scenarios."
+      );
+    } catch (e: any) {
+      setError(e.message);
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  /** Shrink the active scenario list to minimal/standard/full without re-crawling. */
+  async function rebuildCoverage() {
+    if (!site) return;
+    setBusy("coverage-rebuild");
+    setError(null);
+    try {
+      const res = await api.crawlerRebuildCoverage(site.id, coverageMode);
+      await refreshDetail();
+      setProgressMessage(
+        `Coverage rebuilt (${res.coverageMode}): +${res.added} added, ${res.retired} retired across ${res.pagesUpdated} page(s).`
+      );
+      setTimeout(() => setProgressMessage(null), 6000);
+    } catch (e: any) {
+      setError(e.message);
+    } finally {
+      setBusy(null);
+    }
+  }
+
   // Closes most of the loop from inside this one tab: generate real Playwright
   // tests for the selected scenarios and run each one immediately (Ultrafast --
   // no profile/environment picking needed). The Allure report itself is built
@@ -509,20 +608,19 @@ export default function Crawler() {
   const flowCount = allScenarios.filter((s) => s.type === "flow").length;
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-4">
       <div>
-        <h2 className="font-display text-xl tracking-tight">AI Crawler</h2>
-        <p className="text-sm text-ink/60">
-          Point it at a URL, curate the discovered scenarios, then generate and run real Playwright tests in one flow — build, view, download, or
-          email the Allure report right here, and download the generated test cases in any format.
+        <h2 className="font-display text-lg tracking-tight">AI Crawler</h2>
+        <p className="text-xs text-ink/60">
+          Point it at a URL, curate the discovered scenarios, then generate and run real Playwright tests in one flow.
         </p>
       </div>
 
-      {error && <div className="rounded-md border border-alert bg-alert/5 p-3 text-sm text-alert">{error}</div>}
+      {error && <div className="rounded-md border border-alert bg-alert/5 p-2 text-xs text-alert">{error}</div>}
 
       {/* Step 0: Crawl Preset Selection */}
-      <div className="rounded-lg border border-line bg-white/60 shadow-panel p-4 space-y-4">
-        <h3 className="font-medium text-sm">Crawl Preset</h3>
+      <div className="rounded-lg border border-line bg-white/60 shadow-panel p-3 space-y-3">
+        <h3 className="font-medium text-xs">Crawl Preset</h3>
         
         {/* Preset Selection Grid */}
         <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
@@ -590,7 +688,7 @@ export default function Crawler() {
       </div>
 
       {/* Step 1: Onboarding */}
-      <div className="rounded-lg border border-line bg-white/60 shadow-panel p-4 space-y-3">
+      <div className="rounded-lg border border-line bg-white/60 shadow-panel p-3 space-y-2">
         <div className="flex items-center rounded-full border border-line bg-white/60 p-0.5 text-xs w-fit">
           <button className={`rounded-full px-3 py-1 font-medium ${urlMode === "single" ? "bg-ink text-paper" : "text-ink/60"}`} onClick={() => setUrlMode("single")}>
             Single URL
@@ -618,7 +716,7 @@ export default function Crawler() {
           </label>
         )}
 
-        <div className="grid gap-3 md:grid-cols-2">
+        <div className="grid gap-2 md:grid-cols-2">
           <label className="text-xs text-ink/60 space-y-1">
             <span>Username (optional)</span>
             <input className="w-full rounded-md border border-line px-2 py-1.5 text-sm" value={username} onChange={(e) => setUsername(e.target.value)} />
@@ -632,11 +730,108 @@ export default function Crawler() {
           <input type="checkbox" checked={captureApi} onChange={(e) => setCaptureApi(e.target.checked)} />
           Capture API calls per interaction (--capture-api) — required for API scenarios below to appear
         </label>
+
+        <div className="flex flex-wrap items-center gap-2 text-xs">
+          <span className="text-ink/60 font-medium">Re-crawl mode</span>
+          <div className="flex items-center rounded-full border border-line bg-white/60 p-0.5">
+            {(["auto", "incremental", "full"] as const).map((m) => (
+              <button
+                key={m}
+                type="button"
+                className={`rounded-full px-2.5 py-1 font-medium capitalize ${
+                  crawlMode === m ? "bg-ink text-paper" : "text-ink/60"
+                }`}
+                onClick={() => setCrawlMode(m)}
+                title={
+                  m === "auto"
+                    ? "Diff on known URLs; full if baseline is stale or change rate is high"
+                    : m === "incremental"
+                      ? "Shallow probe + reuse unchanged pages"
+                      : "Deep re-scan every page"
+                }
+              >
+                {m}
+              </button>
+            ))}
+          </div>
+        </div>
+
         {urlMode === "multi" && <p className="text-xs text-ink/50">Same settings apply to every URL. Crawled one at a time so a local run doesn't compete with itself for resources.</p>}
         {urlMode === "single" && knownSite?.known && (
           <p className="text-xs text-signal">
-            This URL was crawled before (last: {knownSite.site?.last_crawled_at ?? "unknown"}) — this run will auto-switch to diff mode and only
-            re-capture changed pages.
+            Known site (last: {knownSite.site?.last_crawled_at ?? "unknown"}). Mode{" "}
+            <strong>{crawlMode}</strong>
+            {crawlMode === "auto"
+              ? " — cheap HTTP skip (ETag/Last-Modified/sitemap lastmod) when possible; otherwise shallow probe, deep only when structure drifts."
+              : crawlMode === "incremental"
+                ? " — HTTP skip + shallow probe; deep-scan only pages that drifted."
+                : " — full deep re-scan of all pages (no HTTP skip)."}
+          </p>
+        )}
+        {urlMode === "single" && knownSite?.known && knownSite.site?.id && (
+          <div className="rounded-md border border-line bg-white/70 p-3 space-y-2 text-xs">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <p className="font-semibold text-ink">Recrawl cockpit</p>
+              <button
+                type="button"
+                className="rounded border border-line px-2 py-1 hover:bg-gray-50"
+                onClick={async () => {
+                  try {
+                    setCockpit(await api.crawlerGetCockpit(knownSite.site!.id));
+                  } catch (e: any) {
+                    setError(e.message);
+                  }
+                }}
+              >
+                Refresh ETA
+              </button>
+            </div>
+            {cockpit ? (
+              <>
+                <p className="text-ink/70">
+                  Baseline {cockpit.baselineAge?.label || "—"} · {cockpit.pageCount ?? 0} pages · recommend{" "}
+                  <strong>{cockpit.modeRecommendation}</strong> · ETA ~{cockpit.eta?.estimatedLabel || "—"}
+                </p>
+                <p className="text-ink/50">{cockpit.honestCopy}</p>
+                <div className="flex flex-wrap gap-2">
+                  <button
+                    type="button"
+                    className="rounded border border-line px-2 py-1"
+                    onClick={async () => {
+                      const enabled = !cockpit.watchEnabled;
+                      await api.crawlerSetWatch(knownSite.site!.id, enabled);
+                      setCockpit({ ...cockpit, watchEnabled: enabled });
+                    }}
+                  >
+                    {cockpit.watchEnabled ? "Disable nightly watch" : "Watch nightly (incremental)"}
+                  </button>
+                  <button
+                    type="button"
+                    className="rounded border border-line px-2 py-1"
+                    onClick={async () => {
+                      const r = await api.crawlerCreateCiSecret(knownSite.site!.id);
+                      setCiSecret(r.secret);
+                    }}
+                  >
+                    Create CI webhook secret
+                  </button>
+                </div>
+                {ciSecret && (
+                  <p className="font-mono text-[11px] break-all text-ink/60">
+                    POST /api/crawler/ci/delta · secret {ciSecret}
+                  </p>
+                )}
+              </>
+            ) : (
+              <p className="text-ink/50">Refresh ETA for baseline age and predicted re-crawl time.</p>
+            )}
+          </div>
+        )}
+        {lastModeInfo?.mode && (
+          <p className="text-xs text-ink/60">
+            Started as <strong>{lastModeInfo.mode}</strong>
+            {lastModeInfo.isRerun ? " re-crawl" : " first crawl"}
+            {lastModeInfo.modeReason ? ` (${lastModeInfo.modeReason})` : ""}.
           </p>
         )}
         {urlMode === "single" ? (
@@ -645,7 +840,13 @@ export default function Crawler() {
             disabled={!url.trim() || isRunning}
             onClick={startCrawl}
           >
-            {isRunning ? "Crawling…" : knownSite?.known ? "Re-crawl (diff mode)" : "Start crawl"}
+            {isRunning
+              ? "Crawling…"
+              : knownSite?.known
+                ? crawlMode === "full"
+                  ? "Re-crawl (full)"
+                  : "Re-crawl (diff)"
+                : "Start crawl"}
           </button>
         ) : (
           <button
@@ -660,7 +861,7 @@ export default function Crawler() {
 
       {/* Multi-URL queue: live status per URL, click a completed one to curate it below */}
       {urlMode === "multi" && batchQueue.length > 0 && (
-        <div className="rounded-lg border border-line bg-white/60 shadow-panel p-4 space-y-2">
+        <div className="rounded-lg border border-line bg-white/60 shadow-panel p-3 space-y-2">
           <p className="font-medium text-sm">Crawl queue ({batchQueue.filter((b) => b.status === "completed").length}/{batchQueue.length} done)</p>
           <ul className="space-y-1.5">
             {batchQueue.map((item, i) => (
@@ -688,9 +889,9 @@ export default function Crawler() {
 
       {/* Step 2: live progress */}
       {urlMode === "single" && site && (
-        <div className="rounded-lg border border-line bg-white/60 shadow-panel p-4 space-y-3">
+        <div className="rounded-lg border border-line bg-white/60 shadow-panel p-3 space-y-2">
           <div className="flex items-center justify-between">
-            <p className="font-medium text-sm">Crawl status</p>
+          <p className="font-medium text-sm">Crawl status</p>
             <Pill tone={site.status === "completed" ? "good" : site.status === "failed" ? "bad" : "warn"}>{site.status}</Pill>
           </div>
           
@@ -720,8 +921,139 @@ export default function Crawler() {
               <p className="text-sm font-medium text-signal truncate">{site.current_page}</p>
             </div>
           )}
+
+          {(site.progress || site.status === "running") && (
+            <p className="text-xs text-ink/70">
+              skipped {site.progress?.skippedHttp ?? 0} · scanned {site.progress?.scannedBrowser ?? 0} · deep{" "}
+              {site.progress?.deepScans ?? 0}
+              {site.progress?.reusedBaselines != null ? ` · reused ${site.progress.reusedBaselines}` : ""}
+            </p>
+          )}
           
           {site.error && <p className="text-xs text-alert">{site.error}</p>}
+
+          {(detail?.site?.recrawl_summary || site.is_rerun) && site.status === "completed" && (
+            <div className="rounded border border-signal/30 bg-signal/5 p-3 space-y-1.5">
+              <p className="text-xs font-semibold text-ink">Re-crawl summary</p>
+              {(() => {
+                const s = detail?.site?.recrawl_summary;
+                if (!s) {
+                  return <p className="text-xs text-ink/60">Diff run finished — open page list below for change status.</p>;
+                }
+                const secs = s.elapsedMs ? Math.round(s.elapsedMs / 1000) : null;
+                return (
+                  <>
+                    <p className="text-xs text-ink/70">
+                      Mode <strong>{s.mode || site.crawl_mode || "—"}</strong>
+                      {s.modeReason ? ` (${s.modeReason})` : ""}
+                      {secs != null ? ` · ${secs}s` : ""}
+                    </p>
+                    <div className="flex flex-wrap gap-2 text-xs">
+                      <Pill tone="good">unchanged {s.unchangedPages ?? 0}</Pill>
+                      <Pill tone="warn">changed {s.changedPages ?? 0}</Pill>
+                      <Pill tone="good">new {s.newPages ?? 0}</Pill>
+                      <Pill tone="neutral">reused {s.reusedBaselines ?? 0}</Pill>
+                      <Pill tone="neutral">HTTP skip {s.skippedHttp ?? 0}</Pill>
+                      <Pill tone="neutral">deep {s.deepScans ?? 0}</Pill>
+                      {(s.removedPages ?? 0) > 0 && <Pill tone="bad">removed {s.removedPages}</Pill>}
+                      {(s.preservedUnvisited ?? 0) > 0 && (
+                        <Pill tone="neutral">kept unvisited {s.preservedUnvisited}</Pill>
+                      )}
+                    </div>
+                    <div className="pt-2 space-y-2 border-t border-signal/20">
+                      <p className="text-xs font-semibold text-ink">Impact suite</p>
+                      <p className="text-[11px] text-ink/55">
+                        After a re-crawl: heal locators on changed pages, generate any missing tests, then run only the
+                        delta suite (not the whole library).
+                      </p>
+                      <div className="flex flex-wrap items-center gap-2">
+                        {(["smoke", "critical", "full-delta"] as const).map((t) => (
+                          <button
+                            key={t}
+                            type="button"
+                            className={`rounded-full px-2.5 py-1 text-[11px] font-medium ${
+                              impactTier === t ? "bg-ink text-paper" : "border border-line text-ink/70"
+                            }`}
+                            onClick={() => setImpactTier(t)}
+                          >
+                            {t === "full-delta" ? "Full delta" : t === "critical" ? "Critical paths" : "Smoke impact"}
+                          </button>
+                        ))}
+                        <button
+                          type="button"
+                          className="rounded-md bg-ink text-paper px-3 py-1.5 text-xs font-medium disabled:opacity-40"
+                          disabled={impactBusy || !site.id}
+                          onClick={async () => {
+                            if (!site?.id) return;
+                            setImpactBusy(true);
+                            setImpactMsg(null);
+                            setImpactJob(null);
+                            try {
+                              const r = await api.crawlerRunImpactSuite(site.id, impactTier);
+                              const jobId = r.jobId || r.job?.id;
+                              setImpactJobId(jobId || null);
+                              setImpactJob(r.job || null);
+                              setImpactMsg(r.message || "Impact suite started");
+                              if (jobId && r.job?.status !== "failed" && r.job?.status !== "completed") {
+                                startImpactPolling(site.id, jobId);
+                              } else {
+                                setImpactBusy(false);
+                              }
+                            } catch (e: any) {
+                              setError(e.message);
+                              setImpactBusy(false);
+                            }
+                          }}
+                        >
+                          {impactBusy ? "Running…" : "Run impact suite"}
+                        </button>
+                      </div>
+                      {impactMsg && <p className="text-xs text-ink/70">{impactMsg}</p>}
+                      {impactJob && (
+                        <div className="space-y-1.5">
+                          <div className="flex flex-wrap gap-1.5 text-[11px]">
+                            <Pill tone="neutral">status {impactJob.status}</Pill>
+                            <Pill tone="neutral">healed {impactJob.healed ?? 0}</Pill>
+                            <Pill tone="neutral">generated {impactJob.generated ?? 0}</Pill>
+                            <Pill tone="neutral">scripts {impactJob.scriptIds?.length ?? 0}</Pill>
+                            {impactJob.batch && (
+                              <>
+                                <Pill tone="good">passed {impactJob.batch.passed ?? 0}</Pill>
+                                <Pill tone="bad">failed {impactJob.batch.failed ?? 0}</Pill>
+                              </>
+                            )}
+                            {impactJobId && <Pill tone="neutral">job {impactJobId}</Pill>}
+                          </div>
+                          {Array.isArray(impactJob.suggestions) && impactJob.suggestions.length > 0 && (
+                            <div className="rounded border border-line/60 bg-white/70 p-2 space-y-1">
+                              <p className="text-[11px] font-medium text-ink/70">Self-heal suggestions</p>
+                              <ul className="space-y-1 max-h-28 overflow-y-auto">
+                                {impactJob.suggestions.slice(0, 6).map((s: any, i: number) => (
+                                  <li key={i} className="text-[10px] text-ink/65 leading-snug">
+                                    <span className="text-ink/80">{s.reason}</span>
+                                    {s.from !== "interaction" && (
+                                      <span className="block font-mono text-ink/45 truncate" title={`${s.from} → ${s.to}`}>
+                                        {String(s.from).slice(0, 48)} → {String(s.to).slice(0, 48)}
+                                      </span>
+                                    )}
+                                  </li>
+                                ))}
+                              </ul>
+                            </div>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                    {s.truncatedByMaxPages && (
+                      <p className="text-xs text-amber-700">
+                        Page limit truncated this run — unvisited prior pages were kept (not marked removed).
+                      </p>
+                    )}
+                  </>
+                );
+              })()}
+            </div>
+          )}
 
           {/* Discovered pages list */}
           {discoveredPages.length > 0 && (
@@ -744,7 +1076,58 @@ export default function Crawler() {
 
       {/* Step 3: review & curate */}
       {detail && detail.pages.length > 0 && (
-        <div className="rounded-lg border border-line bg-white/60 shadow-panel p-4 space-y-4">
+        <div className="rounded-lg border border-line bg-white/60 shadow-panel p-3 space-y-3">
+          {detail.componentCoverage && detail.componentCoverage.kinds.length > 0 && (
+            <div className="rounded border border-line/70 bg-ink/[0.03] p-3 space-y-2">
+              <div className="flex items-center justify-between gap-2 flex-wrap">
+                <div>
+                  <p className="font-medium text-sm">Components found while crawling</p>
+                  <p className="text-xs text-ink/50">
+                    {detail.componentCoverage.kinds.length} kind(s) across {detail.componentCoverage.pagesWithInventory}/
+                    {detail.componentCoverage.pagesTotal} page(s)
+                  </p>
+                </div>
+                <button
+                  className="rounded-md border border-ink/20 text-ink/70 px-3 py-1.5 text-xs font-medium disabled:opacity-40"
+                  disabled={!site || busy === "component-coverage"}
+                  onClick={ensureComponentTests}
+                  title="Create one working-coverage scenario per component kind present on each page"
+                >
+                  {busy === "component-coverage" ? "Adding…" : "Add tests for all components"}
+                </button>
+              </div>
+              <div className="overflow-x-auto">
+                <table className="w-full text-xs text-left">
+                  <thead>
+                    <tr className="text-ink/50 border-b border-line/60">
+                      <th className="py-1.5 pr-3 font-medium">Component</th>
+                      <th className="py-1.5 pr-3 font-medium">Instances</th>
+                      <th className="py-1.5 pr-3 font-medium">Pages</th>
+                      <th className="py-1.5 font-medium">Coverage</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {detail.componentCoverage.kinds.map((k) => (
+                      <tr key={k.kind} className="border-b border-line/40 last:border-0">
+                        <td className="py-1.5 pr-3 font-medium text-ink/80">{k.label}</td>
+                        <td className="py-1.5 pr-3 text-ink/60">×{k.totalCount}</td>
+                        <td className="py-1.5 pr-3 text-ink/60" title={k.pages.join(", ")}>
+                          {k.pageCount}
+                        </td>
+                        <td className="py-1.5">
+                          {k.scenarioCount > 0 ? (
+                            <Pill tone="good">tests present</Pill>
+                          ) : (
+                            <Pill tone="warn">needs tests</Pill>
+                          )}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
           <div className="flex items-center justify-between flex-wrap gap-2">
             <p className="font-medium text-sm">Review & curate ({visibleScenarioCount} scenario(s) across {detail.pages.length} page(s))</p>
             <div className="flex gap-2 flex-wrap">
@@ -869,6 +1252,14 @@ export default function Crawler() {
                     <span className="text-xs text-ink/40">{visibleScenarios.length} scenario(s)</span>
                     {page.spellingIssues.length > 0 && <Pill tone="warn">{page.spellingIssues.length} spelling issue(s)</Pill>}
                     <Pill tone={page.change_status === "changed" ? "warn" : page.change_status === "new" ? "good" : "neutral"}>{page.change_status}</Pill>
+                    {page.changeSignals && (
+                      <span className="text-[10px] text-ink/50">
+                        Structure {page.changeSignals.structure === "same" ? "✓" : page.changeSignals.structure === "changed" ? "≠" : "·"}
+                        {" · "}A11y {page.changeSignals.a11y === "same" ? "✓" : page.changeSignals.a11y === "changed" ? "≠" : "·"}
+                        {" · "}Visual {page.changeSignals.visual === "same" ? "✓" : page.changeSignals.visual === "changed" ? "≠" : "·"}
+                        {page.changeSignals.http === "not-modified" ? " · HTTP skip" : ""}
+                      </span>
+                    )}
                   </span>
                 </button>
                 {!isCollapsed && (
@@ -954,7 +1345,7 @@ export default function Crawler() {
       )}
 
       {genResults && (
-        <div className="rounded-lg border border-line bg-white/60 shadow-panel p-4 space-y-2">
+        <div className="rounded-lg border border-line bg-white/60 shadow-panel p-3 space-y-2">
           <p className="font-medium text-sm">Test generation results</p>
 
           {Object.keys(runStatuses).length > 0 && (() => {

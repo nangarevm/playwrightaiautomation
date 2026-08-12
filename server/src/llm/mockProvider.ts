@@ -258,7 +258,22 @@ function extractCrawlMeta(hint?: string): { url?: string; locators: string[] } {
       locators = [];
     }
   }
-  return { url, locators };
+  return { url, locators: Array.isArray(locators) ? locators : [] };
+}
+
+/**
+ * Build a Playwright script from crawl locators without calling an LLM.
+ * Used by codegen when CRAWL_TEMPLATE_FIRST is enabled (default) to save tokens.
+ */
+export function tryBuildCrawledScriptWithoutLlm(
+  testCase: { title: string; steps: string[]; expected_result: string; category?: string },
+  language: "typescript" | "javascript" | "python",
+  hint?: string
+): string | null {
+  if (testCase.category === "API") return null;
+  const crawlMeta = extractCrawlMeta(hint);
+  if (!crawlMeta.url && crawlMeta.locators.length === 0) return null;
+  return buildCrawledPlaywrightScript(testCase, language, crawlMeta);
 }
 
 function resolveTargetUrl(crawlUrl?: string): string {
@@ -278,27 +293,89 @@ function buildCrawledPlaywrightScript(
   const fallbackUrl = resolveTargetUrl(crawlMeta.url);
   const title = escapeForTsString(testCase.title);
   const isFlow = /end-to-end flow/i.test(testCase.title);
-  // Prefer TARGET_URL at execution time (set by Generate+Run / executionService) so
-  // the same script works for the crawled site without baking a single host only.
   const gotoExprTs = `process.env.TARGET_URL || '${escapeForTsString(fallbackUrl)}'`;
   const gotoExprPy = `os.environ.get("TARGET_URL", "${escapeForTsString(fallbackUrl)}")`;
 
+  const locators = (crawlMeta.locators || [])
+    .map((l) => l.trim())
+    .filter(Boolean)
+    .map((l) => (l.startsWith("page.") ? l : `page.${l}`));
+
   const stepLines: string[] = [];
-  let locatorIdx = 0;
+  const used = new Set<number>();
+  let lastClickLocator: string | null = null;
+
   for (const step of testCase.steps) {
     const stepLower = step.toLowerCase();
-    const locator = crawlMeta.locators[locatorIdx] ?? crawlMeta.locators[crawlMeta.locators.length - 1];
-    if (locator && /(click|navigat|toggle|select)/.test(stepLower)) {
-      if (/navigat/.test(stepLower) && stepLower.includes("given")) {
-        stepLines.push(`  // ${collapseWhitespace(step)}`);
-        continue;
-      }
-      stepLines.push(`  await ${locator}.first().click();`);
-      stepLines.push(`  await page.waitForLoadState('domcontentloaded');`);
-      if (/click|toggle|select/.test(stepLower)) locatorIdx++;
-    } else {
-      stepLines.push(`  // ${collapseWhitespace(step)}`);
+    const collapsed = collapseWhitespace(step);
+
+    // Setup / assertion narrative — keep as comments
+    if (/^\s*(given|then)\b/i.test(step) || (/navigat/.test(stepLower) && /\bgiven\b/.test(stepLower))) {
+      stepLines.push(`  // ${collapsed}`);
+      continue;
     }
+
+    const quoted = step.match(/["']([^"']+)["']/)?.[1];
+    const locator = resolveCrawlLocatorForStep(step, locators, used);
+
+    if (/\bfills?\s+in\b|\benters?\b|\btypes?\b|\battach(?:es)?\b/.test(stepLower)) {
+      stepLines.push(`  // ${collapsed}`);
+      if (locator) {
+        const value = inferFillValue(stepLower, quoted);
+        stepLines.push(`  await ${withFirst(locator)}.scrollIntoViewIfNeeded();`);
+        stepLines.push(`  await ${withFirst(locator)}.fill(${JSON.stringify(value)});`);
+        lastClickLocator = null;
+      }
+      continue;
+    }
+
+    if (/\bchecks?\b|\bticks?\b/.test(stepLower)) {
+      stepLines.push(`  // ${collapsed}`);
+      if (locator) {
+        stepLines.push(`  await ${withFirst(locator)}.scrollIntoViewIfNeeded();`);
+        stepLines.push(`  await ${withFirst(locator)}.check({ force: true });`);
+        lastClickLocator = null;
+      }
+      continue;
+    }
+
+    if (/\bselects?\b/.test(stepLower) && !/\bsubmits?\b/.test(stepLower)) {
+      stepLines.push(`  // ${collapsed}`);
+      if (locator) {
+        stepLines.push(`  await ${withFirst(locator)}.scrollIntoViewIfNeeded();`);
+        stepLines.push(`  await ${withFirst(locator)}.selectOption({ index: 1 });`);
+        lastClickLocator = null;
+      }
+      continue;
+    }
+
+    if (/\bclicks?\b|\bsubmits?\b|\btoggles?\b|\bpress(?:es)?\b/.test(stepLower)) {
+      stepLines.push(`  // ${collapsed}`);
+      const clickLocator =
+        /\bsubmits?\b/.test(stepLower)
+          ? pickSubmitLocator(locators, used) || locator
+          : locator || pickSubmitLocator(locators, used);
+      if (clickLocator) {
+        const normalized = withFirst(clickLocator);
+        if (lastClickLocator === normalized) {
+          // Avoid duplicate submit/click on the same control back-to-back
+          continue;
+        }
+        stepLines.push(`  await ${normalized}.scrollIntoViewIfNeeded();`);
+        stepLines.push(`  await ${normalized}.click({ timeout: 10000 });`);
+        stepLines.push(`  await page.waitForLoadState('domcontentloaded');`);
+        lastClickLocator = normalized;
+      }
+      continue;
+    }
+
+    // Leaves empty / blank — no interaction
+    if (/\bleaves?\b|doesn't|does not|without entering|\bblank\b|\bempty\b/.test(stepLower)) {
+      stepLines.push(`  // ${collapsed}`);
+      continue;
+    }
+
+    stepLines.push(`  // ${collapsed}`);
   }
 
   if (language === "python") {
@@ -329,6 +406,85 @@ test('${title}', async ({ page }) => {
 ${stepLines.length ? stepLines.join("\n") + "\n" : ""}${flowAssertion}
 });
 `;
+}
+
+function withFirst(locator: string): string {
+  if (/\.first\s*\(/.test(locator)) return locator;
+  return `${locator}.first()`;
+}
+
+function looksLikeUrlName(value: string): boolean {
+  return /^(https?:\/\/|www\.|\/[\w.-]+)/i.test(value.trim());
+}
+
+function locatorLabel(locator: string): string | null {
+  const m =
+    locator.match(/name:\s*["']([^"']+)["']/) ||
+    locator.match(/getBy(?:Text|Label|Placeholder|TestId)\(\s*["']([^"']+)["']/) ||
+    locator.match(/locator\(\s*["']#([^"']+)["']/) ||
+    locator.match(/name=["']([^"']+)["']/);
+  return m?.[1] || null;
+}
+
+function resolveCrawlLocatorForStep(step: string, locators: string[], used: Set<number>): string | null {
+  const quoted = step.match(/["']([^"']+)["']/)?.[1];
+  if (quoted) {
+    const want = quoted.toLowerCase();
+    // Exact/label match may reuse a locator (e.g. submit button referenced twice)
+    const idx = locators.findIndex((l) => {
+      const label = (locatorLabel(l) || "").toLowerCase();
+      return label === want || label.includes(want) || want.includes(label);
+    });
+    if (idx >= 0) {
+      used.add(idx);
+      return locators[idx];
+    }
+  }
+  // Fall back to next unused non-URL locator
+  const idx = locators.findIndex((l, i) => {
+    if (used.has(i)) return false;
+    const label = locatorLabel(l) || "";
+    return !looksLikeUrlName(label);
+  });
+  if (idx >= 0) {
+    used.add(idx);
+    return locators[idx];
+  }
+  return null;
+}
+
+function pickSubmitLocator(locators: string[], used: Set<number>): string | null {
+  const idx = locators.findIndex((l, i) => {
+    if (used.has(i)) return false;
+    return /getByRole\(\s*["']button["']|type=["']submit["']|getByText\(\s*["'][^"']*(submit|send|search|go|save|login|sign)[^"']*["']/i.test(
+      l
+    );
+  });
+  if (idx >= 0) {
+    used.add(idx);
+    return locators[idx];
+  }
+  // last locator is often the submit in form scenarios
+  for (let i = locators.length - 1; i >= 0; i--) {
+    if (!used.has(i) && /button|submit/i.test(locators[i])) {
+      used.add(i);
+      return locators[i];
+    }
+  }
+  return null;
+}
+
+function inferFillValue(stepLower: string, quoted?: string): string {
+  if (/invalid email|bad email|malformed/.test(stepLower)) return "not-an-email";
+  if (/whitespace|spaces only|blank spaces/.test(stepLower)) return "   ";
+  if (/extremely long|very long|too long/.test(stepLower)) return "x".repeat(256);
+  if (/empty|leave(?:s|ing)? .* empty|without/.test(stepLower)) return "";
+  if (/email/.test(stepLower) || /email/i.test(quoted || "")) return "user@example.com";
+  if (/password|passcode/.test(stepLower)) return "ValidPass123!";
+  if (/phone|tel|mobile/.test(stepLower)) return "5551234567";
+  if (/number|qty|amount|age|zip|postal/.test(stepLower)) return "42";
+  if (/url|website/.test(stepLower)) return "https://example.com";
+  return "test value";
 }
 
 function resolveLocatorForStep(stepText: string, language: "typescript" | "javascript" | "python"): { code: string; usedFallback: boolean } {

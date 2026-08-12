@@ -14,11 +14,31 @@ export interface CrawlOptions {
   concurrency?: number;
   /** incremental (default on re-run): skip deep interaction when page structure matches baseline. full: always deep-scan. */
   mode?: "incremental" | "full";
+  /**
+   * Scenario depth. Default "minimal": ~2–5 scenarios/page covering load, components,
+   * primary flow/form — enough for page + component coverage without LLM token blowups.
+   * "standard" adds a few negatives/edges; "full" is the exhaustive historical set.
+   */
+  coverageMode?: CoverageMode;
   /** Previously discovered page URLs for this site -- seeded first on re-crawl so coverage isn't lost. */
   knownUrls?: string[];
   /** Baseline lookup used during discovery for early unchanged short-circuit (incremental mode). */
-  getBaseline?: (url: string) => { hash: string; elements: ElementRecord[] } | null;
+  getBaseline?: (url: string) => PageBaselineMeta | null;
   onProgress?: (progress: CrawlProgress) => void;
+}
+
+/** How many scenarios the crawler should emit per page / site. */
+export type CoverageMode = "minimal" | "standard" | "full";
+
+export interface PageBaselineMeta {
+  hash: string;
+  elements: ElementRecord[];
+  etag?: string | null;
+  lastModified?: string | null;
+  lastSeenAt?: string | null;
+  title?: string | null;
+  a11yHash?: string | null;
+  screenshotHash?: string | null;
 }
 
 export interface CrawlProgress {
@@ -26,6 +46,13 @@ export interface CrawlProgress {
   formsDiscovered: number;
   scenariosDiscovered: number;
   currentPage: string;
+  /** Cheap HTTP skips (no Playwright navigation). */
+  skippedHttp?: number;
+  /** Pages opened in browser (shallow or deep). */
+  scannedBrowser?: number;
+  /** Pages that required deep interaction. */
+  deepScans?: number;
+  reusedBaselines?: number;
 }
 
 export interface LocatorCandidate {
