@@ -2,7 +2,12 @@
 // Using the same key everywhere prevents the same logical page from being
 // crawled, stored, or scenario-generated multiple times under tracking-param variants.
 
-const VOLATILE_QUERY_PARAMS = /^(utm_|fbclid$|gclid$|msclkid$|ref$|referrer$|source$|sid$|session(id)?$|_ga$|_gl$)/i;
+const VOLATILE_QUERY_PARAMS =
+  /^(utm_|fbclid$|gclid$|msclkid$|mc_cid$|mc_eid$|ref$|referrer$|source$|sid$|session(id)?$|_ga$|_gl$)/i;
+
+/** Binary/asset URLs that are not HTML pages (strategy §3). */
+const NON_HTML_PATH =
+  /\.(?:jpe?g|png|gif|webp|svg|ico|bmp|mp4|mov|avi|mp3|wav|ogg|css|js|mjs|map|woff2?|ttf|eot|otf|zip|rar|7z|gz|pdf|json|xml|csv|docx?|xlsx?)$/i;
 
 export function normalizeUrl(raw: string): string {
   return /^https?:\/\//i.test(raw) ? raw : `https://${raw}`;
@@ -11,6 +16,10 @@ export function normalizeUrl(raw: string): string {
 export function dedupeKey(rawUrl: string): string {
   try {
     const u = new URL(rawUrl);
+    u.hostname = u.hostname.toLowerCase();
+    if ((u.protocol === "https:" && u.port === "443") || (u.protocol === "http:" && u.port === "80")) {
+      u.port = "";
+    }
     const params = new URLSearchParams(u.search);
     for (const key of Array.from(params.keys())) {
       if (VOLATILE_QUERY_PARAMS.test(key)) params.delete(key);
@@ -22,6 +31,24 @@ export function dedupeKey(rawUrl: string): string {
   } catch {
     return rawUrl;
   }
+}
+
+export function isHtmlDocumentUrl(rawUrl: string): boolean {
+  try {
+    const u = new URL(rawUrl);
+    if (/^(mailto|tel|javascript|data):/i.test(u.protocol)) return false;
+    return !NON_HTML_PATH.test(u.pathname);
+  } catch {
+    return false;
+  }
+}
+
+export function isPaginationUrl(rawUrl: string, label = ""): boolean {
+  const path = rawUrl.split(/[?#]/)[0] || "";
+  if (/[?&](?:page|p|paged)=\d+/i.test(rawUrl)) return true;
+  if (/\/page\/\d+\/?$/i.test(path)) return true;
+  if (/\/(offset|start)\/\d+\/?$/i.test(path)) return true;
+  return /^(next|next page|older posts|load more|show more|previous|prev)$/i.test(label.trim());
 }
 
 export function sameOrigin(a: string, b: string): boolean {
@@ -47,7 +74,12 @@ export async function fetchSitemapUrls(siteUrl: string, maxUrls = 200): Promise<
   const origin = originOf(siteUrl);
   if (!origin) return [];
 
-  const candidates = [`${origin}/sitemap.xml`, `${origin}/sitemap_index.xml`];
+  const candidates = [
+    `${origin}/sitemap.xml`,
+    `${origin}/sitemap_index.xml`,
+    `${origin}/wp-sitemap.xml`,
+    `${origin}/sitemap-index.xml`,
+  ];
   const found: string[] = [];
   const visitedSitemaps = new Set<string>();
 

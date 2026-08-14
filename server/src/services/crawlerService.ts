@@ -24,6 +24,12 @@ import {
   shouldPerformFullCrawl,
 } from "./incrementalCrawlService.js";
 import { healScriptsForSiteDelta } from "./locatorHealService.js";
+import {
+  buildPageTitleUrlIndex,
+  normalizeFlowStepsForCodegen,
+} from "./flowStepNormalize.js";
+
+export { normalizeFlowStepsForCodegen, buildPageTitleUrlIndex } from "./flowStepNormalize.js";
 
 function daysSinceIso(iso?: string | null): number {
   if (!iso) return 999;
@@ -137,9 +143,46 @@ function upsertSiteRow(url: string, captureApi: boolean, mode: "incremental" | "
 }
 
 function knownUrlsForSite(siteId: string): string[] {
-  return (db.prepare("SELECT url FROM crawl_pages WHERE site_id = ? AND change_status != 'removed'").all(siteId) as Array<{ url: string }>).map(
-    (r) => r.url
-  );
+  return (
+    db
+      .prepare("SELECT url FROM crawl_pages WHERE site_id = ? AND change_status != 'removed' ORDER BY url ASC")
+      .all(siteId) as Array<{ url: string }>
+  ).map((r) => r.url);
+}
+
+function safeParseArray<T>(raw: string | null | undefined): T[] {
+  try {
+    const parsed = JSON.parse(raw || "[]");
+    return Array.isArray(parsed) ? (parsed as T[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+// Headline site counters are an INVENTORY of everything currently known for the
+// site, read back from the DB after persistence -- not "what this run happened to
+// touch". An incremental re-crawl that legitimately skips unchanged pages must
+// still report the same totals as the full crawl before it.
+function siteInventoryCounts(siteId: string): {
+  pages: number;
+  forms: number;
+  scenarios: number;
+  spellingIssues: number;
+} {
+  const rows = db
+    .prepare("SELECT elements_json, spelling_issues_json FROM crawl_pages WHERE site_id = ? AND change_status != 'removed'")
+    .all(siteId) as Array<{ elements_json: string; spelling_issues_json: string }>;
+  let forms = 0;
+  let spellingIssues = 0;
+  for (const row of rows) {
+    const elements = safeParseArray<ElementRecord>(row.elements_json);
+    if (elements.some((e) => ["input", "textarea", "dropdown"].includes(e.type))) forms += 1;
+    spellingIssues += safeParseArray(row.spelling_issues_json).length;
+  }
+  const scenarios = (
+    db.prepare("SELECT COUNT(*) as c FROM crawl_scenarios WHERE site_id = ? AND status = 'active'").get(siteId) as any
+  ).c as number;
+  return { pages: rows.length, forms, scenarios, spellingIssues };
 }
 
 // Runs the crawl to completion and persists everything. Callers (the route)
@@ -181,7 +224,7 @@ export async function startCrawl(params: {
     if (!page) return null;
     const row = db
       .prepare(
-        `SELECT dom_hash, elements_json, etag, last_modified, last_seen_at, title, a11y_hash, screenshot_hash
+        `SELECT dom_hash, elements_json, links_json, etag, last_modified, last_seen_at, title, a11y_hash, screenshot_hash, change_status, change_signals_json, http_status, miss_count
          FROM crawl_pages WHERE id = ?`
       )
       .get(page.id) as any;
@@ -195,6 +238,18 @@ export async function startCrawl(params: {
       title: row.title,
       a11yHash: row.a11y_hash,
       screenshotHash: row.screenshot_hash,
+      links: safeParseArray(row.links_json),
+      httpStatus: row.http_status ?? null,
+      priorChangeStatus: row.change_status ?? null,
+      missCount: row.miss_count ?? 0,
+      snapshot: (() => {
+        try {
+          const signals = row.change_signals_json ? JSON.parse(row.change_signals_json) : null;
+          return signals?.snapshot ?? null;
+        } catch {
+          return null;
+        }
+      })(),
     };
   };
 
@@ -341,6 +396,22 @@ function mergeScenariosForPage(
   }
 }
 
+function pageSignalsJson(page: CrawlRunOutput["pages"][number], previousJson?: string | null): string {
+  let previous: Record<string, unknown> = {};
+  try {
+    previous = previousJson ? JSON.parse(previousJson) : {};
+  } catch {
+    previous = {};
+  }
+  return JSON.stringify({
+    ...previous,
+    ...(page.changeSignals || {}),
+    snapshot: page.snapshot || previous.snapshot,
+    events: page.diff?.events || previous.events,
+    httpStatus: page.httpStatus ?? previous.httpStatus ?? null,
+  });
+}
+
 function persistCrawlResult(
   siteId: string,
   result: CrawlRunOutput,
@@ -353,11 +424,17 @@ function persistCrawlResult(
   }
 ) {
   const now = new Date().toISOString();
-  let totalScenarios = 0;
-  let totalForms = 0;
-  let totalSpellingIssues = 0;
   let removedPages = 0;
   let preservedUnvisited = 0;
+  const priorSummaryRow = db.prepare("SELECT recrawl_summary_json FROM crawl_sites WHERE id = ?").get(siteId) as
+    | { recrawl_summary_json?: string }
+    | undefined;
+  let priorSitemapKeys: string[] = [];
+  try {
+    priorSitemapKeys = JSON.parse(priorSummaryRow?.recrawl_summary_json || "{}")?.coverage?.sitemapKeys || [];
+  } catch {
+    priorSitemapKeys = [];
+  }
 
   const tx = db.transaction(() => {
     const siteFingerprints = loadSiteScenarioFingerprints(siteId);
@@ -367,17 +444,23 @@ function persistCrawlResult(
       const existingPage = findPageByUrl(siteId, page.url);
       const pageId = existingPage?.id || nanoid(10);
       seenKeys.add(dedupeKey(page.url));
-      const formCount = page.elements.filter((e) => ["input", "textarea", "dropdown"].includes(e.type)).length > 0 ? 1 : 0;
-      totalForms += formCount;
-      totalSpellingIssues += page.spellingIssues.length;
 
       if (existingPage) {
+        const prevSignals = (db.prepare("SELECT change_signals_json FROM crawl_pages WHERE id = ?").get(pageId) as { change_signals_json?: string } | undefined)
+          ?.change_signals_json;
         // Unchanged pages: refresh last_seen/change_status but keep elements/apis/spelling unless we have fresher data.
         if (page.changeStatus === "unchanged") {
+          // Never zero out stored inventory (spelling issues, adjacency) for a page
+          // we deliberately didn't re-scan -- only refresh it when this run actually
+          // produced something.
+          const spellingJson = JSON.stringify(page.spellingIssues);
+          const linksJson = JSON.stringify(page.links ?? []);
           db.prepare(
             `UPDATE crawl_pages SET title = ?, change_status = 'unchanged', last_seen_at = ?, updated_at = ?,
              etag = COALESCE(?, etag), last_modified = COALESCE(?, last_modified),
              a11y_hash = COALESCE(?, a11y_hash), screenshot_hash = COALESCE(?, screenshot_hash),
+             spelling_issues_json = CASE WHEN ? = '[]' THEN spelling_issues_json ELSE ? END,
+             links_json = CASE WHEN ? = '[]' THEN links_json ELSE ? END,
              change_signals_json = ?, is_persisted_from_previous_crawl = 1
              WHERE id = ?`
           ).run(
@@ -388,12 +471,22 @@ function persistCrawlResult(
             page.lastModified ?? null,
             page.a11yHash ?? null,
             page.screenshotHash ?? null,
-            JSON.stringify(page.changeSignals || { structure: "same", http: page.skippedHttp ? "not-modified" : "unknown" }),
+            spellingJson,
+            spellingJson,
+            linksJson,
+            linksJson,
+            pageSignalsJson(
+              {
+                ...page,
+                changeSignals: page.changeSignals || { structure: "same", http: page.skippedHttp ? "not-modified" : "unknown" },
+              },
+              prevSignals
+            ),
             pageId
           );
         } else {
           db.prepare(
-            `UPDATE crawl_pages SET title = ?, dom_hash = ?, elements_json = ?, apis_json = ?, change_status = ?, diff_json = ?, spelling_issues_json = ?, component_inventory_json = ?, last_seen_at = ?, updated_at = ?,
+            `UPDATE crawl_pages SET title = ?, dom_hash = ?, elements_json = ?, apis_json = ?, change_status = ?, diff_json = ?, spelling_issues_json = ?, component_inventory_json = ?, links_json = ?, last_seen_at = ?, updated_at = ?,
              etag = ?, last_modified = ?, a11y_hash = ?, screenshot_hash = ?, change_signals_json = ?, is_persisted_from_previous_crawl = 0
              WHERE id = ?`
           ).run(
@@ -405,20 +498,21 @@ function persistCrawlResult(
             page.diff ? JSON.stringify(page.diff) : null,
             JSON.stringify(page.spellingIssues),
             JSON.stringify(page.componentInventory),
+            JSON.stringify(page.links ?? []),
             now,
             now,
             page.etag ?? null,
             page.lastModified ?? null,
             page.a11yHash ?? null,
             page.screenshotHash ?? null,
-            JSON.stringify(page.changeSignals || {}),
+            pageSignalsJson(page, prevSignals),
             pageId
           );
         }
       } else {
         db.prepare(
-          `INSERT INTO crawl_pages (id, site_id, url, title, dom_hash, screenshot_hash, elements_json, apis_json, change_status, diff_json, spelling_issues_json, component_inventory_json, last_seen_at, created_at, updated_at, etag, last_modified, a11y_hash, change_signals_json)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+          `INSERT INTO crawl_pages (id, site_id, url, title, dom_hash, screenshot_hash, elements_json, apis_json, change_status, diff_json, spelling_issues_json, component_inventory_json, links_json, last_seen_at, created_at, updated_at, etag, last_modified, a11y_hash, change_signals_json)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
         ).run(
           pageId,
           siteId,
@@ -432,13 +526,14 @@ function persistCrawlResult(
           page.diff ? JSON.stringify(page.diff) : null,
           JSON.stringify(page.spellingIssues),
           JSON.stringify(page.componentInventory),
+          JSON.stringify(page.links ?? []),
           now,
           now,
           now,
           page.etag ?? null,
           page.lastModified ?? null,
           page.a11yHash ?? null,
-          JSON.stringify(page.changeSignals || {})
+          pageSignalsJson(page)
         );
       }
 
@@ -464,10 +559,11 @@ function persistCrawlResult(
         }
       }
 
-      const activeScenarioCount = (db.prepare("SELECT COUNT(*) as c FROM crawl_scenarios WHERE page_id = ? AND status = 'active'").get(pageId) as any).c;
-      totalScenarios += activeScenarioCount;
-
       catalogScreen({ name: page.title || page.url, sourceInputId: siteId, urlOrPath: page.url, content: page.hash });
+      db.prepare("UPDATE crawl_pages SET miss_count = 0, http_status = COALESCE(?, http_status) WHERE id = ?").run(
+        page.httpStatus ?? null,
+        pageId
+      );
     }
 
     // Only mark pages removed when we actually covered the prior inventory.
@@ -481,43 +577,66 @@ function persistCrawlResult(
       result.pages.length >= opts.maxPages;
     const safeToMarkRemoved = isRerun && visitedAllKnown && !hitMaxPagesCap;
 
+    let temporarilyUnavailable = 0;
     if (isRerun) {
-      const priorPages = db.prepare("SELECT id, url FROM crawl_pages WHERE site_id = ? AND change_status != 'removed'").all(siteId) as Array<{
-        id: string;
-        url: string;
-      }>;
+      const priorPages = db
+        .prepare("SELECT id, url, miss_count FROM crawl_pages WHERE site_id = ? AND change_status != 'removed'")
+        .all(siteId) as Array<{ id: string; url: string; miss_count?: number }>;
       for (const prior of priorPages) {
         if (seenKeys.has(dedupeKey(prior.url))) continue;
         if (!safeToMarkRemoved) {
           preservedUnvisited++;
           continue;
         }
-        removedPages++;
-        db.prepare("UPDATE crawl_pages SET change_status = 'removed', updated_at = ? WHERE id = ?").run(now, prior.id);
-        db.prepare(
-          "UPDATE crawl_scenarios SET status = 'soft_deleted', deleted_at = ?, updated_at = ? WHERE page_id = ? AND status = 'active' AND generated_test_case_id IS NULL"
-        ).run(now, now, prior.id);
+        const misses = (prior.miss_count ?? 0) + 1;
+        if (misses < 2) {
+          temporarilyUnavailable++;
+          db.prepare("UPDATE crawl_pages SET change_status = 'temporarily_unavailable', miss_count = ?, updated_at = ? WHERE id = ?").run(
+            misses,
+            now,
+            prior.id
+          );
+        } else {
+          removedPages++;
+          db.prepare("UPDATE crawl_pages SET change_status = 'removed', miss_count = ?, updated_at = ? WHERE id = ?").run(misses, now, prior.id);
+          db.prepare(
+            "UPDATE crawl_scenarios SET status = 'soft_deleted', deleted_at = ?, updated_at = ? WHERE page_id = ? AND status = 'active' AND generated_test_case_id IS NULL"
+          ).run(now, now, prior.id);
+        }
       }
     }
 
     const elapsedMs = opts?.elapsedMs || 0;
+    const inventory = siteInventoryCounts(siteId);
+    const currentSitemapKeys: string[] = result.summary?.coverage?.sitemapKeys || [];
+    const priorSet = new Set(priorSitemapKeys);
+    const currentSet = new Set(currentSitemapKeys);
+    const sitemapAdded = currentSitemapKeys.filter((k) => !priorSet.has(k)).length;
+    const sitemapRemoved = priorSitemapKeys.filter((k) => !currentSet.has(k)).length;
+
     const summary = {
       ...(result.summary ?? { mode: isRerun ? "incremental" : "full", newPages: 0, changedPages: 0, unchangedPages: 0, reusedBaselines: 0 }),
       removedPages,
+      temporarilyUnavailable,
+      restoredPages: result.summary?.restoredPages ?? result.pages.filter((p) => p.changeStatus === "restored").length,
       preservedUnvisited,
       truncatedByMaxPages: hitMaxPagesCap && !visitedAllKnown,
-      scenariosActive: totalScenarios,
+      pagesVisitedThisRun: result.pages.length,
+      scenariosActive: inventory.scenarios,
       elapsedMs,
       modeReason: opts?.modeReason || null,
       effectiveMaxPages: opts?.maxPages ?? null,
       skippedHttp: result.summary?.skippedHttp ?? 0,
       scannedBrowser: result.summary?.scannedBrowser ?? result.pages.length,
       deepScans: result.summary?.deepScans ?? 0,
+      coverage: result.summary?.coverage ?? null,
+      sitemapAdded,
+      sitemapRemoved,
     };
 
     db.prepare(
       "UPDATE crawl_sites SET status = 'completed', pages_discovered = ?, forms_discovered = ?, scenarios_discovered = ?, spelling_issues_found = ?, current_page = NULL, last_crawled_at = ?, recrawl_summary_json = ? WHERE id = ?"
-    ).run(result.pages.length, totalForms, totalScenarios, totalSpellingIssues, now, JSON.stringify(summary), siteId);
+    ).run(inventory.pages, inventory.forms, inventory.scenarios, inventory.spellingIssues, now, JSON.stringify(summary), siteId);
 
     // Feature 10: feed live incremental stats for Costs hub
     try {
@@ -1013,11 +1132,22 @@ export async function generateTestsFromScenarios(scenarioIds: string[], actorUse
         input = { id: inputId };
       }
 
-      const steps: string[] = JSON.parse(scenario.steps_json);
+      const rawSteps: string[] = JSON.parse(scenario.steps_json);
+      // Prefer URL navigation over brittle "click link X to reach Y" hops (cards/carousels/truncated titles).
+      const steps = normalizeFlowStepsForCodegen(rawSteps, {
+        titleToUrl: buildPageTitleUrlIndex(scenario.site_id),
+      });
+      if (JSON.stringify(steps) !== JSON.stringify(rawSteps)) {
+        db.prepare("UPDATE crawl_scenarios SET steps_json = ?, updated_at = ? WHERE id = ?").run(
+          JSON.stringify(steps),
+          now,
+          scenarioId
+        );
+      }
       const locators: string[] = JSON.parse(scenario.locators_json || "[]");
       const screen = db.prepare("SELECT id FROM screens WHERE url_or_path = ? ORDER BY updated_at DESC LIMIT 1").get(page?.url) as any;
       const pageUrl = page?.url ?? site.url;
-      const crawlMetaSuffix = ` CRAWL_URL=${pageUrl}${locators.length ? ` LOCATORS=${JSON.stringify(locators)}` : ""}`;
+      const crawlMetaSuffix = ` CRAWL_URL=${pageUrl} SITE_URL=${site.url}${locators.length ? ` LOCATORS=${JSON.stringify(locators)}` : ""}`;
 
       // Skip if an equivalent test case already exists for this screen (title + steps match).
       // Still ensure a runnable automation script exists -- prior security-scan failures

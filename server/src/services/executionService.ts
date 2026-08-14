@@ -207,7 +207,7 @@ export function resolveScriptsForSelectionMode(selectionMode: string, customSele
     // Phase 1 + 3: smart prioritization + incremental skip of unchanged pages
     if (process.env.OPTIMIZATION_ENABLED !== "false") {
       const changedPages = db.prepare(
-        "SELECT id FROM crawl_pages WHERE change_status IN ('new','changed','modified') OR change_status IS NULL"
+        "SELECT id FROM crawl_pages WHERE change_status IN ('new','changed','modified','restored') OR change_status IS NULL"
       ).all() as Array<{ id: string }>;
       const unchangedRatio =
         changedPages.length === 0
@@ -951,31 +951,44 @@ export function runExecution(scriptId: string, targetUrl: string, input: any = {
         // reporting as a real bug. Order matters: check the more specific
         // (automation/environment) patterns before falling back to "possible_bug"
         // so an ambiguous message doesn't get over-classified as a real defect.
-        const classifyTestFailure = (message: string | null): { failureClass: string; failureLabel: string } => {
-          if (!message) return { failureClass: "unknown", failureLabel: "No error detail captured" };
+        const classifyTestFailure = (message: string | null): { failureClass: string; failureLabel: string; failureCategory: string } => {
+          if (!message) return { failureClass: "unknown", failureLabel: "No error detail captured", failureCategory: "UNKNOWN" };
           const m = message.toLowerCase();
-          if (/syntaxerror|typeerror.*invalid url|invalid url/.test(m)) {
-            return { failureClass: "automation_issue", failureLabel: "Automation script issue -- the generated script itself is malformed (syntax/invalid input), not a product defect" };
+          if (/page crashed|target closed|browser has been closed|playwright\.connection/.test(m)) {
+            return { failureClass: "environment_issue", failureLabel: "Page/browser crashed during the test", failureCategory: "PAGE_CRASH" };
           }
           if (/net::err_|err_connection_refused|err_name_not_resolved|err_connection_timed_out|err_connection_reset|err_internet_disconnected/.test(m)) {
-            return { failureClass: "environment_issue", failureLabel: "Target unreachable (network/environment issue, not a product defect)" };
+            return { failureClass: "environment_issue", failureLabel: "Target unreachable (network/environment issue, not a product defect)", failureCategory: "NETWORK_FAILURE" };
           }
-          if (/returned http [45]\d\d|response\.ok|tohavetitle.*received|tobevisible.*received|not visible|404|page not found|internal server error/.test(m)) {
-            return { failureClass: "possible_bug", failureLabel: "Possible product bug -- page content or HTTP response did not match expectations" };
+          if (/401|403|unauthorized|forbidden|login required|session expired|not authenticated/.test(m) && /expect|status|goto|navigation/.test(m)) {
+            return { failureClass: "environment_issue", failureLabel: "Authentication/session failure — not a locator issue", failureCategory: "AUTHENTICATION_FAILURE" };
           }
-          if (/expect\(.*\)\.|assert/.test(m)) {
-            return { failureClass: "possible_bug", failureLabel: "Possible product bug -- an assertion did not match actual page/API content" };
+          if (/syntaxerror|typeerror.*invalid url|invalid url/.test(m)) {
+            return { failureClass: "automation_issue", failureLabel: "Automation script issue -- the generated script itself is malformed (syntax/invalid input), not a product defect", failureCategory: "UNKNOWN" };
           }
-          if (/(getbylabel|getbyrole|getbytext|getbytestid|getbyplaceholder|locator\()/.test(m) && /(timeout|waiting for)/.test(m)) {
-            return { failureClass: "automation_issue", failureLabel: "Automation script issue -- the generated locator didn't match anything on the page" };
+          if (/(getbylabel|getbyrole|getbytext|getbytestid|getbyplaceholder|getbyalttext|getbytitle|locator\()/.test(m) && /(timeout|waiting for|strict mode violation|resolved to \d+ elements)/.test(m)) {
+            return { failureClass: "automation_issue", failureLabel: "Locator failure -- the generated locator did not uniquely match the page (safe to consider healing)", failureCategory: "LOCATOR_FAILURE" };
           }
           if (/test timeout of \d+ms exceeded/.test(m)) {
-            if (/(getbylabel|getbyrole|getbytext|getbytestid|getbyplaceholder|locator\()/.test(m)) {
-              return { failureClass: "automation_issue", failureLabel: "Automation script issue -- step timed out before reaching an assertion" };
-            }
-            return { failureClass: "possible_bug", failureLabel: "Possible product bug -- the page did not become ready within the time limit (slow load, broken page, or blocked content)" };
+            return {
+              failureClass: "automation_issue",
+              failureLabel: "Timeout -- the test exceeded its time budget (slow load, missing wait, or insufficient timeout)",
+              failureCategory: "TIMEOUT",
+            };
           }
-          return { failureClass: "unknown", failureLabel: "Uncategorized failure -- review the error detail" };
+          if (/returned http [45]\d\d|response\.ok|internal server error|502 bad gateway|503 service/.test(m)) {
+            return { failureClass: "possible_bug", failureLabel: "Possible product bug -- HTTP/API response did not match expectations", failureCategory: "NETWORK_FAILURE" };
+          }
+          if (/tohavetitle.*received|tobevisible.*received|not visible|404|page not found/.test(m)) {
+            return { failureClass: "possible_bug", failureLabel: "Possible product bug -- page content did not match expectations (do not heal assertions)", failureCategory: "ASSERTION_FAILURE" };
+          }
+          if (/expect\(.*\)\.|assert/.test(m)) {
+            return { failureClass: "possible_bug", failureLabel: "Assertion failure -- expected application state did not match; healing is not recommended", failureCategory: "ASSERTION_FAILURE" };
+          }
+          if (/pageerror|javascript error|uncaught \(in promise\)/.test(m)) {
+            return { failureClass: "possible_bug", failureLabel: "JavaScript error on the page", failureCategory: "JAVASCRIPT_ERROR" };
+          }
+          return { failureClass: "unknown", failureLabel: "Uncategorized failure -- review the error detail", failureCategory: "UNKNOWN" };
         };
 
         // FR-6.5: per-failed-test evidence entries, parsed from Playwright's own JSON reporter
@@ -985,7 +998,7 @@ export function runExecution(scriptId: string, targetUrl: string, input: any = {
         // per-step implementation isn't attempted here; this is the honest partial improvement.
         try {
           const parsed = JSON.parse(stdout);
-          const failedTests: Array<{ title: string; file: string; status: string; errorMessage: string | null; failureClass: string; failureLabel: string }> = [];
+          const failedTests: Array<{ title: string; file: string; status: string; errorMessage: string | null; failureClass: string; failureLabel: string; failureCategory: string }> = [];
           const walkSuites = (suites: any[], filePrefix = "") => {
             for (const suite of suites ?? []) {
               const file = suite.file || filePrefix;
@@ -1004,7 +1017,7 @@ export function runExecution(scriptId: string, targetUrl: string, input: any = {
                     // eslint-disable-next-line no-control-regex
                     const stripAnsi = (s: string) => s.replace(/\x1b\[[0-9;]*m/g, "");
                     const errorMessage = rawMessage ? stripAnsi(String(rawMessage)).slice(0, 2000) : null;
-                    const { failureClass, failureLabel } = classifyTestFailure(errorMessage);
+                    const { failureClass, failureLabel, failureCategory } = classifyTestFailure(errorMessage);
                     failedTests.push({
                       title: spec.title,
                       file,
@@ -1012,6 +1025,7 @@ export function runExecution(scriptId: string, targetUrl: string, input: any = {
                       errorMessage,
                       failureClass,
                       failureLabel,
+                      failureCategory,
                     });
                   }
                 }
@@ -1023,8 +1037,8 @@ export function runExecution(scriptId: string, targetUrl: string, input: any = {
 
           if (failedTests.length > 0) {
             const insertEvidence = db.prepare(`
-              INSERT INTO execution_evidence (id, run_id, test_title, test_file, status, evidence_path, error_message, failure_class, failure_label, created_at)
-              VALUES (@id, @run_id, @test_title, @test_file, @status, @evidence_path, @error_message, @failure_class, @failure_label, @created_at)
+              INSERT INTO execution_evidence (id, run_id, test_title, test_file, status, evidence_path, error_message, failure_class, failure_label, failure_category, created_at)
+              VALUES (@id, @run_id, @test_title, @test_file, @status, @evidence_path, @error_message, @failure_class, @failure_label, @failure_category, @created_at)
             `);
             const evNow = new Date().toISOString();
             for (const ft of failedTests) {
@@ -1042,6 +1056,7 @@ export function runExecution(scriptId: string, targetUrl: string, input: any = {
                 error_message: ft.errorMessage,
                 failure_class: ft.failureClass,
                 failure_label: ft.failureLabel,
+                failure_category: ft.failureCategory,
                 created_at: evNow,
               });
 

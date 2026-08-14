@@ -7,7 +7,7 @@ import { api } from "../api.js";
 
 const DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
 
-export default function Execution() {
+export default function Execution({ compact = false }: { compact?: boolean }) {
   const {
     mode,
     profiles,
@@ -166,11 +166,13 @@ export default function Execution() {
     null;
 
   return (
-    <div className="space-y-6">
-      <div>
-        <h2 className="font-display text-xl tracking-tight">Execution</h2>
-        <p className="text-sm text-ink/60">Run profiles, queue, and pipeline controls</p>
-      </div>
+    <div className={compact ? "space-y-3" : "space-y-6"}>
+      {!compact && (
+        <div>
+          <h2 className="font-display text-xl tracking-tight">Execution</h2>
+          <p className="text-sm text-ink/60">Run profiles, queue, and pipeline controls</p>
+        </div>
+      )}
 
       {liveRunId && (
         <RealtimeExecutionDashboard
@@ -184,6 +186,7 @@ export default function Execution() {
       {/* FR-4.24: speed-mode toggle, positioned ahead of the profile dropdown. Ultrafast skips
           the Execution Settings Panel entirely (FR-4.25); Fast keeps the existing checkpointed
           flow (profile/environment confirmation + FR-2.4 review gate) below, unchanged. */}
+      {!compact && (
       <div className="rounded-lg border border-line bg-white/60 shadow-panel p-4 space-y-3">
         <div className="flex flex-wrap items-center gap-3">
           <p className="text-xs font-semibold uppercase tracking-wide text-ink/60">Speed mode (FR-4.24)</p>
@@ -273,6 +276,7 @@ export default function Execution() {
           </div>
         )}
       </div>
+      )}
 
       {/* FR-4.26: non-blocking queue of test cases Ultrafast routed below-threshold */}
       {needsReviewLaterCases.length > 0 && (

@@ -40,8 +40,8 @@ export default defineConfig({
   testDir: "./generated",
   // Fast timeouts cut idle waits that dominated the previous ~2.5h suite runs.
   timeout: isFast ? 25000 : 45000,
-  expect: { timeout: isFast ? 5000 : 10000 },
-  retries: 0,
+    expect: { timeout: isFast ? 8000 : 10000 },
+    retries: process.env.RETRY_STRATEGY === "retry-all" ? 2 : process.env.RETRY_STRATEGY === "retry-flaky" ? 1 : 0,
   workers,
   fullyParallel: true,
   forbidOnly: false,
@@ -60,7 +60,7 @@ export default defineConfig({
     trace: traceSetting,
     headless: headlessSetting,
     navigationTimeout: isFast ? 15000 : 30000,
-    actionTimeout: isFast ? 8000 : 15000,
+    actionTimeout: isFast ? 10000 : 15000,
   },
   projects: [
     { name: "chromium", use: { ...devices["Desktop Chrome"] } },

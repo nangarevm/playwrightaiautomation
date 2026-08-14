@@ -9,6 +9,13 @@ import Reports from "./Reports.js";
 
 type Step = "input" | "generate" | "execute" | "report";
 
+const FAST_STEPS: { key: Step; label: string; hint: string }[] = [
+  { key: "input", label: "Input", hint: "Add a website, file, or description" },
+  { key: "generate", label: "Review", hint: "Approve generated test cases" },
+  { key: "execute", label: "Run", hint: "Execute tests" },
+  { key: "report", label: "Report", hint: "View results" },
+];
+
 // The core end-to-end flow: Input -> Generate & Review -> Execute -> Report, all
 // under one nav entry. Ultrafast Mode replaces the step tabs entirely with
 // UltrafastRunner (FR-4.25: zero intermediate screens). Fast Mode keeps every
@@ -19,33 +26,25 @@ export default function Run() {
   const [step, setStep] = useState<Step>("input");
 
   return (
-    <div className="space-y-4">
-      <div className="flex flex-wrap items-start justify-between gap-3">
-        <div>
-          <h2 className="font-display text-lg tracking-tight">Run</h2>
-          <p className="text-xs text-ink/60">Input → Generate → Execute → Report</p>
+    <div className="space-y-3 max-w-3xl">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div className="flex items-center rounded-full border border-line bg-white/60 p-0.5 text-xs">
+          <button
+            className={`rounded-full px-3 py-1.5 font-medium ${speedMode === "ultrafast" ? "bg-ink text-paper" : "text-ink/60"}`}
+            onClick={() => setSpeedMode("ultrafast")}
+          >
+            Ultrafast
+          </button>
+          <button
+            className={`rounded-full px-3 py-1.5 font-medium ${speedMode === "fast" ? "bg-ink text-paper" : "text-ink/60"}`}
+            onClick={() => setSpeedMode("fast")}
+          >
+            Fast
+          </button>
         </div>
-        <div className="flex flex-col items-end gap-0.5">
-          <div className="flex items-center rounded-full border border-line bg-white/60 p-0.5 text-xs">
-            <button
-              className={`rounded-full px-3.5 py-1.5 font-medium ${speedMode === "ultrafast" ? "bg-ink text-paper" : "text-ink/60"}`}
-              onClick={() => setSpeedMode("ultrafast")}
-            >
-              Ultrafast
-            </button>
-            <button
-              className={`rounded-full px-3.5 py-1.5 font-medium ${speedMode === "fast" ? "bg-ink text-paper" : "text-ink/60"}`}
-              onClick={() => setSpeedMode("fast")}
-            >
-              Fast
-            </button>
-          </div>
-          <span className="text-xs text-ink/50 max-w-xs text-right">
-            {speedMode === "ultrafast"
-              ? "Fully automatic — no review or confirmation steps."
-              : "You review and confirm each step before it runs."}
-          </span>
-        </div>
+        <p className="text-xs text-ink/50">
+          {speedMode === "ultrafast" ? "Automatic — crawl, test, report" : "Step-by-step with review at each stage"}
+        </p>
       </div>
 
       {speedMode === "ultrafast" ? (
@@ -53,27 +52,23 @@ export default function Run() {
       ) : (
         <div className="space-y-3">
           <TabBar<Step>
-            tabs={[
-              { key: "input", label: "1. Input" },
-              { key: "generate", label: "2. Generate & review" },
-              { key: "execute", label: "3. Execute" },
-              { key: "report", label: "4. Report" },
-            ]}
+            tabs={FAST_STEPS.map(({ key, label }) => ({ key, label }))}
             active={step}
             onChange={setStep}
           />
+          <p className="text-xs text-ink/45 -mt-1">{FAST_STEPS.find((s) => s.key === step)?.hint}</p>
 
           <div style={{ display: step === "input" ? "block" : "none" }}>
-            <Projects />
+            <Projects compact />
           </div>
           <div style={{ display: step === "generate" ? "block" : "none" }}>
-            <AiStudio />
+            <AiStudio compact />
           </div>
           <div style={{ display: step === "execute" ? "block" : "none" }}>
-            <Execution />
+            <Execution compact />
           </div>
           <div style={{ display: step === "report" ? "block" : "none" }}>
-            <Reports />
+            <Reports compact />
           </div>
         </div>
       )}

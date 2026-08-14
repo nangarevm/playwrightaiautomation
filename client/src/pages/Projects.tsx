@@ -58,11 +58,11 @@ function GenerationStatusPill({ status }: { status?: string }) {
   }
 }
 
-const TABS: { key: Tab; icon: string; label: string }[] = [
-  { key: "upload", icon: "📄", label: "Upload Files" },
-  { key: "crawl", icon: "🌐", label: "Live URL Crawl" },
-  { key: "integrations", icon: "🔌", label: "Integrations" },
-  { key: "freetext", icon: "✍️", label: "Free-text Scenario" },
+const TABS: { key: Tab; label: string }[] = [
+  { key: "crawl", label: "Website" },
+  { key: "upload", label: "Upload files" },
+  { key: "freetext", label: "Describe" },
+  { key: "integrations", label: "Integrations" },
 ];
 
 const btnPrimary =
@@ -151,7 +151,7 @@ function EmptyState({ icon, text }: { icon: string; text: string }) {
 const UPLOAD_ACCEPT =
   "image/png,image/jpeg,image/jpg,video/mp4,video/webm,video/avi,video/mov,.pdf,.docx,.xlsx,.xls,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel";
 
-export default function Projects() {
+export default function Projects({ compact = false }: { compact?: boolean }) {
   const {
     inputs,
     draftInput,
@@ -193,8 +193,9 @@ export default function Projects() {
     setError,
   } = useApp();
 
-  const [tab, setTab] = useState<Tab>("freetext");
+  const [tab, setTab] = useState<Tab>("crawl");
   const [integrationTab, setIntegrationTab] = useState<IntegrationTab>("api");
+  const [showCrawlAuth, setShowCrawlAuth] = useState(false);
 
   // Classify a mixed drop/pick of files across the two upload endpoints this
   // tab now fronts: images/video -> /inputs/upload, everything else (pdf/
@@ -212,66 +213,90 @@ export default function Projects() {
   const pendingUploadCount = screenshots.length + videos.length + documents.length;
 
   return (
-    <div className="space-y-6">
-      <div>
-        <h2 className="font-display text-xl tracking-tight">Projects</h2>
-        <p className="text-sm text-ink/60">Bring in requirements, docs, and scenarios to analyze</p>
-      </div>
+    <div className={compact ? "space-y-3" : "space-y-6"}>
+      {!compact && (
+        <>
+          <div>
+            <h2 className="font-display text-xl tracking-tight">Projects</h2>
+            <p className="text-sm text-ink/60">Bring in requirements, docs, and scenarios to analyze</p>
+          </div>
+          <div className="rounded-lg border border-line bg-white/60 shadow-panel p-3">
+            <div className="flex flex-wrap items-center gap-2 text-xs text-ink/60">
+              <Pill tone="good">1 · Analyze</Pill>
+              <span className="text-ink/30">→</span>
+              <Pill>2 · Generate</Pill>
+              <span className="text-ink/30">→</span>
+              <Pill>3 · Execute</Pill>
+              <span className="ml-auto text-ink/50">Business rules carry across every input type</span>
+            </div>
+          </div>
+        </>
+      )}
 
-      <div className="rounded-lg border border-line bg-white/60 shadow-panel p-3">
-        <div className="flex flex-wrap items-center gap-2 text-xs text-ink/60">
-          <Pill tone="good">1 · Analyze</Pill>
-          <span className="text-ink/30">→</span>
-          <Pill>2 · Generate</Pill>
-          <span className="text-ink/30">→</span>
-          <Pill>3 · Execute</Pill>
-          <span className="ml-auto text-ink/50">Business rules and thresholds carry across every input type</span>
-        </div>
-      </div>
-
-      <div className="grid grid-cols-[220px_1fr] gap-4">
-        <ul className="space-y-1.5">
-          {TABS.map((t) => (
-            <li key={t.key}>
+      <div className={compact ? "space-y-3" : "grid grid-cols-[220px_1fr] gap-4"}>
+        {compact ? (
+          <div className="flex flex-wrap gap-1.5">
+            {TABS.map((t) => (
               <button
-                className={`w-full flex items-center gap-2.5 rounded-md border px-3 py-2.5 text-left text-sm font-medium transition-all duration-150 ${
-                  tab === t.key
-                    ? "border-ink bg-ink text-paper shadow-sm"
-                    : "border-line bg-white/50 text-ink/70 hover:border-ink/30 hover:bg-ink/5 hover:text-ink"
+                key={t.key}
+                type="button"
+                className={`rounded-full px-3 py-1.5 text-xs font-medium transition ${
+                  tab === t.key ? "bg-ink text-paper" : "border border-line text-ink/60 hover:border-ink/40"
                 }`}
                 onClick={() => setTab(t.key)}
               >
-                <span className="text-base leading-none">{t.icon}</span>
-                <span>{t.label}</span>
+                {t.label}
               </button>
-            </li>
-          ))}
-        </ul>
+            ))}
+          </div>
+        ) : (
+          <ul className="space-y-1.5">
+            {TABS.map((t) => (
+              <li key={t.key}>
+                <button
+                  className={`w-full flex items-center gap-2.5 rounded-md border px-3 py-2.5 text-left text-sm font-medium transition-all duration-150 ${
+                    tab === t.key
+                      ? "border-ink bg-ink text-paper shadow-sm"
+                      : "border-line bg-white/50 text-ink/70 hover:border-ink/30 hover:bg-ink/5 hover:text-ink"
+                  }`}
+                  onClick={() => setTab(t.key)}
+                >
+                  <span>{t.label}</span>
+                </button>
+              </li>
+            ))}
+          </ul>
+        )}
 
-        <div className="min-h-[440px] rounded-lg border border-line bg-white/60 shadow-panel p-4">
+        <div className={`rounded-lg border border-line bg-white/60 shadow-panel ${compact ? "p-4 space-y-3" : "min-h-[440px] p-4"}`}>
           {tab === "freetext" && (
             <div className="space-y-3">
-              <p className="text-sm font-medium">Free-text scenario or ticket description (FR-1.7)</p>
-              <textarea
-                className={`w-full ${fieldClass} p-3 font-mono`}
-                rows={5}
-                value={draftInput}
-                onChange={(e) => setDraftInput(e.target.value)}
-              />
-              <textarea
-                className={`w-full ${fieldClass}`}
-                rows={2}
-                placeholder="Business rules / approval thresholds"
-                value={businessRules}
-                onChange={(e) => setBusinessRules(e.target.value)}
-              />
+              <label className="block space-y-1">
+                <span className="text-xs font-medium text-ink/70">What should be tested?</span>
+                <textarea
+                  className={`w-full ${fieldClass} p-3`}
+                  rows={compact ? 3 : 5}
+                  placeholder="e.g. Login page with username, password, and a Log in button…"
+                  value={draftInput}
+                  onChange={(e) => setDraftInput(e.target.value)}
+                />
+              </label>
+              {!compact && (
+                <textarea
+                  className={`w-full ${fieldClass}`}
+                  rows={2}
+                  placeholder="Business rules / approval thresholds"
+                  value={businessRules}
+                  onChange={(e) => setBusinessRules(e.target.value)}
+                />
+              )}
               <button
                 className={btnPrimary}
-                disabled={busy === "ingest"}
+                disabled={busy === "ingest" || !draftInput.trim()}
                 onClick={() =>
                   withBusy("ingest", async () => {
                     const text = draftInput.trim();
-                    const input = await api.createInput(text || "Upload context from screenshots/videos or free text.", "free_text", businessRules.trim());
+                    const input = await api.createInput(text, "free_text", businessRules.trim() || undefined);
                     if (screenshots.length > 0 || videos.length > 0) {
                       await api.uploadFiles(screenshots, videos);
                     }
@@ -280,7 +305,7 @@ export default function Projects() {
                 }
               >
                 {busy === "ingest" && <Spinner className="h-3.5 w-3.5" />}
-                {busy === "ingest" ? "Generating test cases…" : "Submit & generate test cases"}
+                {busy === "ingest" ? "Generating…" : "Generate test cases"}
               </button>
             </div>
           )}
@@ -288,17 +313,18 @@ export default function Projects() {
           {tab === "upload" && (
             <div className="space-y-3">
               <div className="rounded-md border border-line bg-white/50 p-3">
-                <p className="text-sm font-medium">Upload files (FR-1.1/FR-1.2a/FR-1.7)</p>
-                <p className="mt-1 text-xs text-ink/60">
-                  Drop or choose any mix of screenshots (JPG/PNG), videos (MP4/MOV/WebM/AVI), and documents (PDF, Word, Excel) —
-                  each file is routed to the right parser automatically and they upload together in a single action.
-                  Unsupported formats are rejected with a clear error, not silently dropped.
-                </p>
-
+                {!compact && (
+                  <>
+                    <p className="text-sm font-medium">Upload files</p>
+                    <p className="mt-1 text-xs text-ink/60">
+                      Drop screenshots, videos, or documents (PDF, Word, Excel) — routed automatically.
+                    </p>
+                  </>
+                )}
                 <DropZone
                   accept={UPLOAD_ACCEPT}
                   onFiles={handleUploadFiles}
-                  hint="Drag files here, or"
+                  hint={compact ? "Drop files here or choose" : "Drag files here, or"}
                 />
 
                 {pendingUploadCount > 0 && (
@@ -453,59 +479,74 @@ export default function Projects() {
 
           {tab === "crawl" && (
             <div className="space-y-3">
-              <p className="text-sm font-medium">Live URL Crawl</p>
-              <input
-                className={`w-full ${fieldClass}`}
-                placeholder="https://example.com"
-                value={batchUrl}
-                onChange={(e) => setBatchUrl(e.target.value)}
-              />
-              <div className="space-y-2 rounded-md border border-line bg-white/50 p-3">
-                <p className="text-xs font-semibold uppercase tracking-wide text-ink/60">
-                  Optional authentication (FR-1.3a/FR-1.3b) — crawl pages behind a login wall
-                </p>
-                <div className="grid gap-2 sm:grid-cols-2">
-                  <input
-                    className={fieldClass}
-                    placeholder="Username"
-                    value={crawlUsername}
-                    onChange={(e) => setCrawlUsername(e.target.value)}
-                  />
-                  <input
-                    className={fieldClass}
-                    type="password"
-                    placeholder="Password"
-                    value={crawlPassword}
-                    onChange={(e) => setCrawlPassword(e.target.value)}
-                  />
-                </div>
+              <label className="block space-y-1">
+                <span className="text-xs font-medium text-ink/70">Website URL</span>
                 <input
                   className={`w-full ${fieldClass}`}
-                  placeholder="Or a session token/cookie (used instead of username/password)"
-                  value={crawlSessionToken}
-                  onChange={(e) => setCrawlSessionToken(e.target.value)}
+                  placeholder="https://your-site.com"
+                  value={batchUrl}
+                  onChange={(e) => setBatchUrl(e.target.value)}
                 />
-                <p className="text-xs text-ink/50">
-                  Credentials are used only in-memory for this crawl request — they are never logged or stored here. To reuse credentials across runs, save them as an Environment instead.
-                </p>
-              </div>
-              <button
-                className={btnGhost}
-                disabled={busy === "crawl"}
-                onClick={() =>
-                  withBusy("crawl", async () => {
-                    if (!batchUrl.trim()) throw new Error("Enter a URL first.");
-                    await api.crawlUrl(batchUrl.trim(), 2, {
-                      username: crawlUsername.trim() || undefined,
-                      password: crawlPassword.trim() || undefined,
-                      sessionToken: crawlSessionToken.trim() || undefined,
-                    });
-                  })
-                }
-              >
-                {busy === "crawl" && <Spinner />}
-                {busy === "crawl" ? "Crawling…" : "Crawl URL"}
-              </button>
+              </label>
+              {compact ? (
+                <>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <button
+                      className={btnPrimary}
+                      disabled={busy === "crawl" || !batchUrl.trim()}
+                      onClick={() =>
+                        withBusy("crawl", async () => {
+                          await api.crawlUrl(batchUrl.trim(), 2, {
+                            username: crawlUsername.trim() || undefined,
+                            password: crawlPassword.trim() || undefined,
+                            sessionToken: crawlSessionToken.trim() || undefined,
+                          });
+                        })
+                      }
+                    >
+                      {busy === "crawl" && <Spinner className="h-3.5 w-3.5" />}
+                      {busy === "crawl" ? "Crawling…" : "Crawl website"}
+                    </button>
+                    <button type="button" className="text-xs text-ink/50 underline-offset-2 hover:underline" onClick={() => setShowCrawlAuth((v) => !v)}>
+                      {showCrawlAuth ? "Hide login" : "Login required?"}
+                    </button>
+                  </div>
+                  {showCrawlAuth && (
+                    <div className="grid gap-2 sm:grid-cols-2">
+                      <input className={fieldClass} placeholder="Username" value={crawlUsername} onChange={(e) => setCrawlUsername(e.target.value)} />
+                      <input className={fieldClass} type="password" placeholder="Password" value={crawlPassword} onChange={(e) => setCrawlPassword(e.target.value)} />
+                    </div>
+                  )}
+                </>
+              ) : (
+                <>
+                  <div className="space-y-2 rounded-md border border-line bg-white/50 p-3">
+                    <p className="text-xs font-semibold uppercase tracking-wide text-ink/60">Optional authentication</p>
+                    <div className="grid gap-2 sm:grid-cols-2">
+                      <input className={fieldClass} placeholder="Username" value={crawlUsername} onChange={(e) => setCrawlUsername(e.target.value)} />
+                      <input className={fieldClass} type="password" placeholder="Password" value={crawlPassword} onChange={(e) => setCrawlPassword(e.target.value)} />
+                    </div>
+                    <input className={`w-full ${fieldClass}`} placeholder="Session token (optional)" value={crawlSessionToken} onChange={(e) => setCrawlSessionToken(e.target.value)} />
+                  </div>
+                  <button
+                    className={btnGhost}
+                    disabled={busy === "crawl"}
+                    onClick={() =>
+                      withBusy("crawl", async () => {
+                        if (!batchUrl.trim()) throw new Error("Enter a URL first.");
+                        await api.crawlUrl(batchUrl.trim(), 2, {
+                          username: crawlUsername.trim() || undefined,
+                          password: crawlPassword.trim() || undefined,
+                          sessionToken: crawlSessionToken.trim() || undefined,
+                        });
+                      })
+                    }
+                  >
+                    {busy === "crawl" && <Spinner />}
+                    {busy === "crawl" ? "Crawling…" : "Crawl URL"}
+                  </button>
+                </>
+              )}
             </div>
           )}
 
@@ -631,29 +672,26 @@ export default function Projects() {
         </div>
       </div>
 
-      <div className="rounded-lg border border-line bg-white/60 shadow-panel p-4">
-        <p className="mb-2 text-xs font-semibold uppercase tracking-wide text-ink/60">Inputs</p>
-        {inputs.length === 0 ? (
-          <EmptyState icon="🗂️" text="No inputs yet. Upload a document, crawl a URL, or write a scenario above to get started." />
-        ) : (
-          <ul className="space-y-1 text-sm text-ink/70">
-            {inputs.map((i) => (
-              <li
-                key={i.id}
-                className="animate-fade-slide-in flex items-center gap-2 rounded-md border border-line bg-white/50 p-2"
-              >
-                <span className="font-mono text-xs text-ink/40">{i.id}</span>
-                <span className="flex-1 truncate">{i.content}</span>
-                <Pill tone="good">
-                  <CheckIcon /> Parsed
-                </Pill>
+      {inputs.length > 0 && (
+        <div className={`rounded-lg border border-line bg-white/60 shadow-panel ${compact ? "p-3" : "p-4"}`}>
+          <p className="mb-2 text-xs font-medium text-ink/60">{inputs.length} input(s) ready — go to Review</p>
+          <ul className="space-y-1 text-xs text-ink/70">
+            {inputs.slice(0, compact ? 5 : undefined).map((i) => (
+              <li key={i.id} className="flex items-center gap-2 rounded-md border border-line bg-white/50 px-2 py-1.5">
+                <span className="flex-1 truncate">{i.content.slice(0, 80)}{i.content.length > 80 ? "…" : ""}</span>
                 <GenerationStatusPill status={i.generation_status} />
-                <span className="text-xs text-ink/40">{i.type}</span>
               </li>
             ))}
+            {compact && inputs.length > 5 && <li className="text-ink/40 px-1">+{inputs.length - 5} more</li>}
           </ul>
-        )}
-      </div>
+        </div>
+      )}
+      {!compact && inputs.length === 0 && (
+        <div className="rounded-lg border border-line bg-white/60 shadow-panel p-4">
+          <p className="mb-2 text-xs font-semibold uppercase tracking-wide text-ink/60">Inputs</p>
+          <EmptyState icon="🗂️" text="No inputs yet. Upload a document, crawl a URL, or write a scenario above to get started." />
+        </div>
+      )}
     </div>
   );
 }

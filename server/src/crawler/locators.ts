@@ -1,16 +1,21 @@
 // Phase 2: locator extraction + priority ranking.
 //
-// Priority order (highest first), matching the brief exactly:
+// Priority order (highest first):
 //   1. data-testid/data-test/data-qa
-//   2. ARIA role + accessible name (getByRole)
-//   3. id
-//   4. label/visible text (getByText/getByLabel)
-//   5. CSS selector fallback
-//   6. XPath (last resort)
+//   2. ARIA role + accessible name (getByRole) — loading-state labels stripped
+//   3. label (getByLabel) / placeholder (getByPlaceholder)
+//   4. id / name attribute (CSS fallback)
+//   5. visible text (getByText)
+//   6. CSS selector / XPath (last resort)
 //
 // Only the top 2-3 candidates are kept per element (self-healing fallback set).
 
 import type { Locator, Page } from "playwright";
+import {
+  pickPreferredLocator,
+  scoreStableLocator,
+  stripTransientLoadingLabel,
+} from "./locatorQuality.js";
 
 export interface RankedLocators {
   locators: string[]; // Playwright-expression strings, ranked best-first
@@ -51,19 +56,38 @@ export async function extractElementLocators(page: Page, handle: Locator): Promi
         ? "button"
         : tag === "a"
           ? "link"
-          : tag === "input"
-            ? el.getAttribute("type") === "checkbox"
-              ? "checkbox"
-              : "textbox"
-            : tag === "select"
-              ? "combobox"
-              : null);
+          : tag === "textarea"
+            ? "textbox"
+            : tag === "input"
+              ? el.getAttribute("type") === "checkbox"
+                ? "checkbox"
+                : el.getAttribute("type") === "search"
+                  ? "searchbox"
+                  : el.getAttribute("type") === "radio"
+                    ? "radio"
+                    : el.getAttribute("type") === "submit" || el.getAttribute("type") === "button"
+                      ? "button"
+                      : "textbox"
+              : tag === "select"
+                ? "combobox"
+                : null);
     const id = el.id || null;
     const name = el.getAttribute("name") || null;
+    // Prefer direct/own text over deep textContent so nested "Sending…" spans
+    // on submit buttons are not concatenated into the accessible name.
+    const ownText = Array.from(el.childNodes)
+      .filter((n) => n.nodeType === Node.TEXT_NODE)
+      .map((n) => (n.textContent || "").trim())
+      .filter(Boolean)
+      .join(" ");
+    const valueText =
+      tag === "input" || tag === "button" ? String((el as HTMLInputElement).value || "").trim() : "";
     // Collapse multi-line/wrapped element text so scenario titles/steps stay single-line.
-    const text = (el.textContent || "").replace(/\s+/g, " ").trim().slice(0, 60);
+    const text = (ownText || valueText || el.textContent || "").replace(/\s+/g, " ").trim().slice(0, 60);
     const ariaLabel = el.getAttribute("aria-label");
     const placeholder = el.getAttribute("placeholder");
+    const alt = el.getAttribute("alt");
+    const title = el.getAttribute("title");
 
     let labelText: string | null = null;
     if (id) {
@@ -76,7 +100,9 @@ export async function extractElementLocators(page: Page, handle: Locator): Promi
     }
 
     const href = tag === "a" ? el.getAttribute("href") : null;
-    const accessibleNameRaw = ariaLabel || labelText || text || placeholder || null;
+    // Prefer aria/label/placeholder over raw concatenated text for controls.
+    const accessibleNameRaw =
+      ariaLabel || labelText || (tag === "button" || role === "button" ? ownText || valueText || text : text) || placeholder || null;
     const accessibleName =
       accessibleNameRaw && !/^(https?:\/\/|www\.|mailto:)/i.test(accessibleNameRaw.trim())
         ? accessibleNameRaw
@@ -113,6 +139,10 @@ export async function extractElementLocators(page: Page, handle: Locator): Promi
       name,
       href,
       accessibleName,
+      labelText,
+      placeholder,
+      alt,
+      title,
       elementType,
       required: el.hasAttribute("required"),
       inputType: tag === "input" ? el.getAttribute("type") || "text" : null,
@@ -121,65 +151,85 @@ export async function extractElementLocators(page: Page, handle: Locator): Promi
     };
   });
 
-  const locators: string[] = [];
+  const cleanName = info.accessibleName ? stripTransientLoadingLabel(info.accessibleName) : "";
+  const cleanLabel = info.labelText ? stripTransientLoadingLabel(info.labelText) : "";
+  const cleanPlaceholder = info.placeholder ? stripTransientLoadingLabel(info.placeholder) : "";
+  const cleanAlt = info.alt ? stripTransientLoadingLabel(info.alt) : "";
+  const cleanTitle = info.title ? stripTransientLoadingLabel(info.title) : "";
+
+  const candidates: string[] = [];
 
   // 1. data-testid/data-test/data-qa
   if (info.testId) {
-    locators.push(`page.getByTestId(${JSON.stringify(info.testId)})`);
+    candidates.push(`page.getByTestId(${JSON.stringify(info.testId)})`);
   }
-  // 2. ARIA role + accessible name (skip URL-like names — they fail getByRole matching)
-  if (info.role && info.accessibleName && !/^(https?:\/\/|www\.|mailto:)/i.test(info.accessibleName)) {
-    locators.push(`page.getByRole(${JSON.stringify(info.role)}, { name: ${JSON.stringify(info.accessibleName)} })`);
+  // 2. ARIA role + accessible name (skip URL-like / empty names)
+  if (info.role && cleanName && !/^(https?:\/\/|www\.|mailto:)/i.test(cleanName)) {
+    candidates.push(`page.getByRole(${JSON.stringify(info.role)}, { name: ${JSON.stringify(cleanName)} })`);
+  }
+  // 3. label / placeholder (prefer over raw #id for form fields)
+  if (cleanLabel && (info.tag === "input" || info.tag === "select" || info.tag === "textarea")) {
+    candidates.push(`page.getByLabel(${JSON.stringify(cleanLabel)})`);
+  }
+  if (cleanPlaceholder && (info.tag === "input" || info.tag === "textarea")) {
+    candidates.push(`page.getByPlaceholder(${JSON.stringify(cleanPlaceholder)})`);
+  }
+  if (cleanAlt && (info.tag === "img" || info.tag === "area" || info.role === "img")) {
+    candidates.push(`page.getByAltText(${JSON.stringify(cleanAlt)})`);
+  }
+  if (cleanTitle) {
+    candidates.push(`page.getByTitle(${JSON.stringify(cleanTitle)})`);
+  }
+  if (info.closestFormLabel && info.role && cleanName) {
+    candidates.push(
+      `page.locator("form").filter({ hasText: ${JSON.stringify(info.closestFormLabel)} }).getByRole(${JSON.stringify(info.role)}, { name: ${JSON.stringify(cleanName)} })`
+    );
   }
   // 2b. Links with no usable accessible name: target by href
-  if (info.tag === "a" && info.href && (!info.accessibleName || /^(https?:\/\/|www\.)/i.test(info.accessibleName))) {
-    locators.push(`page.locator(${JSON.stringify(`a[href="${escapeForAttrSelector(info.href)}"]`)})`);
+  if (info.tag === "a" && info.href && (!cleanName || /^(https?:\/\/|www\.)/i.test(cleanName))) {
+    candidates.push(`page.locator(${JSON.stringify(`a[href="${escapeForAttrSelector(info.href)}"]`)})`);
   }
-  // 3. id (prefer over generic CSS, most specific)
+  // 4. id / name attribute (CSS fallback — brittle, ranked lower)
   if (info.id) {
-    locators.push(`page.locator("#${escapeForAttrSelector(info.id)}")`);
+    candidates.push(`page.locator("#${escapeForAttrSelector(info.id)}")`);
   }
-  // 3b. name attribute (for form inputs, often more reliable than type-only selectors)
   if (info.name && (info.tag === "input" || info.tag === "select" || info.tag === "textarea")) {
-    locators.push(`page.locator("[name=${JSON.stringify(info.name)}]")`);
+    candidates.push(`page.locator("[name=${JSON.stringify(info.name)}]")`);
   }
-  // 4. label/visible text
-  if (info.accessibleName) {
-    locators.push(`page.getByText(${JSON.stringify(info.accessibleName)}, { exact: false })`);
+  // 5. label/visible text
+  if (cleanName) {
+    candidates.push(`page.getByText(${JSON.stringify(cleanName)}, { exact: false })`);
   }
-  // 5. CSS selector fallback (only if we still have fewer than 3 candidates)
-  // For form inputs, prioritize more specific selectors over generic type selectors
-  if (locators.length < 3) {
+  // 6. CSS selector fallback (only if we still have fewer than 3 candidates after ranking)
+  if (candidates.length < 3) {
     let css: string | null = null;
-    
-    // Prefer id-based selectors for unambiguous targeting
-    if (info.id) {
+
+    if (info.id && !/^(?:ember|react|vue)?-?\d{5,}$/i.test(info.id)) {
       css = `#${escapeForAttrSelector(info.id)}`;
-    }
-    // For inputs within forms, use form context to disambiguate
-    else if (info.tag === "input" && info.closestFormLabel) {
-      // Use form with input type: more specific than bare input[type="text"]
+    } else if (info.tag === "input" && info.closestFormLabel) {
       css = `form:has-text("${info.closestFormLabel}") ${info.tag}${info.inputType ? `[type="${info.inputType}"]` : ""}`;
-    }
-    // Fallback: generic tag selector (only for non-input or standalone elements)
-    else if (info.tag !== "input" || !info.inputType) {
+    } else if (info.tag !== "input" || !info.inputType) {
       css = info.tag;
     }
-    
-    if (css) {
-      locators.push(`page.locator(${JSON.stringify(css)})`);
+
+    if (css && !/\.(?:css|sc)-[a-zA-Z0-9_-]{4,}/.test(css)) {
+      candidates.push(`page.locator(${JSON.stringify(css)})`);
     }
   }
-  // 6. XPath, last resort, only if nothing better was found at all
-  if (locators.length === 0) {
-    locators.push(`page.locator("xpath=//${info.tag}")`);
+  // 7. XPath, last resort, only if nothing better was found at all
+  if (candidates.length === 0) {
+    candidates.push(`page.locator("xpath=//${info.tag}")`);
   }
+
+  const unique = Array.from(new Set(candidates));
+  unique.sort((a, b) => scoreStableLocator(b) - scoreStableLocator(a));
+  const locators = unique.slice(0, 5);
 
   if (locators.length === 0) return null;
 
   return {
-    locators: locators.slice(0, 3),
-    label: info.accessibleName || info.id || info.tag,
+    locators,
+    label: cleanName || cleanLabel || cleanPlaceholder || info.id || info.tag,
     type: info.elementType,
     component: guessComponentName(info),
     // Previously computed here but never returned, so buildFormScenarios in
@@ -192,4 +242,4 @@ export async function extractElementLocators(page: Page, handle: Locator): Promi
   };
 }
 
-export { INTERACTIVE_SELECTOR };
+export { INTERACTIVE_SELECTOR, pickPreferredLocator, scoreStableLocator, stripTransientLoadingLabel };

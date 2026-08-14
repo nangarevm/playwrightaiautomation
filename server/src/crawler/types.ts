@@ -22,6 +22,8 @@ export interface CrawlOptions {
   coverageMode?: CoverageMode;
   /** Previously discovered page URLs for this site -- seeded first on re-crawl so coverage isn't lost. */
   knownUrls?: string[];
+  /** Max BFS hops from the start URL (default 20). */
+  maxDepth?: number;
   /** Baseline lookup used during discovery for early unchanged short-circuit (incremental mode). */
   getBaseline?: (url: string) => PageBaselineMeta | null;
   onProgress?: (progress: CrawlProgress) => void;
@@ -39,6 +41,12 @@ export interface PageBaselineMeta {
   title?: string | null;
   a11yHash?: string | null;
   screenshotHash?: string | null;
+  /** Same-origin outbound links stored on the last scan -- replayed into the nav graph when this page is cheap-skipped. */
+  links?: Array<{ url: string; label: string }>;
+  httpStatus?: number | null;
+  priorChangeStatus?: string | null;
+  snapshot?: PageSnapshot | null;
+  missCount?: number;
 }
 
 export interface CrawlProgress {
@@ -144,10 +152,30 @@ export interface PageRecord {
   spellingIssues: SpellingIssue[];
 }
 
+export interface PageSnapshot {
+  title?: string | null;
+  description?: string | null;
+  h1?: string | null;
+  robots?: string | null;
+  canonical?: string | null;
+  httpStatus?: number | null;
+  finalUrl?: string | null;
+  wordCount?: number;
+  images?: Array<{ src: string; alt: string }>;
+}
+
+export interface ChangeEvent {
+  type: string;
+  severity: "critical" | "high" | "medium" | "low";
+  oldValue?: string;
+  newValue?: string;
+}
+
 export interface PageDiff {
   added: string[];
   removed: string[];
   changed: string[];
+  events?: ChangeEvent[];
 }
 
 export interface CrawlResult {

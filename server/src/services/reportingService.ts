@@ -1,6 +1,7 @@
 import PDFDocument from "pdfkit";
 import { utils, write } from "xlsx";
 import { db } from "../db.js";
+import { getHealingMetrics } from "./selfHealingService.js";
 
 // FR-6.7: estimated wall-clock per selection mode (SRS section 12.1), used to compute
 // actual-vs-estimated time and time saved. Midpoints of the documented ranges.
@@ -94,6 +95,7 @@ export function getDashboardSummary(range?: DateRange) {
       avgDurationMs: b.runs === 0 ? 0 : Math.round(b.totalDurationMs / b.runs),
     })),
     range: { startDate: range?.startDate ?? null, endDate: range?.endDate ?? null },
+    smartExecution: getHealingMetrics(),
   };
 }
 

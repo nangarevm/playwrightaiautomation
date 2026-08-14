@@ -7,7 +7,7 @@
 import { runDiscoveryCrawl, type DiscoveredPage } from "./discovery.js";
 import { buildCrudFlowScenario, buildFlowScenariosForSite, buildIntraPageFlowScenario, buildScenariosForPage } from "./scenarios.js";
 import { buildApiScenariosForSite } from "./apiScenarios.js";
-import { classifyChange, diffElements, hashElements, type ChangeStatus } from "./diff.js";
+import { classifyChange, compareLinkSets, compareSnapshots, diffElements, hashElements, type ChangeStatus } from "./diff.js";
 import { collectPageSpellingIssues } from "./spellcheck.js";
 import { dedupeScenariosFuzzy, scenarioFingerprint } from "./scenarioDedup.js";
 import { normalizeUrl } from "./urlUtils.js";
@@ -44,6 +44,9 @@ export interface CrawledPageOutput {
   changeSignals?: DiscoveredPage["changeSignals"];
   scanMode?: string;
   skippedHttp?: boolean;
+  links?: Array<{ url: string; label: string }>;
+  snapshot?: DiscoveredPage["snapshot"];
+  httpStatus?: number | null;
 }
 
 export interface CrawlRunOutput {
@@ -63,6 +66,17 @@ export interface CrawlRunOutput {
     skippedHttp?: number;
     scannedBrowser?: number;
     deepScans?: number;
+    coverage?: {
+      reachableHtmlPages: number;
+      sitemapUrls: number;
+      combinedUnique: number;
+      sitemapOnly: number;
+      externalLinks: number;
+      maxDepth: number;
+      statusCounts: Record<string, number>;
+      sitemapKeys?: string[];
+    };
+    restoredPages?: number;
   };
 }
 
@@ -73,7 +87,7 @@ export interface BaselineLookup {
 export async function runCrawl(options: CrawlOptions, getBaseline: BaselineLookup): Promise<CrawlRunOutput> {
   const mode = options.mode ?? "full";
   const coverageMode = resolveCoverageMode(options.coverageMode);
-  const { pages, edges, authenticated, authMessage } = await runDiscoveryCrawl({
+  const { pages, edges, authenticated, authMessage, coverage } = await runDiscoveryCrawl({
     ...options,
     mode,
     getBaseline,
@@ -83,11 +97,24 @@ export async function runCrawl(options: CrawlOptions, getBaseline: BaselineLooku
   const output: CrawledPageOutput[] = pages.map((discovered) => {
     const hash = hashElements(discovered.elements);
     const baseline = getBaseline(discovered.url);
-    // Reused baseline pages are unchanged by definition -- skip re-hash surprises
-    // from shallow vs deep locator differences.
-    const changeStatus: ChangeStatus = discovered.reusedBaseline
+    const snapshotEvents = compareSnapshots(baseline?.snapshot, discovered.snapshot);
+    const linkEvents = compareLinkSets(baseline?.links, discovered.links);
+    const events = [...snapshotEvents, ...linkEvents];
+    if (discovered.changeSignals?.structure === "changed") {
+      events.push({ type: "STRUCTURE_CHANGED", severity: "high" });
+    }
+    if (discovered.changeSignals?.visual === "changed") {
+      events.push({ type: "VISUAL_CHANGED", severity: "high" });
+    }
+
+    const priorState = (baseline?.priorChangeStatus || "").toLowerCase();
+    const wasGone = priorState === "removed" || priorState === "temporarily_unavailable";
+    let changeStatus: ChangeStatus = discovered.reusedBaseline
       ? "unchanged"
       : classifyChange(baseline?.hash, hash);
+    if (wasGone) changeStatus = "restored";
+    else if (discovered.errorCategory) changeStatus = "error";
+    else if (changeStatus === "unchanged" && events.length > 0) changeStatus = "changed";
     if (discovered.reusedBaseline) reusedBaselines++;
 
     let scenarios: ScenarioRecord[] = [];
@@ -110,8 +137,11 @@ export async function runCrawl(options: CrawlOptions, getBaseline: BaselineLooku
         scenarios = dedupeScenariosFuzzy(scenarios);
       }
     }
-    if (changeStatus === "changed" && baseline) {
+    if ((changeStatus === "changed" || changeStatus === "restored") && baseline) {
       diff = diffElements(baseline.elements, discovered.elements);
+      diff.events = events;
+    } else if (events.length) {
+      diff = { added: [], removed: [], changed: [], events };
     }
 
     options.onProgress?.({
@@ -130,7 +160,9 @@ export async function runCrawl(options: CrawlOptions, getBaseline: BaselineLooku
       scenarios,
       changeStatus,
       diff,
-      spellingIssues: changeStatus === "unchanged" ? [] : collectPageSpellingIssues(discovered.title, discovered.elements),
+      // Always reported, including for unchanged pages: the site-level spelling
+      // count is an inventory of what's on the site, not a per-run delta.
+      spellingIssues: collectPageSpellingIssues(discovered.title, discovered.elements),
       componentInventory: discovered.componentInventory,
       etag: discovered.etag,
       lastModified: discovered.lastModified,
@@ -139,6 +171,9 @@ export async function runCrawl(options: CrawlOptions, getBaseline: BaselineLooku
       changeSignals: discovered.changeSignals,
       scanMode: discovered.scanMode,
       skippedHttp: discovered.skippedHttp,
+      links: discovered.links,
+      snapshot: discovered.snapshot,
+      httpStatus: discovered.httpStatus ?? discovered.snapshot?.httpStatus ?? null,
     };
   });
 
@@ -224,6 +259,8 @@ export async function runCrawl(options: CrawlOptions, getBaseline: BaselineLooku
       skippedHttp,
       scannedBrowser,
       deepScans,
+      coverage,
+      restoredPages: output.filter((p) => p.changeStatus === "restored").length,
     },
   };
 }

@@ -2,7 +2,7 @@
 // don't deep-scan on timestamps, ads, CSRF, counters, etc.
 
 import crypto from "crypto";
-import type { ElementRecord, PageDiff } from "./types.js";
+import type { ChangeEvent, ElementRecord, PageDiff, PageSnapshot } from "./types.js";
 
 const NOISE_LABEL =
   /\b(\d{1,2}:\d{2}(:\d{2})?|\d{4}-\d{2}-\d{2}|csrf|token|nonce|session|captcha|cookie|ads?bygoogle|advertisement|sponsored|©|®|™|\d+\s*(views?|likes?|comments?|shares?|followers?))\b/gi;
@@ -82,11 +82,119 @@ export function diffElements(before: ElementRecord[], after: ElementRecord[]): P
   return { added, removed, changed };
 }
 
-export type ChangeStatus = "new" | "changed" | "unchanged" | "removed";
+export type ChangeStatus = "new" | "changed" | "unchanged" | "removed" | "restored" | "temporarily_unavailable" | "error";
 
 export function classifyChange(previousHash: string | null | undefined, currentHash: string): ChangeStatus {
   if (!previousHash) return "new";
   return previousHash === currentHash ? "unchanged" : "changed";
+}
+
+function sha(value: string): string {
+  return crypto.createHash("sha256").update(value).digest("hex").slice(0, 32);
+}
+
+export function fingerprintSnapshot(snap: PageSnapshot | null | undefined): {
+  title: string;
+  description: string;
+  h1: string;
+  robots: string;
+  canonical: string;
+  links: string;
+  images: string;
+  seo: string;
+} {
+  const s = snap || {};
+  const title = sha(normalizeLabel(s.title || ""));
+  const description = sha(normalizeLabel(s.description || ""));
+  const h1 = sha(normalizeLabel(s.h1 || ""));
+  const robots = sha((s.robots || "").toLowerCase().replace(/\s+/g, ""));
+  const canonical = sha((s.canonical || "").toLowerCase());
+  const images = sha(
+    JSON.stringify(
+      (s.images || [])
+        .map((i) => `${(i.src || "").split("?")[0]}|${normalizeLabel(i.alt || "")}`)
+        .sort()
+    )
+  );
+  const seo = sha(`${title}|${description}|${h1}|${robots}|${canonical}`);
+  return { title, description, h1, robots, canonical, links: "", images, seo };
+}
+
+function event(
+  type: string,
+  severity: ChangeEvent["severity"],
+  oldValue?: string | number | null,
+  newValue?: string | number | null
+): ChangeEvent {
+  return {
+    type,
+    severity,
+    oldValue: oldValue == null ? undefined : String(oldValue),
+    newValue: newValue == null ? undefined : String(newValue),
+  };
+}
+
+function robotsNoindex(value?: string | null): boolean {
+  return /noindex/i.test(value || "");
+}
+
+/** Level-2 component comparison: named change events instead of a single hash flip. */
+export function compareSnapshots(prev: PageSnapshot | null | undefined, next: PageSnapshot | null | undefined): ChangeEvent[] {
+  if (!prev || !next) return [];
+  const events: ChangeEvent[] = [];
+  if ((prev.title || "") !== (next.title || "")) {
+    events.push(event("TITLE_CHANGED", "medium", prev.title, next.title));
+  }
+  if ((prev.description || "") !== (next.description || "")) {
+    events.push(event("DESCRIPTION_CHANGED", "medium", prev.description, next.description));
+  }
+  if ((prev.h1 || "") !== (next.h1 || "")) {
+    events.push(event("H1_CHANGED", "medium", prev.h1, next.h1));
+  }
+  if ((prev.canonical || "") !== (next.canonical || "")) {
+    events.push(event("CANONICAL_CHANGED", "high", prev.canonical, next.canonical));
+  }
+  const prevRobots = prev.robots || "";
+  const nextRobots = next.robots || "";
+  if (prevRobots !== nextRobots) {
+    const critical = !robotsNoindex(prevRobots) && robotsNoindex(nextRobots);
+    events.push(event("ROBOTS_CHANGED", critical ? "critical" : "medium", prevRobots, nextRobots));
+  }
+  if (prev.httpStatus != null && next.httpStatus != null && prev.httpStatus !== next.httpStatus) {
+    const critical = prev.httpStatus < 400 && next.httpStatus >= 400;
+    const restored = prev.httpStatus >= 400 && next.httpStatus < 400;
+    events.push(event("STATUS_CHANGED", critical || restored ? "critical" : "high", prev.httpStatus, next.httpStatus));
+  }
+  if (prev.finalUrl && next.finalUrl && prev.finalUrl !== next.finalUrl) {
+    events.push(event("REDIRECT_CHANGED", "high", prev.finalUrl, next.finalUrl));
+  }
+  const prevImgs = new Map((prev.images || []).map((i) => [i.src.split("?")[0], i.alt || ""]));
+  const nextImgs = new Map((next.images || []).map((i) => [i.src.split("?")[0], i.alt || ""]));
+  for (const [src, alt] of nextImgs) {
+    if (!prevImgs.has(src)) events.push(event("IMAGE_ADDED", "medium", undefined, src));
+    else if (prevImgs.get(src) !== alt) events.push(event("ALT_TEXT_CHANGED", "medium", prevImgs.get(src), alt));
+  }
+  for (const src of prevImgs.keys()) {
+    if (!nextImgs.has(src)) events.push(event("IMAGE_REMOVED", "medium", src, undefined));
+  }
+  const prevWords = prev.wordCount ?? 0;
+  const nextWords = next.wordCount ?? 0;
+  if (prevWords && nextWords && Math.abs(nextWords - prevWords) / Math.max(prevWords, 1) >= 0.15) {
+    events.push(event("CONTENT_CHANGED", "high", prevWords, nextWords));
+  }
+  return events;
+}
+
+export function compareLinkSets(
+  prev: Array<{ url: string; label: string }> | undefined,
+  next: Array<{ url: string; label: string }> | undefined
+): ChangeEvent[] {
+  const a = new Set((prev || []).map((l) => l.url));
+  const b = new Set((next || []).map((l) => l.url));
+  const events: ChangeEvent[] = [];
+  for (const url of b) if (!a.has(url)) events.push(event("LINK_ADDED", "low", undefined, url));
+  for (const url of a) if (!b.has(url)) events.push(event("LINK_REMOVED", "high", url, undefined));
+  return events;
 }
 
 /** Structure-only fingerprint (type + label, noise-normalized). */

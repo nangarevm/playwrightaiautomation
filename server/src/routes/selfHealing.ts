@@ -4,6 +4,7 @@ import { logAudit, requireRole } from "../services/adminService.js";
 import {
   applySelfHealingForTestCase,
   detectChangesForTestCase,
+  getHealingMetrics,
   getSelfHealConfidenceThreshold,
   listAutoHealActions,
   rollbackAutoHealAction,
@@ -17,6 +18,10 @@ export const selfHealingRouter = Router();
 // Testing.tsx to show the live value), edits gated to QA Lead.
 selfHealingRouter.get("/confidence-threshold", (_req, res) => {
   res.json({ threshold: getSelfHealConfidenceThreshold() });
+});
+
+selfHealingRouter.get("/metrics", (_req, res) => {
+  res.json(getHealingMetrics());
 });
 
 selfHealingRouter.put("/confidence-threshold", requireRole("QA Lead"), (req, res) => {

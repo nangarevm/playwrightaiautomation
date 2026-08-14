@@ -14,6 +14,21 @@ import { optimizePromptWithCompression, isPromptOptimizationEnabled } from "./pr
 import { getPromptResponse, cachePromptResponse, isCacheEnabled } from "./cacheService.js";
 import { selectModel, isModelRoutingEnabled } from "./modelRoutingService.js";
 import { tryBuildCrawledScriptWithoutLlm } from "../llm/mockProvider.js";
+import {
+  buildPageTitleUrlIndex,
+  normalizeFlowStepsForCodegen,
+} from "./flowStepNormalize.js";
+import { applyDeterministicScriptHeals, persistScriptQuality } from "./locatorHealService.js";
+
+/** Post-process generated Playwright code with shared deterministic heals. */
+function finalizeGeneratedScript(code: string): string {
+  if (!code || !/from ['"]@playwright\/test['"]|@playwright\/test/.test(code)) return code;
+  try {
+    return applyDeterministicScriptHeals(code).code;
+  } catch {
+    return code;
+  }
+}
 
 interface GeneratedArtifactRecord {
   language: string;
@@ -73,15 +88,114 @@ export function collectAllowedHosts(...candidates: Array<string | null | undefin
   const hosts = new Set(DEFAULT_ALLOWED_HOSTS);
   for (const candidate of candidates) {
     if (!candidate) continue;
+    const text = String(candidate);
     // Pull every URL-looking token out of rationale / hints, not just a single host.
-    const matches = String(candidate).matchAll(/https?:\/\/[^\s)'"`]+/gi);
+    const matches = text.matchAll(/https?:\/\/[^\s)'"`<>]+/gi);
     for (const match of matches) {
-      const host = hostFromUrl(match[0]);
+      const host = hostFromUrl(match[0].replace(/[.,;:]+$/, ""));
+      if (host) hosts.add(host);
+    }
+    // CRAWL_URL=... / SITE_URL=... may be present without being re-matched above if truncated oddly
+    const crawlEq = text.match(/(?:CRAWL_URL|SITE_URL)=(\S+)/i);
+    if (crawlEq?.[1]) {
+      const host = hostFromUrl(crawlEq[1]);
+      if (host) hosts.add(host);
+    }
+    for (const m of text.matchAll(/(?:CRAWL_URL|SITE_URL)=(\S+)/gi)) {
+      const host = hostFromUrl(m[1]);
       if (host) hosts.add(host);
     }
     const bare = hostFromUrl(candidate);
     if (bare) hosts.add(bare);
   }
+  return hosts;
+}
+
+/** Hosts for every site the crawler has on file — safe allowlist for crawl-generated scripts. */
+function knownCrawlHosts(): Set<string> {
+  const hosts = new Set<string>();
+  try {
+    const rows = db.prepare(`SELECT url FROM crawl_sites`).all() as Array<{ url: string }>;
+    for (const row of rows) {
+      const host = hostFromUrl(row.url);
+      if (host) hosts.add(host);
+    }
+    const pages = db.prepare(`SELECT DISTINCT url FROM crawl_pages LIMIT 5000`).all() as Array<{ url: string }>;
+    for (const row of pages) {
+      const host = hostFromUrl(row.url);
+      if (host) hosts.add(host);
+    }
+  } catch {
+    /* db may be unavailable in unit tests */
+  }
+  return hosts;
+}
+
+/**
+ * Allowlist for a test case: rationale / screen / TARGET_URL, plus the linked
+ * crawl site, plus (for crawler-authored cases) any host that appears in the
+ * generated script AND is a known crawled site. Blocks true third-parties.
+ */
+export function collectAllowedHostsForTestCase(
+  tc: { id?: string; source_rationale?: string | null; screen_id?: string | null; input_id?: string | null },
+  generatedCode?: string
+): Set<string> {
+  const screen = tc.screen_id
+    ? (db.prepare("SELECT url_or_path FROM screens WHERE id = ?").get(tc.screen_id) as { url_or_path: string | null } | undefined)
+    : undefined;
+  const crawlUrlMatch = String(tc.source_rationale || "").match(/CRAWL_URL=(\S+)/i);
+  const hosts = collectAllowedHosts(
+    tc.source_rationale,
+    crawlUrlMatch?.[1],
+    screen?.url_or_path,
+    process.env.TARGET_URL
+  );
+
+  try {
+    if (tc.input_id) {
+      const input = db.prepare(`SELECT content FROM inputs WHERE id = ?`).get(tc.input_id) as { content?: string } | undefined;
+      if (input?.content) {
+        const siteUrl = input.content.match(/https?:\/\/[^\s)]+/i)?.[0];
+        const host = hostFromUrl(siteUrl);
+        if (host) hosts.add(host);
+        const sites = db.prepare(`SELECT url FROM crawl_sites`).all() as Array<{ url: string }>;
+        for (const s of sites) {
+          const h = hostFromUrl(s.url);
+          if (h && input.content.includes(s.url)) hosts.add(h);
+        }
+      }
+    }
+    if (tc.id) {
+      const linked = db
+        .prepare(
+          `SELECT cs.url as site_url, cp.url as page_url
+           FROM crawl_scenarios sc
+           JOIN crawl_sites cs ON cs.id = sc.site_id
+           LEFT JOIN crawl_pages cp ON cp.id = sc.page_id
+           WHERE sc.generated_test_case_id = ?
+           LIMIT 1`
+        )
+        .get(tc.id) as { site_url?: string; page_url?: string } | undefined;
+      const siteHost = hostFromUrl(linked?.site_url);
+      const pageHost = hostFromUrl(linked?.page_url);
+      if (siteHost) hosts.add(siteHost);
+      if (pageHost) hosts.add(pageHost);
+    }
+  } catch {
+    /* ignore lookup failures */
+  }
+
+  const isCrawlerAuthored = /AI crawler|CRAWL_URL=/i.test(String(tc.source_rationale || ""));
+  if (isCrawlerAuthored && generatedCode) {
+    const known = knownCrawlHosts();
+    for (const h of hosts) known.add(h);
+    const urlMatches = generatedCode.matchAll(/https?:\/\/[^\s)'"`<>]+/gi);
+    for (const match of urlMatches) {
+      const host = hostFromUrl(match[0].replace(/[.,;:]+$/, ""));
+      if (host && known.has(host)) hosts.add(host);
+    }
+  }
+
   return hosts;
 }
 
@@ -96,10 +210,10 @@ export function staticSecurityScan(
     if (host) allowed.add(String(host).toLowerCase());
   }
 
-  const urlMatches = code.matchAll(/https?:\/\/[^\s)'"`]+/gi);
+  const urlMatches = code.matchAll(/https?:\/\/[^\s)'"`<>]+/gi);
   const disallowedHosts = new Set<string>();
   for (const match of urlMatches) {
-    const host = hostFromUrl(match[0]);
+    const host = hostFromUrl(match[0].replace(/[.,;:]+$/, ""));
     if (!host) continue;
     if (allowed.has(host)) continue;
     disallowedHosts.add(host);
@@ -120,7 +234,8 @@ export function staticSecurityScan(
 // used. This classifies the generated code itself so it's a real column
 // (automation_scripts.locator_strategy), not just a comment a compliance report
 // would have to grep for.
-const ACCESSIBILITY_LOCATOR_PATTERN = /getByRole|getByLabel|getByText|get_by_role|get_by_label|get_by_text|By\.(?:ROLE|LABEL)\b/;
+const ACCESSIBILITY_LOCATOR_PATTERN =
+  /getByRole|getByLabel|getByText|getByTestId|getByPlaceholder|getByAltText|getByTitle|get_by_role|get_by_label|get_by_text|get_by_test_id|By\.(?:ROLE|LABEL)\b/;
 const CSS_XPATH_LOCATOR_PATTERN = /page\.locator\(|document\.querySelector|By\.(?:CSS_SELECTOR|XPATH)\b|find_element_by_(?:css|xpath)|driver\.findElement\(By\.(?:cssSelector|xpath)/;
 
 export function classifyLocatorStrategy(code: string): "accessibility" | "css_xpath_fallback" | "mixed" | "n/a" {
@@ -181,7 +296,12 @@ ${sharedSteps.map((s) => `  // ${s}`).join("\n")}
 
 export async function generateAutomationScript(
   testCaseId: string,
-  options: { framework?: "playwright" | "selenium" | "cypress"; language?: ScriptLanguage } = {}
+  options: {
+    framework?: "playwright" | "selenium" | "cypress";
+    language?: ScriptLanguage;
+    /** Bypass prompt-cache so regenerated flow scripts pick up latest hop normalization. */
+    force?: boolean;
+  } = {}
 ) {
   const tc = db.prepare("SELECT * FROM test_cases WHERE id = ?").get(testCaseId) as any;
   if (!tc) throw new Error("Test case not found");
@@ -190,11 +310,24 @@ export async function generateAutomationScript(
   }
 
   const rawSteps = JSON.parse(tc.steps) as string[];
+  // Resolve title-based "clicks … to reach …" hops to page.goto URLs before codegen.
+  const normalizedSteps = normalizeFlowStepsForCodegen(rawSteps, {
+    titleToUrl: buildPageTitleUrlIndex(),
+  });
+  if (JSON.stringify(normalizedSteps) !== JSON.stringify(rawSteps)) {
+    const now = new Date().toISOString();
+    db.prepare("UPDATE test_cases SET steps = ?, updated_at = ? WHERE id = ?").run(
+      JSON.stringify(normalizedSteps),
+      now,
+      testCaseId
+    );
+    tc.steps = JSON.stringify(normalizedSteps);
+  }
 
   // FR-9.2: sanitize before submission to the LLM, even for already human-reviewed test case content
   const sanitizedTestCase = {
     title: sanitizeForLlm(tc.title).sanitized,
-    steps: rawSteps.map((s) => sanitizeForLlm(s).sanitized),
+    steps: normalizedSteps.map((s) => sanitizeForLlm(s).sanitized),
     expected_result: sanitizeForLlm(tc.expected_result).sanitized,
     category: tc.category,
   };
@@ -231,7 +364,7 @@ export async function generateAutomationScript(
       /* non-blocking */
     }
   }
-  if (isCacheEnabled()) {
+  if (isCacheEnabled() && !options.force) {
     const cachedCode = getPromptResponse(effectivePrompt);
     if (cachedCode && cachedCode.length > 40) {
       const fileName =
@@ -246,23 +379,15 @@ export async function generateAutomationScript(
                 : `${tc.id}.spec.ts`;
       const artifacts = [{ language, framework: requestedFramework, code: cachedCode, fileName }];
       // Fall through to security scan / persist using cached artifact.
-      const screen = tc.screen_id
-        ? (db.prepare("SELECT url_or_path FROM screens WHERE id = ?").get(tc.screen_id) as { url_or_path: string | null } | undefined)
-        : undefined;
-      const crawlUrlMatch = String(tc.source_rationale || "").match(/CRAWL_URL=(\S+)/);
-      const allowedHosts = collectAllowedHosts(
-        tc.source_rationale,
-        crawlUrlMatch?.[1],
-        screen?.url_or_path,
-        process.env.TARGET_URL
-      );
       const fixturePath = tc.screen_id ? ensureScreenFixture(tc.screen_id) : null;
-      const scan = staticSecurityScan(cachedCode, { allowedHosts });
+      const healedCached = finalizeGeneratedScript(cachedCode);
+      const allowedHosts = collectAllowedHostsForTestCase(tc, healedCached);
+      const scan = staticSecurityScan(healedCached, { allowedHosts });
       if (scan.status === "flagged") throw new SecurityScanFailedError(scan.notes);
       const filePath = path.join(GENERATED_DIR, fileName);
       const codeWithFixtureRef = fixturePath
-        ? `// FR-3.7: shares setup steps with other scripts on this screen via ${path.relative(GENERATED_DIR, fixturePath)}\n${cachedCode}`
-        : cachedCode;
+        ? `// FR-3.7: shares setup steps with other scripts on this screen via ${path.relative(GENERATED_DIR, fixturePath)}\n${healedCached}`
+        : healedCached;
       fs.writeFileSync(filePath, codeWithFixtureRef, "utf-8");
       try {
         await commitGeneratedScriptToGit(fileName, tc.id, tc.title);
@@ -289,6 +414,7 @@ export async function generateAutomationScript(
         created_at: now,
       });
       tagScriptToScreen(id, tc.id);
+      persistScriptQuality(id, codeWithFixtureRef);
       return {
         artifacts: [{
           language,
@@ -374,6 +500,7 @@ export async function generateAutomationScript(
   // unrelated script's file.
   for (const artifact of artifacts) {
     artifact.fileName = artifact.fileName.replace(/^[^.]+/, tc.id);
+    artifact.code = finalizeGeneratedScript(artifact.code);
   }
 
   // FR-3.7: (re)compute the shared setup fixture for this test case's screen,
@@ -387,22 +514,13 @@ export async function generateAutomationScript(
   // rather than being silently persisted with a 201, which is what happened
   // before this pass.
   //
-  // Allow the crawled page URL / screen URL / TARGET_URL so Generate+Run against
-  // a real site is not false-flagged as "unexpected external host".
-  const screen = tc.screen_id
-    ? (db.prepare("SELECT url_or_path FROM screens WHERE id = ?").get(tc.screen_id) as { url_or_path: string | null } | undefined)
-    : undefined;
-  const crawlUrlMatch = String(tc.source_rationale || "").match(/CRAWL_URL=(\S+)/);
-  const allowedHosts = collectAllowedHosts(
-    tc.source_rationale,
-    crawlUrlMatch?.[1],
-    screen?.url_or_path,
-    process.env.TARGET_URL
-  );
-
+  // Allow the crawled page URL / screen URL / TARGET_URL / known crawl-site hosts
+  // so Generate+Run against a real site is not false-flagged as "unexpected external host".
   const scans = artifacts.map((artifact) => ({
     artifact,
-    scan: staticSecurityScan(artifact.code, { allowedHosts }),
+    scan: staticSecurityScan(artifact.code, {
+      allowedHosts: collectAllowedHostsForTestCase(tc, artifact.code),
+    }),
   }));
   const flagged = scans.find((s) => s.scan.status === "flagged");
   if (flagged) {
@@ -451,6 +569,7 @@ export async function generateAutomationScript(
     });
     // FR-2.14: script inherits its Screen tag from the test case it was generated from
     tagScriptToScreen(id, tc.id);
+    persistScriptQuality(id, codeWithFixtureRef);
 
     writtenArtifacts.push({
       language: artifact.language,

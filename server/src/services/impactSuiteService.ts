@@ -75,7 +75,7 @@ export function planImpactSuite(siteId: string, tier: ImpactTier = "critical"): 
   const pages = db
     .prepare(
       `SELECT id, url, title, change_status FROM crawl_pages
-       WHERE site_id = ? AND change_status IN ('new', 'changed')`
+       WHERE site_id = ? AND change_status IN ('new', 'changed', 'restored')`
     )
     .all(siteId) as Array<{ id: string; url: string; title: string; change_status: string }>;
 

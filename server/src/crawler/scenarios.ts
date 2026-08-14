@@ -26,6 +26,7 @@
 
 import { nanoid } from "nanoid";
 import type { ElementRecord, NavEdge, ScenarioRecord } from "./types.js";
+import { pickPreferredLocator, stripTransientLoadingLabel } from "./locatorQuality.js";
 
 const MAX_PER_FIELD_CATEGORY = 6; // cap individual-field scenarios per form (required-empty, invalid-format)
 const MAX_STANDALONE_ELEMENTS = 12; // cap per-element scenarios on a no-form page
@@ -63,13 +64,24 @@ function makeScenario(
   locatorSources: ElementRecord[],
   tier: ScenarioRecord["tier"] = "functional"
 ): ScenarioRecord {
-  // Prefer button/submit locators last in the list for "click/submit" steps,
-  // and keep one best locator per element (testid/id/name before role when present).
-  const preferred = locatorSources.map((e) => {
-    const ranked = [...(e.locators || [])];
-    ranked.sort((a, b) => scoreLocator(b) - scoreLocator(a));
-    return ranked[0];
-  }).filter(Boolean) as string[];
+  // Prefer a11y locators (label/role/placeholder) over brittle #id CSS.
+  const preferred = locatorSources
+    .map((e) => {
+      const locs = [...(e.locators || [])];
+      if (e.type === "button" && e.label) {
+        const idle = stripTransientLoadingLabel(e.label);
+        if (idle) locs.push(`page.getByRole("button", { name: ${JSON.stringify(idle)} })`);
+      }
+      if ((e.type === "input" || e.type === "textarea") && e.label) {
+        const idle = stripTransientLoadingLabel(e.label);
+        if (idle) {
+          locs.push(`page.getByLabel(${JSON.stringify(idle)})`);
+          locs.push(`page.getByRole("textbox", { name: ${JSON.stringify(idle)} })`);
+        }
+      }
+      return pickPreferredLocator(locs);
+    })
+    .filter(Boolean) as string[];
 
   return {
     id: nanoid(10),
@@ -82,18 +94,30 @@ function makeScenario(
   };
 }
 
-function scoreLocator(loc: string): number {
-  let s = 0;
-  if (/getByTestId/.test(loc)) s += 50;
-  if (/locator\(["']#/.test(loc)) s += 45;
-  if (/\[name=/.test(loc)) s += 42;
-  if (/getByLabel/.test(loc)) s += 40;
-  if (/getByRole\(\s*["']button["']/.test(loc)) s += 38;
-  if (/getByRole/.test(loc)) s += 30;
-  if (/getByText/.test(loc)) s += 20;
-  if (/^(https?:\/\/|www\.)/i.test(loc.match(/name:\s*["']([^"']+)/)?.[1] || "")) s -= 40;
-  if (/locator\(\s*["']a["']\s*\)/.test(loc)) s -= 25;
-  return s;
+function isFilterChipLabel(label: string): boolean {
+  // Keep this list tight: only generic facet chips mistaken for submit, not real nav labels.
+  return /^(all|none|images?|videos?|audio|filter|filters|sort|close|more|\d+)$/i.test(label.trim());
+}
+
+function isSubmitLikeLabel(label: string): boolean {
+  const idle = stripTransientLoadingLabel(label);
+  return /\b(search|submit|go|find|send|save|login|log\s*in|sign\s*in|continue|next|apply|create|add|subscribe)\b/i.test(
+    idle || label
+  );
+}
+
+/** Prefer real submit/search controls; never treat category chips like "All" as submit. */
+function pickSubmitControl(formElements: ElementRecord[]): ElementRecord | undefined {
+  const buttons = formElements.filter((e) => e.type === "button" && e.label);
+  const preferred = buttons.find((b) => isSubmitLikeLabel(b.label));
+  const chosen = preferred || buttons.find((b) => !isFilterChipLabel(b.label));
+  if (!chosen) return undefined;
+  // Never bake transient loading text into scenario steps / locators.
+  const idle = stripTransientLoadingLabel(chosen.label);
+  if (idle && idle !== chosen.label) {
+    return { ...chosen, label: idle };
+  }
+  return chosen;
 }
 
 function buildFormScenarios(
@@ -102,12 +126,17 @@ function buildFormScenarios(
   coverageMode: import("./types.js").CoverageMode = "full"
 ): ScenarioRecord[] {
   const inputs = formElements.filter((e) => ["input", "textarea", "dropdown", "checkbox"].includes(e.type));
-  const submit = formElements.find((e) => e.type === "button");
+  const submit = pickSubmitControl(formElements);
   if (inputs.length === 0) return [];
 
   const flowGroup = formElements[0]?.component || pageTitle;
   const scenarios: ScenarioRecord[] = [];
-  const submitStep = submit ? `And clicks "${submit.label}"` : "And submits the form";
+  const isSearchForm = /search/i.test(flowGroup) || inputs.some((i) => /search/i.test(i.label) || i.inputType === "search");
+  const submitStep = submit
+    ? `And clicks "${submit.label}"`
+    : isSearchForm
+      ? "And presses Enter to submit the search"
+      : "And submits the form";
   const submitLocator = submit ? [submit] : [];
 
   // 1. Positive: every field filled with a valid value (file fields get a
@@ -1094,14 +1123,23 @@ function verbFor(via: string): string {
   return `clicks "${via}"`;
 }
 
+function isFragileVia(via: string): boolean {
+  const v = via.trim();
+  if (!v || v === "navigation") return true;
+  if (/cdn-cgi|^#|^\/[\w._/-]*$|^(https?:\/\/|www\.)/i.test(v)) return true;
+  if (v.length > 80) return true;
+  return false;
+}
+
 // Best-effort: find the element on `page` whose label matches the edge's `via`
 // text, so the flow step carries a real locator a codegen step can click --
 // falls back to the page's first button/link if no exact match (e.g. the edge
 // came from an SPA route change with via = "navigation").
 function locatorForHop(page: FlowPage, via: string): ElementRecord | null {
+  if (isFragileVia(via)) return null;
   const exact = page.elements.find((e) => e.label.trim().toLowerCase() === via.trim().toLowerCase());
   if (exact) return exact;
-  return page.elements.find((e) => ["link", "button"].includes(e.type)) ?? null;
+  return page.elements.find((e) => ["link", "button"].includes(e.type) && e.label && !isFragileVia(e.label)) ?? null;
 }
 
 // Enumerates simple paths (no repeated pages) from `startUrl` through the
@@ -1180,15 +1218,16 @@ export function buildFlowScenariosForSite(
     const pagesInPath = path.map((url) => pageByUrl.get(url)!);
     const titles = pagesInPath.map((p) => p.title);
 
+    // Multi-page flows always navigate by absolute URL. Clicking crawled link
+    // text is brittle (truncated cards, carousels, locale drift, off-page CTAs) and
+    // caused widespread TimeoutError noise that was mislabeled as product bugs.
     const steps: string[] = [`Given the user starts on "${titles[0]}"`];
     const locators: string[] = [];
     for (let i = 1; i < pagesInPath.length; i++) {
-      const fromPage = pagesInPath[i - 1];
-      const via = vias[i - 1];
-      const hopLocator = locatorForHop(fromPage, via);
-      if (hopLocator) locators.push(...hopLocator.locators.slice(0, 1));
       const connector = i === 1 ? "When" : "And";
-      steps.push(`${connector} the user ${verbFor(via)} to reach "${titles[i]}"`);
+      const via = vias[i - 1];
+      const viaNote = via && !isFragileVia(via) ? ` (via "${via}")` : "";
+      steps.push(`${connector} the user navigates to "${pagesInPath[i].url}"${viaNote}`);
     }
     steps.push(`Then the user successfully reaches "${titles[titles.length - 1]}" and the end-to-end flow completes`);
 

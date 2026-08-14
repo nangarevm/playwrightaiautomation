@@ -657,6 +657,10 @@ export interface CrawlSite {
     unchangedPages?: number;
     reusedBaselines?: number;
     removedPages?: number;
+    temporarilyUnavailable?: number;
+    restoredPages?: number;
+    sitemapAdded?: number;
+    sitemapRemoved?: number;
     preservedUnvisited?: number;
     truncatedByMaxPages?: boolean;
     scenariosActive?: number;
@@ -754,6 +758,7 @@ export interface ExecutionEvidenceRow {
   // (a real content/behavior mismatch), or 'unknown'.
   failure_class: "automation_issue" | "environment_issue" | "possible_bug" | "unknown" | null;
   failure_label: string | null;
+  failure_category?: string | null;
   created_at: string;
 }
 

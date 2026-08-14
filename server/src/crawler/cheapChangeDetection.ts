@@ -112,6 +112,63 @@ export function decideCheapSkip(input: {
   return { skip: false, reason: "none", headers: input.http };
 }
 
+/** Disallow paths under User-agent: * (and unmatched agents). Empty if robots.txt missing. */
+export async function fetchRobotsDisallows(origin: string): Promise<string[]> {
+  try {
+    const res = await fetch(`${origin}/robots.txt`, { signal: AbortSignal.timeout(6000) });
+    if (!res.ok) return [];
+    const text = await res.text();
+    const disallows: string[] = [];
+    let applies = true;
+    for (const rawLine of text.split(/\r?\n/)) {
+      const line = rawLine.replace(/#.*$/, "").trim();
+      if (!line) continue;
+      const ua = line.match(/^user-agent\s*:\s*(.+)$/i);
+      if (ua) {
+        applies = ua[1].trim() === "*";
+        continue;
+      }
+      if (!applies) continue;
+      const d = line.match(/^disallow\s*:\s*(.*)$/i);
+      if (d) {
+        const path = d[1].trim();
+        if (path && path !== "/") disallows.push(path);
+      }
+    }
+    return disallows;
+  } catch {
+    return [];
+  }
+}
+
+export function isRobotsDisallowed(url: string, disallows: string[]): boolean {
+  if (!disallows.length) return false;
+  try {
+    const path = new URL(url).pathname;
+    return disallows.some((rule) => rule && (path === rule || path.startsWith(rule.endsWith("/") ? rule : `${rule}`)));
+  } catch {
+    return false;
+  }
+}
+
+/** Sitemap URLs declared by robots.txt, in declaration order. */
+async function fetchSitemapsFromRobots(origin: string): Promise<string[]> {
+  try {
+    const res = await fetch(`${origin}/robots.txt`, { signal: AbortSignal.timeout(6000) });
+    if (!res.ok) return [];
+    const text = await res.text();
+    const urls: string[] = [];
+    for (const match of text.matchAll(/^\s*sitemap\s*:\s*(\S+)\s*$/gim)) {
+      const raw = match[1].trim();
+      if (!raw || !sameOrigin(raw, origin)) continue;
+      urls.push(raw);
+    }
+    return urls;
+  } catch {
+    return [];
+  }
+}
+
 /**
  * Fetch sitemap entries including optional <lastmod> per URL.
  */
@@ -119,7 +176,17 @@ export async function fetchSitemapEntries(siteUrl: string, maxUrls = 200): Promi
   const origin = originOf(siteUrl);
   if (!origin) return [];
 
-  const candidates = [`${origin}/sitemap.xml`, `${origin}/sitemap_index.xml`];
+  // robots.txt is authoritative: sites often publish the real sitemap at a
+  // non-standard path, in which case the conventional guesses below 404 and the
+  // crawl loses its deep-page seed entirely.
+  const declared = await fetchSitemapsFromRobots(origin);
+  const candidates = [
+    ...declared,
+    `${origin}/sitemap.xml`,
+    `${origin}/sitemap_index.xml`,
+    `${origin}/wp-sitemap.xml`,
+    `${origin}/sitemap-index.xml`,
+  ];
   const found: SitemapEntry[] = [];
   const visitedSitemaps = new Set<string>();
 

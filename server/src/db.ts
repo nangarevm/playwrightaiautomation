@@ -678,6 +678,13 @@ ensureColumn("crawl_pages", "etag", "TEXT");
 ensureColumn("crawl_pages", "last_modified", "TEXT");
 ensureColumn("crawl_pages", "a11y_hash", "TEXT");
 ensureColumn("crawl_pages", "change_signals_json", "TEXT NOT NULL DEFAULT '{}'");
+// AI Crawler: the page's same-origin outbound links as of its last real scan.
+// Cheap-skipped pages (HTTP 304 / sitemap lastmod) never navigate, so discovery
+// replays this adjacency into the nav graph -- without it the flow graph shrinks
+// on every incremental re-crawl and journey selection becomes nondeterministic.
+ensureColumn("crawl_pages", "links_json", "TEXT NOT NULL DEFAULT '[]'");
+ensureColumn("crawl_pages", "miss_count", "INTEGER NOT NULL DEFAULT 0");
+ensureColumn("crawl_pages", "http_status", "INTEGER");
 ensureColumn("crawl_sites", "schedule_cron", "TEXT");
 ensureColumn("crawl_sites", "watch_enabled", "INTEGER NOT NULL DEFAULT 0");
 ensureColumn("crawl_sites", "ci_webhook_secret", "TEXT");
@@ -690,6 +697,11 @@ ensureColumn("crawl_sites", "last_progress_json", "TEXT");
 // instead of dumping every failure into one undifferentiated list.
 ensureColumn("execution_evidence", "failure_class", "TEXT");
 ensureColumn("execution_evidence", "failure_label", "TEXT");
+ensureColumn("execution_evidence", "failure_category", "TEXT");
+ensureColumn("automation_scripts", "locator_quality_json", "TEXT");
+ensureColumn("automation_scripts", "readiness_score", "REAL");
+ensureColumn("automation_scripts", "heal_events_json", "TEXT NOT NULL DEFAULT '[]'");
+ensureColumn("org_settings", "self_heal_suggest_threshold", "REAL NOT NULL DEFAULT 0.7");
 
 // Feature #7: Interaction Validation - stores validation results for user interactions
 // detected during test execution (clicks, form inputs, navigation, etc.)
