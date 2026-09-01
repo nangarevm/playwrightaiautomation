@@ -6,7 +6,7 @@ import { fileURLToPath } from "url";
 import { db } from "../db.js";
 import { recordTimeBreakdownForRun, updateFlakyFlagForScript } from "./reportingService.js";
 import { autoFileBugOnRegression, notifyAllOnRunComplete } from "./integrationsService.js";
-import { runBugScanForScreen, recordBugFinding } from "./bugDetectionService.js";
+import { runBugScanForScreen, recordBugFinding, publishFailureEvidence } from "./bugDetectionService.js";
 import { decryptSecret } from "./secretsService.js";
 import { getEnvironment, preflightHealthCheck } from "./environmentsService.js";
 import { logAudit } from "./adminService.js";
@@ -638,7 +638,9 @@ export function runExecution(scriptId: string, targetUrl: string, input: any = {
 
     // FR-4.15: apply the profile's custom execution rules (test-attribute/schedule/prior-outcome
     // conditioned overrides) on top of its base configuration before building the run
-    const testCase = db.prepare("SELECT title, category, screen_id FROM test_cases WHERE id = ?").get(script.test_case_id) as { title: string; category: string; screen_id?: string | null } | undefined;
+    const testCase = db.prepare("SELECT title, category, screen_id, steps, expected_result FROM test_cases WHERE id = ?").get(script.test_case_id) as { title: string; category: string; screen_id?: string | null; steps?: string; expected_result?: string } | undefined;
+    let testCaseSteps: string[] = [];
+    try { testCaseSteps = testCase?.steps ? JSON.parse(testCase.steps) : []; } catch { testCaseSteps = []; }
     const ruleOverrides = evaluateCustomExecutionRules(profile?.rules_json, {
       testCaseTitle: testCase?.title,
       dayOfWeek: getDayOfWeek(),
@@ -876,6 +878,12 @@ export function runExecution(scriptId: string, targetUrl: string, input: any = {
         // This is test-level granularity (one row per failed test), not step/action-level --
         // the JSON reporter doesn't expose a stable per-step breakdown to parse, so a genuine
         // per-step implementation isn't attempted here; this is the honest partial improvement.
+        // Hoisted out of the try block below so autoFileBugOnRegression (fired after
+        // this block, once we know the run's overall status) can describe the actual
+        // failure instead of just "it failed" -- filled in from the first possible_bug
+        // classified failure, if any.
+        let regressionFailureDetail: { errorMessage: string | null; failureLabel: string } | null = null;
+
         try {
           const parsed = JSON.parse(stdout);
           const failedTests: Array<{ title: string; file: string; status: string; errorMessage: string | null; failureClass: string; failureLabel: string }> = [];
@@ -940,6 +948,24 @@ export function runExecution(scriptId: string, targetUrl: string, input: any = {
 
               // Surface likely product defects in the Bugs tab, not only as test-run noise.
               if (ft.failureClass === "possible_bug") {
+                if (!regressionFailureDetail) regressionFailureDetail = { errorMessage: ft.errorMessage, failureLabel: ft.failureLabel };
+
+                // Detailed, replayable reproduction: the precondition (browser + target),
+                // the test case's own numbered steps as originally reviewed/approved (not
+                // just "run the test"), what should have happened, and what actually did --
+                // plus whatever screenshot/video Playwright captured for this specific
+                // failed test, published so it's viewable from the Bugs tab.
+                const evidenceDir = matchedDir ? path.join(resultsDir, matchedDir) : null;
+                const { screenshotUrl, videoUrl } = publishFailureEvidence(evidenceDir);
+                const reproSteps = [
+                  `Preconditions: open a ${browserSet} browser and navigate to ${targetUrl}.`,
+                  ...(testCaseSteps.length > 0
+                    ? testCaseSteps.map((s, i) => `Step ${i + 1}: ${s}`)
+                    : [`Run the automated test: "${ft.title}"`]),
+                  `Expected result: ${testCase?.expected_result || "See the linked test case for the expected outcome."}`,
+                  `Actual result: ${ft.failureLabel} -- ${ft.errorMessage || "no further error detail captured"}`,
+                ];
+
                 recordBugFinding({
                   source: "regression",
                   severity: "high",
@@ -947,12 +973,17 @@ export function runExecution(scriptId: string, targetUrl: string, input: any = {
                   detail: ft.errorMessage || ft.failureLabel,
                   screenId: testCase?.screen_id ?? null,
                   runId,
-                  evidence: { testTitle: ft.title, testFile: ft.file, failureClass: ft.failureClass },
-                  stepsToReproduce: [
-                    `Run the automated test: ${ft.title}`,
-                    `Target URL: ${targetUrl}`,
-                    `Observe failure: ${ft.failureLabel}`,
-                  ],
+                  evidence: {
+                    testTitle: ft.title,
+                    testFile: ft.file,
+                    failureClass: ft.failureClass,
+                    targetUrl,
+                    browserSet,
+                    expectedResult: testCase?.expected_result ?? null,
+                  },
+                  stepsToReproduce: reproSteps,
+                  screenshotUrl,
+                  videoUrl,
                 });
               }
             }
@@ -1009,7 +1040,15 @@ export function runExecution(scriptId: string, targetUrl: string, input: any = {
           autoFileBugOnRegression(
             { id: script.test_case_id, title: testCase.title, category: (testCase as any).category ?? "" },
             { id: runId, status, evidence_path: evidencePath },
-            previousStatus
+            previousStatus,
+            {
+              steps: testCaseSteps,
+              expectedResult: testCase.expected_result,
+              errorMessage: regressionFailureDetail?.errorMessage ?? null,
+              failureLabel: regressionFailureDetail?.failureLabel ?? null,
+              targetUrl,
+              browserSet,
+            }
           ).catch(() => undefined);
         }
 

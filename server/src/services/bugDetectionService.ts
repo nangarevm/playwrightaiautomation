@@ -154,6 +154,29 @@ function saveUploadFile(buffer: Buffer, extension: string): string {
   return `/uploads/${fileName}`;
 }
 
+// Playwright writes a failed test's own screenshot/video into its per-test
+// output folder (e.g. test-results/artifacts/<test-name>/test-failed-1.png).
+// That folder isn't web-served, so a bug finding built from a test-execution
+// failure (executionService's regression detection) couldn't show a screenshot
+// the way an exploratory UI scan finding already can. Copy whatever evidence
+// exists there into UPLOAD_DIR (which IS served under /uploads) so both finding
+// types carry the same kind of visual evidence. Best-effort: a missing/renamed
+// evidence folder just means no screenshot, not a failure.
+export function publishFailureEvidence(evidenceDir: string | null | undefined): { screenshotUrl: string | null; videoUrl: string | null } {
+  if (!evidenceDir) return { screenshotUrl: null, videoUrl: null };
+  try {
+    if (!fs.existsSync(evidenceDir) || !fs.statSync(evidenceDir).isDirectory()) return { screenshotUrl: null, videoUrl: null };
+    const files = fs.readdirSync(evidenceDir);
+    const pngFile = files.find((f) => f.toLowerCase().endsWith(".png"));
+    const webmFile = files.find((f) => f.toLowerCase().endsWith(".webm"));
+    const screenshotUrl = pngFile ? saveUploadFile(fs.readFileSync(path.join(evidenceDir, pngFile)), ".png") : null;
+    const videoUrl = webmFile ? saveUploadFile(fs.readFileSync(path.join(evidenceDir, webmFile)), ".webm") : null;
+    return { screenshotUrl, videoUrl };
+  } catch {
+    return { screenshotUrl: null, videoUrl: null };
+  }
+}
+
 const FUZZ_IDS = [
   { label: "negative id", value: "-1" },
   { label: "huge number id", value: "99999999999999999999999999" },
