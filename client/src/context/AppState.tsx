@@ -13,13 +13,14 @@ import {
 } from "../api.js";
 
 export type Mode = "single" | "enterprise";
-export type View = "home" | "run" | "library" | "reports" | "settings";
+export type View = "home" | "run" | "library" | "reports" | "settings" | "costs";
 
 const PROFILE_DEFAULT = {
   name: "",
   description: "",
   browser_set: "chromium",
-  concurrency: 1,
+  // 5 parallel workers for now
+  concurrency: 5,
   artifact_capture_mode: "logs-only",
   retention_days: 30,
   selection_mode: "full-suite",

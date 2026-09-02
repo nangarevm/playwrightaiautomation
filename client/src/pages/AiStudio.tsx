@@ -3,7 +3,7 @@ import { useApp } from "../context/AppState.js";
 import { api } from "../api.js";
 import { CATEGORY_COLOR, Pill } from "../components/Pill.js";
 
-export default function AiStudio() {
+export default function AiStudio({ compact = false }: { compact?: boolean }) {
   const {
     testCases,
     scripts,
@@ -80,11 +80,13 @@ export default function AiStudio() {
   }
 
   return (
-    <div className="space-y-6">
-      <div>
-        <h2 className="font-display text-xl tracking-tight">AI Studio</h2>
-        <p className="text-sm text-ink/60">Review, edit, and approve AI-generated test cases</p>
-      </div>
+    <div className={compact ? "space-y-3" : "space-y-6"}>
+      {!compact && (
+        <div>
+          <h2 className="font-display text-xl tracking-tight">AI Studio</h2>
+          <p className="text-sm text-ink/60">Review, edit, and approve AI-generated test cases</p>
+        </div>
+      )}
 
       {/* FR-9.1: concurrent-edit merge/conflict view -- shown instead of silently
           overwriting when the server's version has moved since this tab loaded it */}

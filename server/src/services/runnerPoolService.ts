@@ -20,8 +20,9 @@ import { db } from "../db.js";
 import { runExecution } from "./executionService.js";
 import { logAudit } from "./adminService.js";
 
-const MIN_SHARED_POOL_SIZE = Number(process.env.RUNNER_POOL_MIN) || 2;
-const MAX_SHARED_POOL_SIZE = Number(process.env.RUNNER_POOL_MAX) || 8;
+// Keep pool at 5 workers for now (override via RUNNER_POOL_MIN / RUNNER_POOL_MAX).
+const MIN_SHARED_POOL_SIZE = Number(process.env.RUNNER_POOL_MIN) || 5;
+const MAX_SHARED_POOL_SIZE = Number(process.env.RUNNER_POOL_MAX) || 5;
 
 let sharedPoolSize = MIN_SHARED_POOL_SIZE;
 const activeShared = new Set<string>(); // run ids currently executing against the shared pool
@@ -50,7 +51,9 @@ function recomputeQueuePositions() {
 function autoscale(sharedQueuedCount: number) {
   const before = sharedPoolSize;
   if (sharedQueuedCount > sharedPoolSize && sharedPoolSize < MAX_SHARED_POOL_SIZE) {
-    sharedPoolSize = Math.min(MAX_SHARED_POOL_SIZE, sharedPoolSize + 1);
+    // Jump toward demand quickly (was +1/tick, which stayed tiny for large batches).
+    const target = Math.min(MAX_SHARED_POOL_SIZE, Math.max(sharedQueuedCount, MIN_SHARED_POOL_SIZE));
+    sharedPoolSize = Math.min(MAX_SHARED_POOL_SIZE, Math.max(sharedPoolSize + 2, target));
   } else if (sharedQueuedCount === 0 && activeShared.size === 0 && sharedPoolSize > MIN_SHARED_POOL_SIZE) {
     sharedPoolSize = Math.max(MIN_SHARED_POOL_SIZE, sharedPoolSize - 1);
   }

@@ -257,6 +257,22 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ target_url: targetUrl, ...options }),
     }),
+  // Run many scripts in one Playwright process with --workers=N (much faster than queueing one-by-one)
+  runExecutionBatch: (
+    scriptIds: string[],
+    targetUrl?: string,
+    options?: { profile_id?: string; concurrency?: number; measureBaseline?: boolean }
+  ) =>
+    req("/execution-runs/batch-run", {
+      method: "POST",
+      body: JSON.stringify({
+        script_ids: scriptIds,
+        target_url: targetUrl,
+        concurrency: options?.concurrency ?? 5,
+        measureBaseline: options?.measureBaseline === true,
+        ...options,
+      }),
+    }),
   triggerScheduler: () => req("/execution-runs/scheduler/tick", { method: "POST" }),
   // FR-4.24/FR-4.25/FR-4.26/FR-4.27/FR-4.30: Ultrafast Mode -- given just a script or test
   // case reference, auto-resolves profile/environment, auto-accepts/queues review, and starts
@@ -476,12 +492,58 @@ export const api = {
   importProject: (payload: any) => req("/admin/project/import", { method: "POST", body: JSON.stringify(payload) }),
 
   // AI Crawler (Phases 1-8 of the crawler build brief)
-  crawlerRun: (payload: { url: string; username?: string; password?: string; maxPages?: number; captureApi?: boolean; concurrency?: number }) =>
-    req("/crawler/run", { method: "POST", body: JSON.stringify(payload) }),
+  crawlerRun: (payload: {
+    url: string;
+    username?: string;
+    password?: string;
+    maxPages?: number;
+    captureApi?: boolean;
+    concurrency?: number;
+    mode?: "incremental" | "full";
+    coverageMode?: "minimal" | "standard" | "full";
+  }) => req("/crawler/run", { method: "POST", body: JSON.stringify(payload) }),
   crawlerKnownSite: (url: string) => req(`/crawler/known-site?url=${encodeURIComponent(url)}`),
   crawlerListSites: (): Promise<CrawlSite[]> => req("/crawler/sites"),
   crawlerGetSite: (siteId: string): Promise<CrawlSite> => req(`/crawler/sites/${siteId}`),
   crawlerGetSiteDetail: (siteId: string): Promise<CrawlSiteDetail> => req(`/crawler/sites/${siteId}/detail`),
+  crawlerEnsureComponentCoverage: (siteId: string): Promise<{ siteId: string; added: number; pagesUpdated: number }> =>
+    req(`/crawler/sites/${siteId}/component-coverage/ensure`, { method: "POST", body: "{}" }),
+  crawlerRebuildCoverage: (
+    siteId: string,
+    coverageMode: "minimal" | "standard" | "full" = "minimal"
+  ): Promise<{ siteId: string; coverageMode: string; added: number; retired: number; pagesUpdated: number }> =>
+    req(`/crawler/sites/${siteId}/coverage/rebuild`, {
+      method: "POST",
+      body: JSON.stringify({ coverageMode }),
+    }),
+  crawlerGetCockpit: (siteId: string) => req(`/crawler/sites/${siteId}/cockpit`),
+  crawlerPlanImpactSuite: (siteId: string, tier: "smoke" | "critical" | "full-delta" = "critical") =>
+    req(`/crawler/sites/${siteId}/impact-suite?tier=${tier}`),
+  crawlerRunImpactSuite: (siteId: string, tier: "smoke" | "critical" | "full-delta" = "critical") =>
+    req(`/crawler/sites/${siteId}/impact-suite`, {
+      method: "POST",
+      body: JSON.stringify({ tier }),
+    }),
+  crawlerGetImpactSuiteJob: (siteId: string, jobId: string) =>
+    req(`/crawler/sites/${siteId}/impact-suite/jobs/${jobId}`),
+  crawlerGetImpactSuiteStatus: (siteId: string, tier: "smoke" | "critical" | "full-delta" = "critical", jobId?: string) =>
+    req(
+      `/crawler/sites/${siteId}/impact-suite?tier=${encodeURIComponent(tier)}${
+        jobId ? `&jobId=${encodeURIComponent(jobId)}` : ""
+      }`
+    ),
+  crawlerSetWatch: (siteId: string, enabled: boolean, cron?: string) =>
+    req(`/crawler/sites/${siteId}/watch`, {
+      method: "POST",
+      body: JSON.stringify({ enabled, cron }),
+    }),
+  crawlerCreateCiSecret: (siteId: string, secret?: string) =>
+    req(`/crawler/sites/${siteId}/ci-secret`, {
+      method: "POST",
+      body: JSON.stringify({ secret }),
+    }),
+  crawlerCiDelta: (payload: { url: string; paths?: string[]; secret?: string; mode?: "incremental" | "full" }) =>
+    req("/crawler/ci/delta", { method: "POST", body: JSON.stringify(payload) }),
   crawlerDeleteScenario: (id: string) => req(`/crawler/scenarios/${id}`, { method: "DELETE" }),
   crawlerBulkDeleteScenarios: (ids: string[]) => req("/crawler/scenarios/bulk-delete", { method: "POST", body: JSON.stringify({ ids }) }),
   crawlerRestoreScenario: (id: string) => req(`/crawler/scenarios/${id}/restore`, { method: "POST" }),
@@ -489,6 +551,38 @@ export const api = {
 
   // Bug Detection Engine: proactive UI-exploratory + API-fuzz findings, distinct
   // from FR-7.6's reactive regression auto-filing.
+  // Optimization + monitoring (Phases 1–4 + Costs hub)
+  getOptimizationStatus: () => req("/optimization/status"),
+  getOptimizationMetrics: () => req("/optimization/metrics"),
+  getOptimizationAllPhases: () => req("/optimization/all-phases"),
+  getOptimizationRecommendations: () => req("/optimization/recommendations"),
+  toggleOptimization: (enabled?: boolean) =>
+    req("/optimization/toggle", { method: "POST", body: JSON.stringify({ enabled }) }),
+  toggleOptimizationPhase: (phase: number, enabled: boolean) =>
+    req(`/optimization/toggle-phase/${phase}`, {
+      method: "POST",
+      body: JSON.stringify({ enabled }),
+    }),
+  getFeatureCosts: () => req("/optimization/features/costs"),
+  getFeatureIncremental: () => req("/optimization/features/incremental"),
+  toggleFeatureIncremental: (enabled: boolean) =>
+    req("/optimization/features/incremental/toggle", {
+      method: "POST",
+      body: JSON.stringify({ enabled }),
+    }),
+  getFeatureFastMode: () => req("/optimization/features/fast-mode"),
+  applyFeatureFastMode: (mode: "critical" | "balanced" | "full") =>
+    req("/optimization/features/fast-mode/apply", {
+      method: "POST",
+      body: JSON.stringify({ mode }),
+    }),
+  getFeaturePresets: () => req("/optimization/features/presets"),
+  startFeaturePreset: (preset: string) =>
+    req("/optimization/features/presets/start", {
+      method: "POST",
+      body: JSON.stringify({ preset }),
+    }),
+
   listBugFindings: (params?: { status?: string; severity?: string; screenId?: string }): Promise<BugFindingRow[]> =>
     req(`/bugs${params ? `?${new URLSearchParams(Object.fromEntries(Object.entries(params).filter(([, v]) => v))).toString()}` : ""}`),
   scanScreenForBugs: (screenId: string): Promise<{ findings: BugFindingRow[]; count: number }> =>
@@ -546,8 +640,37 @@ export interface CrawlSite {
   error?: string;
   is_rerun: number;
   capture_api: number;
+  crawl_mode?: "incremental" | "full" | string;
   created_at: string;
   last_crawled_at?: string;
+  progress?: {
+    skippedHttp?: number;
+    scannedBrowser?: number;
+    deepScans?: number;
+    reusedBaselines?: number;
+    currentPage?: string;
+  } | null;
+  recrawl_summary?: {
+    mode?: "incremental" | "full";
+    newPages?: number;
+    changedPages?: number;
+    unchangedPages?: number;
+    reusedBaselines?: number;
+    removedPages?: number;
+    temporarilyUnavailable?: number;
+    restoredPages?: number;
+    sitemapAdded?: number;
+    sitemapRemoved?: number;
+    preservedUnvisited?: number;
+    truncatedByMaxPages?: boolean;
+    scenariosActive?: number;
+    elapsedMs?: number;
+    modeReason?: string | null;
+    effectiveMaxPages?: number | null;
+    skippedHttp?: number;
+    scannedBrowser?: number;
+    deepScans?: number;
+  } | null;
 }
 
 export interface CrawlSpellingIssue {
@@ -589,18 +712,37 @@ export interface CrawlPage {
   url: string;
   title: string;
   dom_hash: string;
-  change_status: "new" | "changed" | "unchanged";
+  change_status: "new" | "changed" | "unchanged" | "removed";
   diff: { added: string[]; removed: string[]; changed: string[] } | null;
   elements: Array<{ type: string; label: string; locators: string[]; component: string }>;
   apis: Array<{ trigger: string; method: string; endpoint: string; schema: any }>;
   scenarios: CrawlScenario[];
   spellingIssues: CrawlSpellingIssue[];
   componentInventory: CrawlComponentInventoryItem[];
+  changeSignals?: {
+    structure?: "same" | "changed" | "unknown";
+    a11y?: "same" | "changed" | "unknown";
+    visual?: "same" | "changed" | "unknown";
+    http?: "not-modified" | "modified" | "unknown";
+  };
 }
 
 export interface CrawlSiteDetail {
   site: CrawlSite;
   pages: CrawlPage[];
+  componentCoverage?: {
+    kinds: Array<{
+      kind: string;
+      label: string;
+      totalCount: number;
+      pageCount: number;
+      pages: string[];
+      scenarioCount: number;
+    }>;
+    knownKinds: Array<{ kind: string; label: string }>;
+    pagesWithInventory: number;
+    pagesTotal: number;
+  };
 }
 
 export interface ExecutionEvidenceRow {
@@ -616,6 +758,7 @@ export interface ExecutionEvidenceRow {
   // (a real content/behavior mismatch), or 'unknown'.
   failure_class: "automation_issue" | "environment_issue" | "possible_bug" | "unknown" | null;
   failure_label: string | null;
+  failure_category?: string | null;
   created_at: string;
 }
 

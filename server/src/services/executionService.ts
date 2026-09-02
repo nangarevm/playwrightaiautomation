@@ -11,6 +11,16 @@ import { decryptSecret } from "./secretsService.js";
 import { getEnvironment, preflightHealthCheck } from "./environmentsService.js";
 import { logAudit } from "./adminService.js";
 import { startRealtimeTracking, emitProgress, stopRealtimeTracking } from "./realtimeExecutionService.js";
+import { calculateOptimalConcurrency } from "./parallelExecutionService.js";
+import { selectSmartTests, getDefaultPrioritizationConfig } from "./testPrioritizationService.js";
+import { recordTestExecution, isSelfLearningEnabled } from "./selfLearningService.js";
+import { learnFromExecution, isMLPrioritizationEnabled } from "./mlPrioritizationService.js";
+import { recordBaseline, isPredictiveOptimizationEnabled } from "./predictiveOptimizationService.js";
+import { recordStrategyResult, isAdaptiveStrategyEnabled, selectStrategy } from "./adaptiveStrategyService.js";
+import { isIncrementalTestingEnabled, shouldRunFullTest } from "./incrementalTestingService.js";
+import { distributeTests, isDistributedExecutionEnabled } from "./distributedExecutionService.js";
+import { selectTests as selectFastModeTests, type FastModeProfile } from "./fastModeService.js";
+import { recordCostMetrics, calculateExecutionCost } from "./costTrackingService.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SERVER_ROOT = path.join(__dirname, "..", "..");
@@ -194,6 +204,82 @@ export function resolveScriptsForSelectionMode(selectionMode: string, customSele
   }
 
   if (selectionMode === "smart-selection") {
+    // Phase 1 + 3: smart prioritization + incremental skip of unchanged pages
+    if (process.env.OPTIMIZATION_ENABLED !== "false") {
+      const changedPages = db.prepare(
+        "SELECT id FROM crawl_pages WHERE change_status IN ('new','changed','modified','restored') OR change_status IS NULL"
+      ).all() as Array<{ id: string }>;
+      const unchangedRatio =
+        changedPages.length === 0
+          ? 0
+          : 1 -
+            changedPages.length /
+              Math.max(
+                1,
+                (db.prepare("SELECT COUNT(*) as c FROM crawl_pages WHERE change_status != 'removed'").get() as any)?.c || 1
+              );
+      const forceFull = isIncrementalTestingEnabled()
+        ? shouldRunFullTest(Math.round((1 - unchangedRatio) * 100), 3)
+        : true;
+
+      const changedScreenIds = new Set(
+        (db.prepare("SELECT id FROM screens WHERE change_status != 'unchanged'").all() as Array<{ id: string }>).map((r) => r.id)
+      );
+
+      let candidates = allLatestScripts.filter((s) => {
+        const category = (s.tc_category || "").toLowerCase();
+        const isSmokeOrRegression = category.includes("smoke") || category.includes("regression");
+        const screenChanged = s.tc_screen_id && changedScreenIds.has(s.tc_screen_id);
+        if (!forceFull && isIncrementalTestingEnabled()) {
+          return isSmokeOrRegression || screenChanged;
+        }
+        return isSmokeOrRegression || screenChanged;
+      });
+
+      const prioritized = selectSmartTests(
+        candidates.map((s) => ({
+          id: s.id,
+          category: (s.tc_category || "Functional") as any,
+          title: s.tc_title || s.id,
+        })),
+        getDefaultPrioritizationConfig()
+      );
+
+      const selectedIds = new Set(prioritized.filter((p) => p.shouldRun).map((p) => p.id));
+      let selected = candidates.filter((s) => selectedIds.has(s.id));
+
+      // Feature 11: Fast Mode further narrows critical vs balanced vs full
+      const fastProfile = (process.env.FAST_MODE_PROFILE as FastModeProfile) || "balanced";
+      if (fastProfile !== "full") {
+        selected = selectFastModeTests(
+          selected.map((s) => ({
+            ...s,
+            criticality: (s.tc_category || "").toLowerCase().includes("smoke") ? "critical" : "normal",
+            priority: (s.tc_category || "").toLowerCase().includes("regression")
+              ? "high"
+              : (s.tc_category || "").toLowerCase().includes("smoke")
+                ? "high"
+                : "medium",
+          })),
+          fastProfile
+        ) as typeof selected;
+      }
+
+      if (isDistributedExecutionEnabled() && selected.length > 5) {
+        try {
+          distributeTests(
+            selected.map((s) => s.id),
+            1
+          );
+        } catch {
+          /* single-node planning only */
+        }
+      }
+
+      return selected;
+    }
+
+    // Fallback (if optimization disabled)
     const changedScreenIds = new Set(
       (db.prepare("SELECT id FROM screens WHERE change_status != 'unchanged'").all() as Array<{ id: string }>).map((r) => r.id)
     );
@@ -389,11 +475,22 @@ function normalizeProfile(input: any): any {
   const artifactCaptureMode = ARTIFACT_MODES.has(input?.artifact_capture_mode) ? input.artifact_capture_mode : "logs-only";
   const selectionMode = SELECTION_MODES.has(input?.selection_mode) ? input.selection_mode : "full-suite";
   const retryStrategy = RETRY_STRATEGIES.has(input?.retry_strategy) ? input.retry_strategy : "no-retry";
+  // Fast defaults: legacy profiles used concurrency=1 (almost sequential).
+  // Locked to 5 workers for now.
+  const optimizedConcurrency =
+    process.env.OPTIMIZATION_ENABLED !== "false"
+      ? calculateOptimalConcurrency({ maxConcurrency: 5, minConcurrency: 5 })
+      : 5;
+  const requestedConcurrency = Number(input?.concurrency);
+  const concurrency =
+    !requestedConcurrency || requestedConcurrency <= 1
+      ? optimizedConcurrency
+      : Math.min(5, requestedConcurrency);
   return {
     name: input?.name || "Unnamed profile",
     description: input?.description || "",
     browser_set: browserSet,
-    concurrency: Number(input?.concurrency || 1),
+    concurrency,
     artifact_capture_mode: artifactCaptureMode,
     retention_days: Number(input?.retention_days || 30),
     selection_mode: selectionMode,
@@ -401,29 +498,14 @@ function normalizeProfile(input: any): any {
     provider: input?.provider || "local",
     runner_pool_name: input?.runner_pool_name || null,
     reserved_runner_count: Number(input?.reserved_runner_count || 0),
-    // Defaults to headless unless a profile/request explicitly opts into headed
-    // (0/false) -- previously any run with no explicit headless_mode (e.g. "Run
-    // all"/"Run selected" with no profile selected, which is the common case for
-    // a fresh workspace) fell through to headed (0), spinning up a full visible
-    // Chrome window per test. Fine for one test; catastrophic for a large batch --
-    // dozens of concurrent headed windows contend for CPU/GPU/memory badly enough
-    // that page loads blow past the 15s test timeout across the whole run, which
-    // is exactly the "all tests timing out" failure mode this was causing.
     headless_mode: input?.headless_mode === false || input?.headless_mode === 0 ? 0 : 1,
     reuse_browser_instances: input?.reuse_browser_instances ? 1 : 0,
     is_default_for_team: input?.is_default_for_team ? 1 : 0,
     is_default_for_suite: input?.is_default_for_suite ? 1 : 0,
     rules_json: input?.rules_json ? JSON.stringify(input.rules_json) : null,
     schedule_json: input?.schedule_json ? JSON.stringify(input.schedule_json) : null,
-    // FR-4.10: comma-separated tags/module keywords for "custom-selection" mode
     custom_selection_query: input?.custom_selection_query ?? null,
-    // FR-4.19/FR-4.20: optional linked Environment -- when set, scheduled/webhook
-    // runs of this profile pre-flight health-check it (see preflightGuardEnvironment)
-    // and use its target_url instead of the hardcoded demo URL.
     default_environment_id: input?.default_environment_id ?? null,
-    // FR-4.24: this profile's default speed mode -- when set to "ultrafast", the client's
-    // "quick trigger" flow (see client Execution.tsx) skips the Execution Settings Panel
-    // entirely for runs against this profile.
     default_speed_mode: input?.default_speed_mode === "ultrafast" ? "ultrafast" : "fast",
   };
 }
@@ -527,6 +609,11 @@ export function listExecutionQueues() {
 export async function queueExecution(scriptId: string, targetUrl: string, input: any = {}): Promise<any> {
   const profile = input.profile_id ? (db.prepare("SELECT * FROM execution_profiles WHERE id = ?").get(input.profile_id) as any) : null;
   const config = profile ? { ...profile } : normalizeProfile(input);
+  // Honor explicit request concurrency, else upgrade stale concurrency=1 defaults (cap 5).
+  const optimizedConcurrency = calculateOptimalConcurrency({ maxConcurrency: 5, minConcurrency: 5 });
+  const requested = Number(input?.concurrency || config.concurrency || 0);
+  config.concurrency =
+    !requested || requested <= 1 ? optimizedConcurrency : Math.min(5, requested);
   const id = nanoid(10);
   const now = new Date().toISOString();
   const queuePosition = (db.prepare("SELECT COUNT(*) as count FROM execution_runs WHERE status = 'queued' ").get() as any).count + 1;
@@ -648,12 +735,24 @@ export function runExecution(scriptId: string, targetUrl: string, input: any = {
     });
     Object.assign(config, ruleOverrides);
 
+    // Upgrade stale concurrency=1 profiles; cap at 5 workers for now.
+    const optimizedConcurrency = calculateOptimalConcurrency({ maxConcurrency: 5, minConcurrency: 5 });
+    const profileConcurrency = Number(config.concurrency || 0);
+    config.concurrency =
+      !profileConcurrency || profileConcurrency <= 1
+        ? optimizedConcurrency
+        : Math.min(5, profileConcurrency);
+
     const browserSet = config.browser_set || "chromium";
     const artifactMode = config.artifact_capture_mode || "logs-only";
     const retryStrategy = config.retry_strategy || "no-retry";
     const selectionMode = config.selection_mode || "full-suite";
-    const reuseBrowser = Number(config.reuse_browser_instances || 0) === 1;
-    const headless = Number(config.headless_mode || 0) === 1;
+    // Reuse forces --workers=1; for speed runs, prefer parallel browsers.
+    const reuseBrowser =
+      process.env.FORCE_PARALLEL_WORKERS === "1"
+        ? false
+        : Number(config.reuse_browser_instances || 0) === 1;
+    const headless = Number(config.headless_mode ?? 1) === 1;
 
     // FR-4.24/FR-4.28: speed_mode defaults to 'fast' (existing checkpointed behavior) unless
     // the caller (Ultrafast trigger route) explicitly passes 'ultrafast', or the resolved
@@ -673,7 +772,8 @@ export function runExecution(scriptId: string, targetUrl: string, input: any = {
     // of them), so allure-results/ never got written no matter how many tests
     // ran. Comma-separating both keeps stdout parsing working AND lets Allure
     // actually see the run.
-    const args = ["playwright", "test", relFile, "--reporter=json,allure-playwright"];
+    const workerCount = reuseBrowser ? 1 : Math.max(1, Math.min(5, Number(config.concurrency) || 5));
+    const args = ["playwright", "test", relFile, "--reporter=json,allure-playwright", `--workers=${workerCount}`];
     if (browserSet === "chromium+firefox") args.push("--project=chromium", "--project=firefox");
     else if (browserSet === "all") args.push("--project=chromium", "--project=firefox", "--project=webkit");
     else args.push("--project=chromium"); // "chromium" and "headless" both run Chromium only
@@ -779,8 +879,14 @@ export function runExecution(scriptId: string, targetUrl: string, input: any = {
       });
     }
 
-    // Start real-time tracking for this run
-    startRealtimeTracking(runId);
+    // Start real-time tracking for this run (SSE / F1 dashboard)
+    startRealtimeTracking(runId, 1);
+    emitProgress({
+      type: "start",
+      runId,
+      timestamp: Date.now(),
+      data: { totalTests: 1, testName: scriptId },
+    });
 
     // FR-4.4: log which CI tool triggered this run, so results are attributable per-tool
     // in the audit trail as well as on the run record. Honest caveat (also in the route
@@ -811,9 +917,10 @@ export function runExecution(scriptId: string, targetUrl: string, input: any = {
           SELECTION_MODE: selectionMode,
           // FR-4.2/FR-4.6/FR-4.9: playwright.config.ts reads these to set real
           // workers/headless -- previously stored but never actually reached Playwright.
-          EXECUTION_CONCURRENCY: String(config.concurrency || 1),
+          EXECUTION_CONCURRENCY: String(workerCount),
           REUSE_BROWSER_INSTANCES: reuseBrowser ? "1" : "0",
           HEADLESS_MODE: headless ? "1" : "0",
+          SPEED_MODE: speedMode === "ultrafast" ? "ultrafast" : "fast",
         },
         maxBuffer: 20 * 1024 * 1024,
         shell: process.platform === "win32",
@@ -846,31 +953,44 @@ export function runExecution(scriptId: string, targetUrl: string, input: any = {
         // reporting as a real bug. Order matters: check the more specific
         // (automation/environment) patterns before falling back to "possible_bug"
         // so an ambiguous message doesn't get over-classified as a real defect.
-        const classifyTestFailure = (message: string | null): { failureClass: string; failureLabel: string } => {
-          if (!message) return { failureClass: "unknown", failureLabel: "No error detail captured" };
+        const classifyTestFailure = (message: string | null): { failureClass: string; failureLabel: string; failureCategory: string } => {
+          if (!message) return { failureClass: "unknown", failureLabel: "No error detail captured", failureCategory: "UNKNOWN" };
           const m = message.toLowerCase();
-          if (/syntaxerror|typeerror.*invalid url|invalid url/.test(m)) {
-            return { failureClass: "automation_issue", failureLabel: "Automation script issue -- the generated script itself is malformed (syntax/invalid input), not a product defect" };
+          if (/page crashed|target closed|browser has been closed|playwright\.connection/.test(m)) {
+            return { failureClass: "environment_issue", failureLabel: "Page/browser crashed during the test", failureCategory: "PAGE_CRASH" };
           }
           if (/net::err_|err_connection_refused|err_name_not_resolved|err_connection_timed_out|err_connection_reset|err_internet_disconnected/.test(m)) {
-            return { failureClass: "environment_issue", failureLabel: "Target unreachable (network/environment issue, not a product defect)" };
+            return { failureClass: "environment_issue", failureLabel: "Target unreachable (network/environment issue, not a product defect)", failureCategory: "NETWORK_FAILURE" };
           }
-          if (/returned http [45]\d\d|response\.ok|tohavetitle.*received|tobevisible.*received|not visible|404|page not found|internal server error/.test(m)) {
-            return { failureClass: "possible_bug", failureLabel: "Possible product bug -- page content or HTTP response did not match expectations" };
+          if (/401|403|unauthorized|forbidden|login required|session expired|not authenticated/.test(m) && /expect|status|goto|navigation/.test(m)) {
+            return { failureClass: "environment_issue", failureLabel: "Authentication/session failure — not a locator issue", failureCategory: "AUTHENTICATION_FAILURE" };
           }
-          if (/expect\(.*\)\.|assert/.test(m)) {
-            return { failureClass: "possible_bug", failureLabel: "Possible product bug -- an assertion did not match actual page/API content" };
+          if (/syntaxerror|typeerror.*invalid url|invalid url/.test(m)) {
+            return { failureClass: "automation_issue", failureLabel: "Automation script issue -- the generated script itself is malformed (syntax/invalid input), not a product defect", failureCategory: "UNKNOWN" };
           }
-          if (/(getbylabel|getbyrole|getbytext|getbytestid|getbyplaceholder|locator\()/.test(m) && /(timeout|waiting for)/.test(m)) {
-            return { failureClass: "automation_issue", failureLabel: "Automation script issue -- the generated locator didn't match anything on the page" };
+          if (/(getbylabel|getbyrole|getbytext|getbytestid|getbyplaceholder|getbyalttext|getbytitle|locator\()/.test(m) && /(timeout|waiting for|strict mode violation|resolved to \d+ elements)/.test(m)) {
+            return { failureClass: "automation_issue", failureLabel: "Locator failure -- the generated locator did not uniquely match the page (safe to consider healing)", failureCategory: "LOCATOR_FAILURE" };
           }
           if (/test timeout of \d+ms exceeded/.test(m)) {
-            if (/(getbylabel|getbyrole|getbytext|getbytestid|getbyplaceholder|locator\()/.test(m)) {
-              return { failureClass: "automation_issue", failureLabel: "Automation script issue -- step timed out before reaching an assertion" };
-            }
-            return { failureClass: "possible_bug", failureLabel: "Possible product bug -- the page did not become ready within the time limit (slow load, broken page, or blocked content)" };
+            return {
+              failureClass: "automation_issue",
+              failureLabel: "Timeout -- the test exceeded its time budget (slow load, missing wait, or insufficient timeout)",
+              failureCategory: "TIMEOUT",
+            };
           }
-          return { failureClass: "unknown", failureLabel: "Uncategorized failure -- review the error detail" };
+          if (/returned http [45]\d\d|response\.ok|internal server error|502 bad gateway|503 service/.test(m)) {
+            return { failureClass: "possible_bug", failureLabel: "Possible product bug -- HTTP/API response did not match expectations", failureCategory: "NETWORK_FAILURE" };
+          }
+          if (/tohavetitle.*received|tobevisible.*received|not visible|404|page not found/.test(m)) {
+            return { failureClass: "possible_bug", failureLabel: "Possible product bug -- page content did not match expectations (do not heal assertions)", failureCategory: "ASSERTION_FAILURE" };
+          }
+          if (/expect\(.*\)\.|assert/.test(m)) {
+            return { failureClass: "possible_bug", failureLabel: "Assertion failure -- expected application state did not match; healing is not recommended", failureCategory: "ASSERTION_FAILURE" };
+          }
+          if (/pageerror|javascript error|uncaught \(in promise\)/.test(m)) {
+            return { failureClass: "possible_bug", failureLabel: "JavaScript error on the page", failureCategory: "JAVASCRIPT_ERROR" };
+          }
+          return { failureClass: "unknown", failureLabel: "Uncategorized failure -- review the error detail", failureCategory: "UNKNOWN" };
         };
 
         // FR-6.5: per-failed-test evidence entries, parsed from Playwright's own JSON reporter
@@ -886,7 +1006,7 @@ export function runExecution(scriptId: string, targetUrl: string, input: any = {
 
         try {
           const parsed = JSON.parse(stdout);
-          const failedTests: Array<{ title: string; file: string; status: string; errorMessage: string | null; failureClass: string; failureLabel: string }> = [];
+          const failedTests: Array<{ title: string; file: string; status: string; errorMessage: string | null; failureClass: string; failureLabel: string; failureCategory: string }> = [];
           const walkSuites = (suites: any[], filePrefix = "") => {
             for (const suite of suites ?? []) {
               const file = suite.file || filePrefix;
@@ -905,7 +1025,7 @@ export function runExecution(scriptId: string, targetUrl: string, input: any = {
                     // eslint-disable-next-line no-control-regex
                     const stripAnsi = (s: string) => s.replace(/\x1b\[[0-9;]*m/g, "");
                     const errorMessage = rawMessage ? stripAnsi(String(rawMessage)).slice(0, 2000) : null;
-                    const { failureClass, failureLabel } = classifyTestFailure(errorMessage);
+                    const { failureClass, failureLabel, failureCategory } = classifyTestFailure(errorMessage);
                     failedTests.push({
                       title: spec.title,
                       file,
@@ -913,6 +1033,7 @@ export function runExecution(scriptId: string, targetUrl: string, input: any = {
                       errorMessage,
                       failureClass,
                       failureLabel,
+                      failureCategory,
                     });
                   }
                 }
@@ -924,8 +1045,8 @@ export function runExecution(scriptId: string, targetUrl: string, input: any = {
 
           if (failedTests.length > 0) {
             const insertEvidence = db.prepare(`
-              INSERT INTO execution_evidence (id, run_id, test_title, test_file, status, evidence_path, error_message, failure_class, failure_label, created_at)
-              VALUES (@id, @run_id, @test_title, @test_file, @status, @evidence_path, @error_message, @failure_class, @failure_label, @created_at)
+              INSERT INTO execution_evidence (id, run_id, test_title, test_file, status, evidence_path, error_message, failure_class, failure_label, failure_category, created_at)
+              VALUES (@id, @run_id, @test_title, @test_file, @status, @evidence_path, @error_message, @failure_class, @failure_label, @failure_category, @created_at)
             `);
             const evNow = new Date().toISOString();
             for (const ft of failedTests) {
@@ -943,6 +1064,7 @@ export function runExecution(scriptId: string, targetUrl: string, input: any = {
                 error_message: ft.errorMessage,
                 failure_class: ft.failureClass,
                 failure_label: ft.failureLabel,
+                failure_category: ft.failureCategory,
                 created_at: evNow,
               });
 
@@ -1023,10 +1145,75 @@ export function runExecution(scriptId: string, targetUrl: string, input: any = {
           browser_launch_count: browserLaunchCount,
         });
 
+        // Feature 9: persist execution cost for Costs hub
+        try {
+          const execCost = calculateExecutionCost(
+            Math.max(1, Math.round(durationMs / 1000)),
+            1,
+            "low"
+          );
+          recordCostMetrics({
+            testId: scriptId,
+            generationCost: 0,
+            executionCost: execCost,
+            storageCost: 0.01,
+            totalCost: execCost + 0.01,
+            timestamp: Date.now(),
+            manualQAEquivalent: 15,
+          });
+          emitProgress({
+            type: "cost_updated",
+            runId,
+            timestamp: Date.now(),
+            data: {
+              testsPassed: status === "passed" ? 1 : 0,
+              testsFailed: status === "passed" ? 0 : 1,
+              totalTests: 1,
+              costAccumulated: execCost + 0.01,
+              testName: scriptId,
+            },
+          });
+        } catch {
+          /* non-blocking */
+        }
+
         // Stop real-time tracking for this run
-        stopRealtimeTracking(runId);
+        stopRealtimeTracking(runId, status === "passed" ? "completed" : "failed");
 
         db.prepare("UPDATE automation_scripts SET last_run_status = ? WHERE id = ?").run(status, scriptId);
+
+        // Phases 3–4: feed real outcomes into learning / ML / predictive / adaptive (hot path).
+        try {
+          const pageType = (testCase as any)?.category?.toLowerCase?.()?.includes("api")
+            ? "api"
+            : "interactive";
+          const passed = status === "passed";
+          if (isSelfLearningEnabled()) {
+            recordTestExecution(scriptId, pageType, durationMs, passed ? "pass" : "fail", 25000);
+          }
+          if (isMLPrioritizationEnabled()) {
+            learnFromExecution(scriptId, testCase?.category || "Functional", pageType, {
+              passed,
+              bugsFound: status === "failed" ? 1 : 0,
+              duration: durationMs,
+            });
+          }
+          if (isPredictiveOptimizationEnabled()) {
+            recordBaseline(testCase?.category || "Functional", durationMs);
+          }
+          if (isAdaptiveStrategyEnabled()) {
+            const strategyName = selectStrategy({
+              pageType,
+              complexity: passed ? 0.4 : 0.8,
+              previousSuccessRate: passed ? 0.95 : 0.5,
+              availableResources: 5,
+              timeConstraints: durationMs,
+            });
+            recordStrategyResult(strategyName, passed);
+          }
+        } catch (learnErr: any) {
+          console.warn(`[execution] learning hooks skipped: ${learnErr?.message || learnErr}`);
+        }
 
         // FR-6.2 / FR-6.7: refresh the flaky flag and record actual-vs-estimated time now that the run is final
         const isFlaky = updateFlakyFlagForScript(scriptId);
@@ -1138,27 +1325,42 @@ export async function runExecutionBatch(scriptIds: string[], targetUrl: string, 
   });
 
   const scripts = scriptDetails.map((s) => s.script).filter(Boolean);
-  const sortedScriptIds = scriptDetails.map((s) => s.id);
 
   if (scripts.length === 0) throw new Error("No matching scripts found");
 
   const relFiles = scripts.map((s) => path.relative(SERVER_ROOT, s.file_path).replace(/\\/g, "/"));
   const profile = input.profile_id ? (db.prepare("SELECT * FROM execution_profiles WHERE id = ?").get(input.profile_id) as any) : null;
   const config = profile ? { ...profile } : normalizeProfile(input);
-  const requestedConcurrency = Math.max(1, Number(config.concurrency || 1));
-  
-  // Store original order for audit/logging (smoke tests prioritized)
-  const testOrderInfo = { total: scripts.length, smokeCount: scriptDetails.filter((s) => s.category === "Smoke").length };
+  const optimizedConcurrency = calculateOptimalConcurrency({ maxConcurrency: 5, minConcurrency: 5 });
+  const profileConcurrency = Number(config.concurrency || 0);
+  // Cap workers by suite size; max 5 for now.
+  const requestedConcurrency = Math.min(
+    scripts.length,
+    !profileConcurrency || profileConcurrency <= 1
+      ? optimizedConcurrency
+      : Math.min(5, profileConcurrency)
+  );
 
-  const runOnce = (workers: number): Promise<{ durationMs: number; passed: number; failed: number }> => {
+  // Windows CreateProcess argv limit (~8191). Keep each playwright invocation small.
+  const FILE_CHUNK = Math.max(5, Number(input.fileChunkSize) || 25);
+
+  const runFileChunk = (files: string[], workers: number): Promise<{ durationMs: number; passed: number; failed: number }> => {
     return new Promise((resolve) => {
       const startedAt = Date.now();
       execFile(
         getNpxCommand(),
-        ["playwright", "test", ...relFiles, "--reporter=json,allure-playwright"],
+        ["playwright", "test", ...files, "--reporter=json,allure-playwright", `--workers=${workers}`],
         {
           cwd: SERVER_ROOT,
-          env: { ...process.env, TARGET_URL: targetUrl, EXECUTION_CONCURRENCY: String(workers), REUSE_BROWSER_INSTANCES: "0", HEADLESS_MODE: "1" },
+          env: {
+            ...process.env,
+            TARGET_URL: targetUrl,
+            EXECUTION_CONCURRENCY: String(workers),
+            REUSE_BROWSER_INSTANCES: "0",
+            HEADLESS_MODE: "1",
+            SPEED_MODE: "fast",
+            ARTIFACT_CAPTURE_MODE: config.artifact_capture_mode || "logs-only",
+          },
           maxBuffer: 20 * 1024 * 1024,
           shell: process.platform === "win32",
         },
@@ -1173,7 +1375,8 @@ export async function runExecutionBatch(scriptIds: string[], targetUrl: string, 
               }
             }
           } catch {
-            /* best-effort parse */
+            /* best-effort parse — treat opaque failure as all failed in this chunk */
+            if (_error) failed = Math.max(failed, files.length);
           }
           resolve({ durationMs, passed, failed });
         }
@@ -1181,10 +1384,26 @@ export async function runExecutionBatch(scriptIds: string[], targetUrl: string, 
     });
   };
 
-  // Concurrent run first (what the user actually asked for), then a true
-  // sequential (--workers=1) baseline run of the same scripts for comparison.
+  const runOnce = async (workers: number): Promise<{ durationMs: number; passed: number; failed: number }> => {
+    let durationMs = 0;
+    let passed = 0;
+    let failed = 0;
+    for (let i = 0; i < relFiles.length; i += FILE_CHUNK) {
+      const slice = relFiles.slice(i, i + FILE_CHUNK);
+      const chunkWorkers = Math.min(workers, slice.length);
+      const result = await runFileChunk(slice, chunkWorkers);
+      durationMs += result.durationMs;
+      passed += result.passed;
+      failed += result.failed;
+    }
+    return { durationMs, passed, failed };
+  };
+
+  // Run once with parallel workers. Sequential baseline is opt-in only —
+  // previously it always re-ran the full suite with workers=1 and doubled duration.
   const concurrentResult = await runOnce(requestedConcurrency);
-  const sequentialBaseline = requestedConcurrency > 1 ? await runOnce(1) : null;
+  const sequentialBaseline =
+    input.measureBaseline === true && requestedConcurrency > 1 ? await runOnce(1) : null;
 
   const runId = nanoid(10);
   const now = new Date().toISOString();
@@ -1205,7 +1424,12 @@ export async function runExecutionBatch(scriptIds: string[], targetUrl: string, 
     script_id: scripts[0].id, // batch runs summarize under the first script's row; individual script results are in `stdout`
     status: concurrentResult.failed === 0 ? "passed" : "failed",
     duration_ms: concurrentResult.durationMs,
-    stdout: JSON.stringify({ scriptIds, passed: concurrentResult.passed, failed: concurrentResult.failed }),
+    stdout: JSON.stringify({
+      scriptIds,
+      passed: concurrentResult.passed,
+      failed: concurrentResult.failed,
+      fileChunks: Math.ceil(relFiles.length / FILE_CHUNK),
+    }),
     browser_set: "chromium",
     concurrency: requestedConcurrency,
     artifact_capture_mode: config.artifact_capture_mode || "logs-only",
@@ -1229,5 +1453,6 @@ export async function runExecutionBatch(scriptIds: string[], targetUrl: string, 
     speedup: sequentialBaseline ? Number((sequentialBaseline.durationMs / concurrentResult.durationMs).toFixed(2)) : null,
     passed: concurrentResult.passed,
     failed: concurrentResult.failed,
+    fileChunks: Math.ceil(relFiles.length / FILE_CHUNK),
   };
 }

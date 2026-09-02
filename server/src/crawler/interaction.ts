@@ -17,16 +17,50 @@ export interface PageInteractionResult {
 }
 
 async function triggerInfiniteScroll(page: Page): Promise<void> {
-  // Best-effort: scroll to bottom up to 3 times, stopping early once the
-  // page stops growing (a real "load more"/infinite-scroll page will grow;
-  // a normal page won't, so this is a bounded no-op for most sites).
+  // Bounded infinite-scroll: stop when height stops growing (max_no_change) or
+  // after max_scrolls — never scroll forever (strategy §11).
+  const maxScrolls = 8;
+  const maxNoChange = 2;
   let lastHeight = await page.evaluate(() => document.body.scrollHeight).catch(() => 0);
-  for (let i = 0; i < 3; i++) {
+  let noChange = 0;
+  for (let i = 0; i < maxScrolls; i++) {
     await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight)).catch(() => undefined);
-    await page.waitForTimeout(400);
+    await page.waitForTimeout(450);
     const newHeight = await page.evaluate(() => document.body.scrollHeight).catch(() => lastHeight);
-    if (newHeight <= lastHeight) break;
-    lastHeight = newHeight;
+    if (newHeight <= lastHeight) {
+      noChange += 1;
+      if (noChange >= maxNoChange) break;
+    } else {
+      noChange = 0;
+      lastHeight = newHeight;
+    }
+  }
+}
+
+const SAFE_PAGINATION_CLICK = /^(next|next page|older posts|load more|show more)$/i;
+
+async function triggerSafePaginationControls(page: Page): Promise<void> {
+  const locators = [
+    'a[rel="next"]',
+    'link[rel="next"]',
+    'button:has-text("Load more")',
+    'button:has-text("Show more")',
+    'a:has-text("Load more")',
+    'a:has-text("Next")',
+    'a:has-text("Older posts")',
+  ];
+  let clicks = 0;
+  for (const sel of locators) {
+    if (clicks >= 4) break;
+    const loc = page.locator(sel).first();
+    const visible = await loc.isVisible().catch(() => false);
+    if (!visible) continue;
+    const label = ((await loc.innerText().catch(() => "")) || "").replace(/\s+/g, " ").trim();
+    if (label && DESTRUCTIVE_ACTION_PATTERN.test(label)) continue;
+    if (label && !SAFE_PAGINATION_CLICK.test(label) && !/rel=["']?next/i.test(sel)) continue;
+    await loc.click({ timeout: 1200 }).catch(() => undefined);
+    await page.waitForTimeout(350);
+    clicks += 1;
   }
 }
 
@@ -38,6 +72,7 @@ export async function discoverPageInteractions(
   const shallow = Boolean(options?.shallow);
   if (!shallow) {
     await triggerInfiniteScroll(page);
+    await triggerSafePaginationControls(page);
   }
 
   const formCount = await page.locator("form").count().catch(() => 0);

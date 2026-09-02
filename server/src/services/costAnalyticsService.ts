@@ -59,12 +59,11 @@ export function generateDailyCostReport(dateStr: string = new Date().toISOString
 
   // Parse breakdown (simplified for now)
   const breakdown: CostBreakdown = {
-    llmCost: totalCost * 0.3,
-    assertionCost: totalCost * 0.2,
-    interactionCost: totalCost * 0.15,
-    crawlCost: totalCost * 0.25,
-    totalCost,
-    costPerTest: averageCostPerTest,
+    llmProcessing: totalCost * 0.3,
+    computeResources: totalCost * 0.35,
+    storage: totalCost * 0.2,
+    dataTransfer: totalCost * 0.15,
+    total: totalCost,
   };
 
   const trends = getDailyCostTrends(30);
@@ -108,12 +107,11 @@ export function generateWeeklyCostReport(weekOffset: number = 0): CostReport {
   const totalTests = rows?.test_count ?? 0;
 
   const breakdown: CostBreakdown = {
-    llmCost: totalCost * 0.3,
-    assertionCost: totalCost * 0.2,
-    interactionCost: totalCost * 0.15,
-    crawlCost: totalCost * 0.25,
-    totalCost,
-    costPerTest: averageCostPerTest,
+    llmProcessing: totalCost * 0.3,
+    computeResources: totalCost * 0.35,
+    storage: totalCost * 0.2,
+    dataTransfer: totalCost * 0.15,
+    total: totalCost,
   };
 
   const trends = getDailyCostTrends(60);
@@ -157,12 +155,11 @@ export function generateMonthlyCostReport(monthOffset: number = 0): CostReport {
   const totalTests = rows?.test_count ?? 0;
 
   const breakdown: CostBreakdown = {
-    llmCost: totalCost * 0.3,
-    assertionCost: totalCost * 0.2,
-    interactionCost: totalCost * 0.15,
-    crawlCost: totalCost * 0.25,
-    totalCost,
-    costPerTest: averageCostPerTest,
+    llmProcessing: totalCost * 0.3,
+    computeResources: totalCost * 0.35,
+    storage: totalCost * 0.2,
+    dataTransfer: totalCost * 0.15,
+    total: totalCost,
   };
 
   const trends = getDailyCostTrends(90);

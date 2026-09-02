@@ -1,4 +1,10 @@
 import { AutomationArtifacts, GeneratedTestCase, LlmProvider } from "./types.js";
+import {
+  normalizeLocatorExpression,
+  scoreStableLocator,
+  stripTransientLoadingLabel,
+  stableRoleNameExpr,
+} from "../crawler/locatorQuality.js";
 
 // A deterministic "AI" stand-in so the whole pipeline is runnable/demo-able
 // with zero API keys. Swap for AnthropicProvider once a key is available.
@@ -342,7 +348,22 @@ function extractCrawlMeta(hint?: string): { url?: string; locators: string[] } {
       locators = [];
     }
   }
-  return { url, locators };
+  return { url, locators: Array.isArray(locators) ? locators : [] };
+}
+
+/**
+ * Build a Playwright script from crawl locators without calling an LLM.
+ * Used by codegen when CRAWL_TEMPLATE_FIRST is enabled (default) to save tokens.
+ */
+export function tryBuildCrawledScriptWithoutLlm(
+  testCase: { title: string; steps: string[]; expected_result: string; category?: string },
+  language: "typescript" | "javascript" | "python",
+  hint?: string
+): string | null {
+  if (testCase.category === "API") return null;
+  const crawlMeta = extractCrawlMeta(hint);
+  if (!crawlMeta.url && crawlMeta.locators.length === 0) return null;
+  return buildCrawledPlaywrightScript(testCase, language, crawlMeta);
 }
 
 function resolveTargetUrl(crawlUrl?: string): string {
@@ -362,27 +383,212 @@ function buildCrawledPlaywrightScript(
   const fallbackUrl = resolveTargetUrl(crawlMeta.url);
   const title = escapeForTsString(testCase.title);
   const isFlow = /end-to-end flow/i.test(testCase.title);
-  // Prefer TARGET_URL at execution time (set by Generate+Run / executionService) so
-  // the same script works for the crawled site without baking a single host only.
+  const isSearchScenario =
+    /\bsite search\b/i.test(testCase.title) ||
+    (/\bsearch\b/i.test(testCase.title) && !/end-to-end flow/i.test(testCase.title)) ||
+    testCase.steps.some((s) =>
+      /\b(search term|fills? in "[^"]*search|submits? the search|presses Enter to submit the search)\b/i.test(s)
+    );
   const gotoExprTs = `process.env.TARGET_URL || '${escapeForTsString(fallbackUrl)}'`;
   const gotoExprPy = `os.environ.get("TARGET_URL", "${escapeForTsString(fallbackUrl)}")`;
 
+  const locators = normalizeCrawlLocators(
+    (crawlMeta.locators || [])
+      .map((l) => l.trim())
+      .filter(Boolean)
+      .map((l) => (l.startsWith("page.") ? l : `page.${l}`))
+  );
+
+  const navHopCount = testCase.steps.filter((s) =>
+    /\bnavigates?\s+to\b|\bto\s+reach\b|clicks?\s+.+\s+to\s+reach/i.test(s)
+  ).length;
+  // Multi-hop flows need headroom beyond the suite's fast 25s default.
+  const flowTimeoutMs = isFlow
+    ? Math.max(90_000, (navHopCount + 1) * 25_000)
+    : navHopCount >= 2
+      ? Math.max(60_000, (navHopCount + 1) * 20_000)
+      : 0;
+
   const stepLines: string[] = [];
-  let locatorIdx = 0;
+  const used = new Set<number>();
+  let lastClickLocator: string | null = null;
+  let openedSearchUi = false;
+
+  const ensureSearchUiOpen = () => {
+    if (openedSearchUi || !isSearchScenario) return;
+    openedSearchUi = true;
+    stepLines.push(`  // Open collapsed search UI when present`);
+    stepLines.push(
+      `  await page.getByRole('button', { name: /toggle search|open search|show search/i }).first().click({ timeout: 5000 }).catch(() => {});`
+    );
+    stepLines.push(
+      `  await page.locator('input[type="search"], input[name="query"]').first().waitFor({ state: 'visible', timeout: 5000 }).catch(() => {});`
+    );
+  };
+
   for (const step of testCase.steps) {
     const stepLower = step.toLowerCase();
-    const locator = crawlMeta.locators[locatorIdx] ?? crawlMeta.locators[crawlMeta.locators.length - 1];
-    if (locator && /(click|navigat|toggle|select)/.test(stepLower)) {
-      if (/navigat/.test(stepLower) && stepLower.includes("given")) {
-        stepLines.push(`  // ${collapseWhitespace(step)}`);
+    const collapsed = collapseWhitespace(step);
+
+    // Setup / assertion narrative — keep as comments
+    if (/^\s*(given|then)\b/i.test(step) || (/navigat/.test(stepLower) && /\bgiven\b/.test(stepLower))) {
+      stepLines.push(`  // ${collapsed}`);
+      continue;
+    }
+
+    // Explicit URL navigation (used for multi-page flow hops)
+    // Also accept malformed "navigates to reach <url>" leftovers.
+    const navUrl =
+      step.match(/\bnavigates?\s+to\s+["']((?:https?:\/\/|\/)[^"']+)["']/i)?.[1] ||
+      step.match(/\bnavigates?\s+to\s+reach\s+["']((?:https?:\/\/|\/)[^"']+)["']/i)?.[1];
+    if (navUrl) {
+      if (/cdn-cgi/i.test(navUrl)) {
+        stepLines.push(`  // ${collapsed} — skipped CDN/challenge URL`);
         continue;
       }
-      stepLines.push(`  await ${locator}.first().click();`);
+      stepLines.push(`  // ${collapsed}`);
+      stepLines.push(`  await page.goto(${JSON.stringify(navUrl)}, { waitUntil: 'domcontentloaded', timeout: 45000 });`);
       stepLines.push(`  await page.waitForLoadState('domcontentloaded');`);
-      if (/click|toggle|select/.test(stepLower)) locatorIdx++;
-    } else {
-      stepLines.push(`  // ${collapseWhitespace(step)}`);
+      lastClickLocator = null;
+      continue;
     }
+
+    // "navigates to reach <page title>" — no URL yet; skip rather than invent a brittle click
+    if (/\bnavigates?\s+to\s+reach\b/i.test(step)) {
+      stepLines.push(`  // ${collapsed} — skipped unresolved title hop`);
+      continue;
+    }
+
+    // Legacy "clicks X to reach Y" flow hops: when Y is a URL, always navigate
+    // directly — never click brittle marketing/card link names. Same-page hops
+    // (non-URL target) still use a robust force click.
+    const clickToReach =
+      step.match(
+        /\bclicks?\s+(?:"([^"]+)"|'([^']+)'|(.+?))\s+to\s+reach\s+(?:"([^"]+)"|'([^']+)'|(\S.+))\s*$/i
+      ) ||
+      step.match(
+        /\bclicks?\s+(?:"([^"]+)"|'([^']+)'|(.+?))\s+(?:to\s+(?:go\s+to|open)|→|->)\s+(?:"([^"]+)"|'([^']+)'|(\S.+))\s*$/i
+      );
+    if (clickToReach) {
+      stepLines.push(`  // ${collapsed}`);
+      const label = (clickToReach[1] || clickToReach[2] || clickToReach[3] || "").trim();
+      const target = (clickToReach[4] || clickToReach[5] || clickToReach[6] || "")
+        .trim()
+        .replace(/[."']+$/, "");
+      const targetLooksLikeUrl =
+        /^https?:\/\//i.test(target) ||
+        (/^\//.test(target) && target.length > 1) ||
+        looksLikeUrlName(target);
+
+      if (targetLooksLikeUrl) {
+        if (/cdn-cgi/i.test(target)) {
+          stepLines.push(`  // Skipped CDN/challenge hop → ${target}`);
+        } else {
+          const abs =
+            /^https?:\/\//i.test(target) || target.startsWith("/")
+              ? target
+              : `https://${target.replace(/^\/\//, "")}`;
+          stepLines.push(
+            `  await page.goto(${JSON.stringify(abs)}, { waitUntil: 'domcontentloaded', timeout: 45000 });`
+          );
+          stepLines.push(`  await page.waitForLoadState('domcontentloaded');`);
+        }
+        lastClickLocator = null;
+      } else {
+        const clickLocator = emitRobustClickLocator(label, locators, used);
+        if (clickLocator) {
+          stepLines.push(...emitRobustClickLines(clickLocator));
+          lastClickLocator = withFirst(clickLocator);
+        } else {
+          stepLines.push(`  // Skipped fragile hop "${label}" — no stable locator; flow continues`);
+        }
+      }
+      continue;
+    }
+
+    const quoted = step.match(/["']([^"']+)["']/)?.[1];
+    const locator = resolveCrawlLocatorForStep(step, locators, used);
+
+    if (/\bfills?\s+in\b|\benters?\b|\btypes?\b|\bpastes?\b|\battach(?:es)?\b/.test(stepLower)) {
+      stepLines.push(`  // ${collapsed}`);
+      ensureSearchUiOpen();
+      if (locator) {
+        const value = inferFillValue(stepLower, quoted);
+        // Prefer fill directly — scrollIntoView times out on hidden/collapsed controls.
+        stepLines.push(`  await ${withFirst(locator)}.fill(${JSON.stringify(value)}, { timeout: 10000 });`);
+        lastClickLocator = null;
+      }
+      continue;
+    }
+
+    if (/\bchecks?\b|\bticks?\b/.test(stepLower)) {
+      stepLines.push(`  // ${collapsed}`);
+      if (locator) {
+        stepLines.push(`  await ${withFirst(locator)}.check({ force: true, timeout: 10000 });`);
+        lastClickLocator = null;
+      }
+      continue;
+    }
+
+    if (/\bselects?\b/.test(stepLower) && !/\bsubmits?\b/.test(stepLower)) {
+      stepLines.push(`  // ${collapsed}`);
+      if (locator) {
+        stepLines.push(`  await ${withFirst(locator)}.selectOption({ index: 1 });`);
+        lastClickLocator = null;
+      }
+      continue;
+    }
+
+    if (/\bpress(?:es)?\s+enter\b|\bkeyboard\b/.test(stepLower)) {
+      stepLines.push(`  // ${collapsed}`);
+      stepLines.push(`  await page.keyboard.press('Enter');`);
+      stepLines.push(`  await page.waitForLoadState('domcontentloaded');`);
+      lastClickLocator = null;
+      continue;
+    }
+
+    if (/\bclicks?\b|\bsubmits?\b|\btoggles?\b|\bpress(?:es)?\b/.test(stepLower)) {
+      stepLines.push(`  // ${collapsed}`);
+      ensureSearchUiOpen();
+
+      // Empty-submit / generic submit: prefer a real Search/Submit control, else Enter.
+      const isGenericSubmit = /\bsubmits?\b/.test(stepLower) && !quoted;
+      let clickLocator =
+        isGenericSubmit || /\bsubmits?\b/.test(stepLower)
+          ? pickSubmitLocator(locators, used) || (quoted ? locator : null)
+          : locator || pickSubmitLocator(locators, used);
+
+      if (clickLocator && isFilterChipLocator(clickLocator)) {
+        clickLocator = pickSubmitLocator(locators, used);
+      }
+
+      // Synthesize a role click from the quoted label when crawl locators omitted it
+      if (!clickLocator && quoted && !isFilterChipLocator(`name: "${quoted}"`) && !looksLikeUrlName(quoted)) {
+        clickLocator = emitRobustClickLocator(quoted, locators, used);
+      }
+
+      if (clickLocator) {
+        const normalized = withFirst(clickLocator);
+        if (lastClickLocator === normalized) {
+          continue;
+        }
+        stepLines.push(...emitRobustClickLines(clickLocator));
+        lastClickLocator = normalized;
+      } else if (isGenericSubmit || isSearchScenario) {
+        stepLines.push(`  await page.keyboard.press('Enter');`);
+        stepLines.push(`  await page.waitForLoadState('domcontentloaded');`);
+        lastClickLocator = null;
+      }
+      continue;
+    }
+
+    // Leaves empty / blank — no interaction
+    if (/\bleaves?\b|doesn't|does not|without entering|\bblank\b|\bempty\b/.test(stepLower)) {
+      stepLines.push(`  // ${collapsed}`);
+      continue;
+    }
+
+    stepLines.push(`  // ${collapsed}`);
   }
 
   if (language === "python") {
@@ -408,11 +614,222 @@ with sync_playwright() as p:
 
 // Auto-generated from crawler-discovered scenario (mock provider)
 test('${title}', async ({ page }) => {
-  await page.goto(${gotoExprTs}, { waitUntil: 'domcontentloaded', timeout: 45000 });
+${flowTimeoutMs ? `  test.setTimeout(${flowTimeoutMs});\n` : ""}  await page.goto(${gotoExprTs}, { waitUntil: 'domcontentloaded', timeout: 45000 });
   await page.waitForLoadState('domcontentloaded');
+  await page.locator('[aria-busy="true"], [role="progressbar"], .spinner, .loader, .loading').first().waitFor({ state: 'hidden', timeout: 8000 }).catch(() => {});
 ${stepLines.length ? stepLines.join("\n") + "\n" : ""}${flowAssertion}
 });
 `;
+}
+
+function normalizeCrawlLocators(locators: string[]): string[] {
+  return locators
+    .map((l) => {
+      // Prefer label/CSS for search fields — role mapping differs across engines and
+      // "Search term" is often only exposed via <label for=...>, not as searchbox name.
+      if (/Search term/i.test(l) || (/[Ss]earch/.test(l) && /textbox|searchbox/.test(l))) {
+        return `page.getByLabel(${JSON.stringify("Search term")}).or(page.locator('input[type="search"], input[name="query"]'))`;
+      }
+      let next = l.replace(
+        /getByRole\(\s*(['"])textbox\1\s*,\s*\{\s*name:\s*(['"])([^'"]*[Ss]earch[^'"]*)\2/g,
+        'getByRole("searchbox", { name: "$3"'
+      );
+      next = next.replace(
+        /getByRole\(\s*(['"])textbox\1\s*,\s*\{\s*name:\s*(['"])Search term\2/g,
+        'getByRole("searchbox", { name: "Search term"'
+      );
+      // Never bake transient loading labels into button/link locators.
+      next = normalizeLocatorExpression(next);
+      return next;
+    })
+    .sort((a, b) => scoreStableLocator(b) - scoreStableLocator(a));
+}
+
+function isFilterChipLocator(locator: string): boolean {
+  const label = locatorLabel(locator) || "";
+  // Only treat short facet names as non-submit when they are buttons.
+  if (!/button|getByRole\(\s*["']button["']/i.test(locator) && !/^name:\s*/.test(locator)) {
+    // synthetic "name: \"X\"" checks from click synthesis still need chip detection
+    if (!/^name:\s*/.test(locator)) return false;
+  }
+  return /^(all|none|images?|videos?|audio|filter|filters|sort|close|more|\d+)$/i.test(label.trim());
+}
+
+function withFirst(locator: string): string {
+  if (/\.first\s*\(/.test(locator)) return locator;
+  return `${locator}.first()`;
+}
+
+/** Prefer short, stable accessible-name matching; avoid exact matches on card blurbs. */
+function emitRobustClickLocator(label: string, locators: string[], used: Set<number>): string | null {
+  const cleaned = collapseWhitespace(label);
+  if (!cleaned || looksLikeUrlName(cleaned) || isFragileClickLabel(cleaned)) return null;
+
+  // Prefer an existing crawl locator whose label matches
+  const want = cleaned.toLowerCase();
+  const fromInventory = locators.findIndex((l, i) => {
+    if (used.has(i)) return false;
+    const locLabel = (locatorLabel(l) || "").toLowerCase();
+    return locLabel === want || locLabel.startsWith(want.slice(0, 24));
+  });
+  if (fromInventory >= 0) {
+    used.add(fromInventory);
+    return locators[fromInventory];
+  }
+
+  // Long marketing/card titles are unstable — match by prefix regex instead of exact name
+  if (cleaned.length > 36) {
+    const prefix = cleaned.slice(0, 28).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    return `page.getByRole('link', { name: /${prefix}/i })`;
+  }
+
+  return `page.getByRole('link', { name: ${JSON.stringify(cleaned)} })`;
+}
+
+function isFragileClickLabel(label: string): boolean {
+  const v = label.trim();
+  if (v.length < 2) return true;
+  if (/cdn-cgi|^#|^(https?:\/\/|www\.)/i.test(v)) return true;
+  // Extremely long truncated card blurbs almost always animate / truncate in DOM
+  if (v.length > 90) return true;
+  return false;
+}
+
+function emitRobustClickLines(locator: string): string[] {
+  const normalized = withFirst(locator);
+  return [
+    // force:true tolerates CSS transitions / carousels that never report "stable"
+    `  await ${normalized}.click({ timeout: 8000, force: true });`,
+    `  await page.waitForLoadState('domcontentloaded');`,
+  ];
+}
+
+function looksLikeUrlName(value: string): boolean {
+  return /^(https?:\/\/|www\.|\/[\w.-]+)/i.test(value.trim());
+}
+
+function locatorLabel(locator: string): string | null {
+  const m =
+    locator.match(/name:\s*["']([^"']+)["']/) ||
+    locator.match(/getBy(?:Text|Label|Placeholder|TestId)\(\s*["']([^"']+)["']/) ||
+    locator.match(/locator\(\s*["']#([^"']+)["']/) ||
+    locator.match(/name=["']([^"']+)["']/);
+  return m?.[1] || null;
+}
+
+function resolveCrawlLocatorForStep(step: string, locators: string[], used: Set<number>): string | null {
+  const quoted = step.match(/["']([^"']+)["']/)?.[1];
+  const wantsClick = /\bclicks?\b|\bsubmits?\b|\btoggles?\b|\bpress(?:es)?\b/.test(step.toLowerCase());
+  const wantsFill = /\bfills?\s+in\b|\benters?\b|\btypes?\b|\bpastes?\b|\battach(?:es)?\b/.test(step.toLowerCase());
+  if (quoted) {
+    const want = stripTransientLoadingLabel(quoted).toLowerCase() || quoted.toLowerCase();
+    const ranked = locators
+      .map((l, i) => {
+        const label = stripTransientLoadingLabel(locatorLabel(l) || "").toLowerCase();
+        let score = -1;
+        if (label === want) score = 100;
+        else if (label.startsWith(want + " ") || label.endsWith(" " + want)) score = 60;
+        else if (want.length >= 4 && label.includes(want)) score = 40;
+        else if (want.length >= 4 && want.includes(label) && label.length >= 3) score = 30;
+        if (score < 0) return null;
+        // Prefer a11y locators over raw #id for fills/clicks.
+        score += Math.min(20, Math.max(0, scoreStableLocator(l) / 5));
+        if (wantsClick) {
+          if (/getByRole\(\s*["']button["']|type=["']submit["']/i.test(l)) score += 50;
+          if (/getByRole\(\s*["'](textbox|searchbox)["']/i.test(l)) score -= 40;
+        }
+        if (wantsFill) {
+          if (/getByLabel|getByPlaceholder|getByRole\(\s*["'](textbox|searchbox)["']/i.test(l)) score += 35;
+          if (/locator\(["']#/.test(l)) score -= 25;
+        }
+        if (used.has(i) && label !== want) score -= 20;
+        return { l, i, score };
+      })
+      .filter(Boolean) as Array<{ l: string; i: number; score: number }>;
+    ranked.sort((a, b) => b.score - a.score);
+    if (ranked[0] && ranked[0].score >= 40) {
+      used.add(ranked[0].i);
+      // If the best match is still a brittle #id for a fill, synthesize label/role.
+      if (wantsFill && /locator\(["']#/.test(ranked[0].l)) {
+        const idle = stripTransientLoadingLabel(quoted);
+        return `page.getByLabel(${JSON.stringify(idle)}).or(page.getByRole('textbox', { name: ${JSON.stringify(idle)} }))`;
+      }
+      return normalizeLocatorExpression(ranked[0].l);
+    }
+    // No inventory match: for fills, still prefer label/role over inventing CSS.
+    if (wantsFill) {
+      const idle = stripTransientLoadingLabel(quoted);
+      if (idle) {
+        return `page.getByLabel(${JSON.stringify(idle)}).or(page.getByRole('textbox', { name: ${JSON.stringify(idle)} }))`;
+      }
+    }
+    if (wantsClick) {
+      const idle = stripTransientLoadingLabel(quoted);
+      const stable = stableRoleNameExpr(quoted);
+      if (stable) {
+        return `page.getByRole('button', { name: /${stable.regexSource}/i })`;
+      }
+      if (idle) {
+        return `page.getByRole('button', { name: ${JSON.stringify(idle)} })`;
+      }
+    }
+  }
+  // Fall back only for quoted targets that soft-failed ranking. Do NOT claim a
+  // random unused locator for narrative steps like "submits the form without
+  // entering any values" — that stole the submit button before pickSubmitLocator ran.
+  if (!quoted) return null;
+  const rankedFallback = locators
+    .map((l, i) => ({ l, i, score: scoreStableLocator(l) }))
+    .filter(({ l, i }) => {
+      if (used.has(i)) return false;
+      const label = locatorLabel(l) || "";
+      return !looksLikeUrlName(label) && !isFilterChipLocator(l);
+    })
+    .sort((a, b) => b.score - a.score);
+  if (rankedFallback[0]) {
+    used.add(rankedFallback[0].i);
+    return normalizeLocatorExpression(rankedFallback[0].l);
+  }
+  return null;
+}
+
+function pickSubmitLocator(locators: string[], used: Set<number>): string | null {
+  const scored = locators
+    .map((l, i) => ({ l, i }))
+    .filter(({ l, i }) => !used.has(i) && !isFilterChipLocator(l))
+    .map(({ l, i }) => {
+      let score = scoreStableLocator(l);
+      if (/type=["']submit["']/i.test(l)) score += 50;
+      if (/getByRole\(\s*["']button["']/i.test(l)) score += 20;
+      const label = stripTransientLoadingLabel(locatorLabel(l) || "");
+      if (/\b(search|submit|go|find|send|save|login|sign|subscribe)\b/i.test(label)) score += 40;
+      if (/button|submit/i.test(l)) score += 5;
+      return { l: normalizeLocatorExpression(l), i, score };
+    })
+    .filter((x) => x.score > 0)
+    .sort((a, b) => b.score - a.score);
+
+  if (scored[0]) {
+    used.add(scored[0].i);
+    return scored[0].l;
+  }
+  return null;
+}
+
+function inferFillValue(stepLower: string, quoted?: string): string {
+  if (/invalid email|bad email|malformed/.test(stepLower)) return "not-an-email";
+  if (/whitespace|spaces only|blank spaces/.test(stepLower)) return "   ";
+  if (/extremely long|very long|too long/.test(stepLower)) return "x".repeat(256);
+  if (/empty|leave(?:s|ing)? .* empty|without/.test(stepLower)) return "";
+  if (/email/.test(stepLower) || /email/i.test(quoted || "")) return "user@example.com";
+  if (/password|passcode/.test(stepLower)) return "ValidPass123!";
+  if (/phone|tel|mobile/.test(stepLower)) return "5551234567";
+  // Word-boundary: avoid matching "age" inside "Message".
+  if (/\b(number|qty|amount|age|zip|postal)\b/.test(stepLower) || /\b(number|qty|amount|age|zip|postal)\b/i.test(quoted || "")) {
+    return "42";
+  }
+  if (/url|website/.test(stepLower)) return "https://example.com";
+  return "test value";
 }
 
 function resolveLocatorForStep(stepText: string, language: "typescript" | "javascript" | "python"): { code: string; usedFallback: boolean } {

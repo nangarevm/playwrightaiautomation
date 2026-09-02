@@ -4,14 +4,27 @@
 // the caller (services/crawlerService.ts) supplies a `getBaseline` lookup and
 // owns all persistence, so this module stays independently testable.
 
-import { runDiscoveryCrawl } from "./discovery.js";
+import { runDiscoveryCrawl, type DiscoveredPage } from "./discovery.js";
 import { buildCrudFlowScenario, buildFlowScenariosForSite, buildIntraPageFlowScenario, buildScenariosForPage } from "./scenarios.js";
 import { buildApiScenariosForSite } from "./apiScenarios.js";
-import { classifyChange, diffElements, hashElements, type ChangeStatus } from "./diff.js";
+import { classifyChange, compareLinkSets, compareSnapshots, diffElements, hashElements, type ChangeStatus } from "./diff.js";
 import { collectPageSpellingIssues } from "./spellcheck.js";
 import { dedupeScenariosFuzzy, scenarioFingerprint } from "./scenarioDedup.js";
 import { normalizeUrl } from "./urlUtils.js";
-import type { ApiCallRecord, ComponentInventoryItem, CrawlOptions, ElementRecord, PageDiff, ScenarioRecord, SpellingIssue } from "./types.js";
+import type { ApiCallRecord, ComponentInventoryItem, CoverageMode, CrawlOptions, ElementRecord, PageDiff, ScenarioRecord, SpellingIssue } from "./types.js";
+
+function resolveCoverageMode(mode?: CoverageMode): CoverageMode {
+  if (mode === "standard" || mode === "full" || mode === "minimal") return mode;
+  const env = (process.env.CRAWL_COVERAGE_MODE || "minimal").toLowerCase();
+  if (env === "standard" || env === "full") return env;
+  return "minimal";
+}
+
+function maxFlowsForMode(mode: CoverageMode): number {
+  if (mode === "minimal") return 5;
+  if (mode === "standard") return 10;
+  return 20;
+}
 
 export interface CrawledPageOutput {
   url: string;
@@ -24,6 +37,16 @@ export interface CrawledPageOutput {
   diff: PageDiff | null;
   spellingIssues: SpellingIssue[];
   componentInventory: ComponentInventoryItem[];
+  etag?: string | null;
+  lastModified?: string | null;
+  a11yHash?: string | null;
+  screenshotHash?: string | null;
+  changeSignals?: DiscoveredPage["changeSignals"];
+  scanMode?: string;
+  skippedHttp?: boolean;
+  links?: Array<{ url: string; label: string }>;
+  snapshot?: DiscoveredPage["snapshot"];
+  httpStatus?: number | null;
 }
 
 export interface CrawlRunOutput {
@@ -40,16 +63,31 @@ export interface CrawlRunOutput {
     changedPages: number;
     unchangedPages: number;
     reusedBaselines: number;
+    skippedHttp?: number;
+    scannedBrowser?: number;
+    deepScans?: number;
+    coverage?: {
+      reachableHtmlPages: number;
+      sitemapUrls: number;
+      combinedUnique: number;
+      sitemapOnly: number;
+      externalLinks: number;
+      maxDepth: number;
+      statusCounts: Record<string, number>;
+      sitemapKeys?: string[];
+    };
+    restoredPages?: number;
   };
 }
 
 export interface BaselineLookup {
-  (url: string): { hash: string; elements: ElementRecord[] } | null;
+  (url: string): import("./types.js").PageBaselineMeta | null;
 }
 
 export async function runCrawl(options: CrawlOptions, getBaseline: BaselineLookup): Promise<CrawlRunOutput> {
   const mode = options.mode ?? "full";
-  const { pages, edges, authenticated, authMessage } = await runDiscoveryCrawl({
+  const coverageMode = resolveCoverageMode(options.coverageMode);
+  const { pages, edges, authenticated, authMessage, coverage } = await runDiscoveryCrawl({
     ...options,
     mode,
     getBaseline,
@@ -59,23 +97,51 @@ export async function runCrawl(options: CrawlOptions, getBaseline: BaselineLooku
   const output: CrawledPageOutput[] = pages.map((discovered) => {
     const hash = hashElements(discovered.elements);
     const baseline = getBaseline(discovered.url);
-    // Reused baseline pages are unchanged by definition -- skip re-hash surprises
-    // from shallow vs deep locator differences.
-    const changeStatus: ChangeStatus = discovered.reusedBaseline
+    const snapshotEvents = compareSnapshots(baseline?.snapshot, discovered.snapshot);
+    const linkEvents = compareLinkSets(baseline?.links, discovered.links);
+    const events = [...snapshotEvents, ...linkEvents];
+    if (discovered.changeSignals?.structure === "changed") {
+      events.push({ type: "STRUCTURE_CHANGED", severity: "high" });
+    }
+    if (discovered.changeSignals?.visual === "changed") {
+      events.push({ type: "VISUAL_CHANGED", severity: "high" });
+    }
+
+    const priorState = (baseline?.priorChangeStatus || "").toLowerCase();
+    const wasGone = priorState === "removed" || priorState === "temporarily_unavailable";
+    let changeStatus: ChangeStatus = discovered.reusedBaseline
       ? "unchanged"
       : classifyChange(baseline?.hash, hash);
+    if (wasGone) changeStatus = "restored";
+    else if (discovered.errorCategory) changeStatus = "error";
+    else if (changeStatus === "unchanged" && events.length > 0) changeStatus = "changed";
     if (discovered.reusedBaseline) reusedBaselines++;
 
     let scenarios: ScenarioRecord[] = [];
     let diff: PageDiff | null = null;
     if (changeStatus !== "unchanged") {
-      scenarios = dedupeScenariosFuzzy(buildScenariosForPage(discovered.title, discovered.elements, discovered.formCount, discovered.url));
-      const crudFlow = buildCrudFlowScenario(discovered.title, discovered.elements);
-      if (crudFlow) scenarios.push(crudFlow);
-      scenarios = dedupeScenariosFuzzy(scenarios);
+      scenarios = dedupeScenariosFuzzy(
+        buildScenariosForPage(
+          discovered.title,
+          discovered.elements,
+          discovered.formCount,
+          discovered.url,
+          discovered.componentInventory,
+          coverageMode
+        )
+      );
+      // CRUD lifecycle only in standard/full — minimal already has form happy-path.
+      if (coverageMode !== "minimal") {
+        const crudFlow = buildCrudFlowScenario(discovered.title, discovered.elements);
+        if (crudFlow) scenarios.push(crudFlow);
+        scenarios = dedupeScenariosFuzzy(scenarios);
+      }
     }
-    if (changeStatus === "changed" && baseline) {
+    if ((changeStatus === "changed" || changeStatus === "restored") && baseline) {
       diff = diffElements(baseline.elements, discovered.elements);
+      diff.events = events;
+    } else if (events.length) {
+      diff = { added: [], removed: [], changed: [], events };
     }
 
     options.onProgress?.({
@@ -94,10 +160,26 @@ export async function runCrawl(options: CrawlOptions, getBaseline: BaselineLooku
       scenarios,
       changeStatus,
       diff,
-      spellingIssues: changeStatus === "unchanged" ? [] : collectPageSpellingIssues(discovered.title, discovered.elements),
+      // Always reported, including for unchanged pages: the site-level spelling
+      // count is an inventory of what's on the site, not a per-run delta.
+      spellingIssues: collectPageSpellingIssues(discovered.title, discovered.elements),
       componentInventory: discovered.componentInventory,
+      etag: discovered.etag,
+      lastModified: discovered.lastModified,
+      a11yHash: discovered.a11yHash,
+      screenshotHash: discovered.screenshotHash,
+      changeSignals: discovered.changeSignals,
+      scanMode: discovered.scanMode,
+      skippedHttp: discovered.skippedHttp,
+      links: discovered.links,
+      snapshot: discovered.snapshot,
+      httpStatus: discovered.httpStatus ?? discovered.snapshot?.httpStatus ?? null,
     };
   });
+
+  const skippedHttp = pages.filter((p) => p.skippedHttp).length;
+  const deepScans = pages.filter((p) => p.scanMode === "deep").length;
+  const scannedBrowser = pages.filter((p) => !p.skippedHttp).length;
 
   const siteHost = safeHost(options.url);
   if (siteHost) {
@@ -108,39 +190,51 @@ export async function runCrawl(options: CrawlOptions, getBaseline: BaselineLooku
     for (const page of output) {
       if (page.changeStatus === "unchanged") continue;
       const apiScenarios = apiScenariosByPage.get(page.url);
-      if (apiScenarios) page.scenarios.push(...apiScenarios);
+      if (!apiScenarios?.length) continue;
+      // Minimal: one API scenario per page max.
+      page.scenarios.push(...(coverageMode === "minimal" ? apiScenarios.slice(0, 1) : apiScenarios));
     }
   }
 
+  // Multi-page flows once from the crawl entry URL (not once per changed page).
   const siteFlowFingerprints = new Set<string>();
-  for (const page of output) {
-    if (page.changeStatus === "unchanged") continue;
+  const entryUrl = normalizeUrl(options.url);
+  const flowOwnerPages = output.filter((p) => p.changeStatus !== "unchanged");
+  if (flowOwnerPages.length > 0) {
+    const flowStart =
+      output.find((p) => normalizeUrl(p.url) === entryUrl)?.url || flowOwnerPages[0].url;
     const flowResults = buildFlowScenariosForSite(
-      page.url,
+      flowStart,
       output.map((p) => ({ url: p.url, title: p.title, elements: p.elements })),
-      edges
+      edges,
+      { maxFlows: maxFlowsForMode(coverageMode) }
     );
-    for (const { scenario, entryUrl } of flowResults) {
+    for (const { scenario, entryUrl: flowEntry } of flowResults) {
       const fp = scenarioFingerprint(scenario);
       if (siteFlowFingerprints.has(fp)) continue;
       siteFlowFingerprints.add(fp);
-      const owner = output.find((p) => p.url === entryUrl);
+      const owner = output.find((p) => p.url === flowEntry);
       owner?.scenarios.push(scenario);
     }
   }
 
-  // Guarantee the flow slot is never empty for a page that has interactive
-  // elements when the site graph didn't yield a multi-page journey for it.
+  // Guarantee the flow slot is never empty when the site graph didn't yield journeys.
+  // Minimal: at most one intra-page flow for the whole site.
   for (const page of output) {
     if (page.changeStatus === "unchanged") continue;
+    if (coverageMode === "minimal" && siteFlowFingerprints.size > 0) break;
     const hasFlow = page.scenarios.some((s) => s.type === "flow");
-    if (hasFlow) continue;
+    if (hasFlow) {
+      if (coverageMode === "minimal") break;
+      continue;
+    }
     const intra = buildIntraPageFlowScenario(page.title, page.elements);
     if (intra) {
       const fp = scenarioFingerprint(intra);
       if (!siteFlowFingerprints.has(fp)) {
         siteFlowFingerprints.add(fp);
         page.scenarios.push(intra);
+        if (coverageMode === "minimal") break;
       }
     }
   }
@@ -162,6 +256,11 @@ export async function runCrawl(options: CrawlOptions, getBaseline: BaselineLooku
       changedPages: output.filter((p) => p.changeStatus === "changed").length,
       unchangedPages: output.filter((p) => p.changeStatus === "unchanged").length,
       reusedBaselines,
+      skippedHttp,
+      scannedBrowser,
+      deepScans,
+      coverage,
+      restoredPages: output.filter((p) => p.changeStatus === "restored").length,
     },
   };
 }

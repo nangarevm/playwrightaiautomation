@@ -610,6 +610,13 @@ ensureColumn("org_settings", "economy_tier_length_threshold", "INTEGER NOT NULL 
 // existing checkpointed behavior) rather than silently reinterpreted as Ultrafast.
 ensureColumn("execution_runs", "speed_mode", "TEXT NOT NULL DEFAULT 'fast'");
 ensureColumn("execution_profiles", "default_speed_mode", "TEXT NOT NULL DEFAULT 'fast'");
+// Speed fix: legacy profiles defaulted concurrency=1 which serialized large suites.
+// Normalize to 5 workers (current cap) — also clamp any temporary higher values.
+try {
+  db.prepare("UPDATE execution_profiles SET concurrency = 5 WHERE concurrency IS NULL OR concurrency <= 1 OR concurrency > 5").run();
+} catch {
+  /* best-effort */
+}
 // FR-4.26: QA-Lead-editable confidence threshold Ultrafast Mode uses to auto-accept
 // a generated test case, mirroring the self_heal_confidence_threshold pattern above.
 ensureColumn("org_settings", "ultrafast_confidence_threshold", "REAL NOT NULL DEFAULT 0.85");
@@ -667,6 +674,21 @@ ensureColumn("crawl_sites", "recrawl_summary_json", "TEXT");
 ensureColumn("crawl_sites", "last_full_crawl_date", "TEXT");
 ensureColumn("crawl_pages", "is_persisted_from_previous_crawl", "INTEGER NOT NULL DEFAULT 0");
 ensureColumn("crawl_sites", "crawl_mode", "TEXT"); // incremental | full
+ensureColumn("crawl_pages", "etag", "TEXT");
+ensureColumn("crawl_pages", "last_modified", "TEXT");
+ensureColumn("crawl_pages", "a11y_hash", "TEXT");
+ensureColumn("crawl_pages", "change_signals_json", "TEXT NOT NULL DEFAULT '{}'");
+// AI Crawler: the page's same-origin outbound links as of its last real scan.
+// Cheap-skipped pages (HTTP 304 / sitemap lastmod) never navigate, so discovery
+// replays this adjacency into the nav graph -- without it the flow graph shrinks
+// on every incremental re-crawl and journey selection becomes nondeterministic.
+ensureColumn("crawl_pages", "links_json", "TEXT NOT NULL DEFAULT '[]'");
+ensureColumn("crawl_pages", "miss_count", "INTEGER NOT NULL DEFAULT 0");
+ensureColumn("crawl_pages", "http_status", "INTEGER");
+ensureColumn("crawl_sites", "schedule_cron", "TEXT");
+ensureColumn("crawl_sites", "watch_enabled", "INTEGER NOT NULL DEFAULT 0");
+ensureColumn("crawl_sites", "ci_webhook_secret", "TEXT");
+ensureColumn("crawl_sites", "last_progress_json", "TEXT");
 // Heuristic classification of *why* a test failed -- 'automation_issue' (the
 // generated script's own locator/timeout, not the product), 'environment_issue'
 // (target unreachable/DNS/connection refused), or 'possible_bug' (an assertion
@@ -675,6 +697,11 @@ ensureColumn("crawl_sites", "crawl_mode", "TEXT"); // incremental | full
 // instead of dumping every failure into one undifferentiated list.
 ensureColumn("execution_evidence", "failure_class", "TEXT");
 ensureColumn("execution_evidence", "failure_label", "TEXT");
+ensureColumn("execution_evidence", "failure_category", "TEXT");
+ensureColumn("automation_scripts", "locator_quality_json", "TEXT");
+ensureColumn("automation_scripts", "readiness_score", "REAL");
+ensureColumn("automation_scripts", "heal_events_json", "TEXT NOT NULL DEFAULT '[]'");
+ensureColumn("org_settings", "self_heal_suggest_threshold", "REAL NOT NULL DEFAULT 0.7");
 
 // Feature #7: Interaction Validation - stores validation results for user interactions
 // detected during test execution (clicks, form inputs, navigation, etc.)

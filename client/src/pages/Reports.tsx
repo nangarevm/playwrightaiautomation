@@ -3,7 +3,7 @@ import { Pill } from "../components/Pill.js";
 import { StatTile } from "../components/StatTile.js";
 import { api } from "../api.js";
 
-export default function Reports() {
+export default function Reports({ compact = false }: { compact?: boolean }) {
   const { testCases, scripts, dashboard, hoursSaved, flakyTests, withBusy } = useApp();
 
   const withScript = testCases.filter((t) => scripts.some((s) => s.test_case_id === t.id)).length;
@@ -14,13 +14,15 @@ export default function Reports() {
       : 0;
 
   return (
-    <div className="space-y-6">
-      <div>
-        <h2 className="font-display text-xl tracking-tight">Reports</h2>
-        <p className="text-sm text-ink/60">Release-ready summary and exports</p>
-      </div>
+    <div className={compact ? "space-y-3" : "space-y-6"}>
+      {!compact && (
+        <div>
+          <h2 className="font-display text-xl tracking-tight">Reports</h2>
+          <p className="text-sm text-ink/60">Release-ready summary and exports</p>
+        </div>
+      )}
 
-      <div className="grid gap-3 md:grid-cols-5">
+      <div className={`grid gap-2 ${compact ? "grid-cols-2 sm:grid-cols-3" : "md:grid-cols-5 gap-3"}`}>
         <StatTile label="Tests generated" value={String(testCases.length)} />
         <StatTile label="Automation coverage" value={`${automationCoverage}%`} />
         <StatTile label="Execution success rate" value={dashboard ? `${dashboard.passRate}%` : "—"} />

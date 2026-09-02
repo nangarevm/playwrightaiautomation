@@ -3,7 +3,7 @@ import { api, CrawlSite, CrawlSiteDetail } from "../api.js";
 import { Pill } from "../components/Pill.js";
 import { AllureReportPanel } from "../components/AllureReportPanel.js";
 import { BugReportPanel } from "../components/BugReportPanel.js";
-import { CRAWL_PRESETS, type PresetId, getDefaultPreset } from "../config/crawlPresets.js";
+import { CRAWL_PRESETS, type PresetId } from "../config/crawlPresets.js";
 
 // AI Crawler end-to-end flow (project brief Phase 8): onboarding -> live crawl
 // progress -> curate-before-generate review -> one-click test generation + run ->
@@ -32,13 +32,23 @@ export default function Crawler() {
   const [multiUrls, setMultiUrls] = useState("");
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
-  const [maxPages, setMaxPages] = useState(50);
-  const [crawlAllPages, setCrawlAllPages] = useState(false);
   const [captureApi, setCaptureApi] = useState(false);
+  /** auto = server decides (diff on re-crawl); incremental/full = force */
+  const [crawlMode, setCrawlMode] = useState<"auto" | "incremental" | "full">("auto");
+  /** minimal = few scenarios/page covering load + components + primary flow (saves LLM tokens) */
+  const [coverageMode, setCoverageMode] = useState<"minimal" | "standard" | "full">("minimal");
+  const [lastModeInfo, setLastModeInfo] = useState<{ mode?: string; modeReason?: string; isRerun?: boolean } | null>(null);
+  const [cockpit, setCockpit] = useState<any>(null);
+  const [impactTier, setImpactTier] = useState<"smoke" | "critical" | "full-delta">("critical");
+  const [impactBusy, setImpactBusy] = useState(false);
+  const [impactMsg, setImpactMsg] = useState<string | null>(null);
+  const [impactJobId, setImpactJobId] = useState<string | null>(null);
+  const [impactJob, setImpactJob] = useState<any>(null);
+  const impactPollRef = useRef<number | null>(null);
+  const [ciSecret, setCiSecret] = useState<string | null>(null);
   
-  // Smart presets
+  // Smart presets — shown as three simple depth choices in the UI
   const [selectedPreset, setSelectedPreset] = useState<PresetId>("comprehensive");
-  const [useCustomPages, setUseCustomPages] = useState(false);
 
   const [site, setSite] = useState<CrawlSite | null>(null);
   const [detail, setDetail] = useState<CrawlSiteDetail | null>(null);
@@ -114,6 +124,8 @@ export default function Crawler() {
 
   const [batchQueue, setBatchQueue] = useState<BatchItem[]>([]);
   const [batchRunning, setBatchRunning] = useState(false);
+  const [showAdvanced, setShowAdvanced] = useState(false);
+  const [showTestDetails, setShowTestDetails] = useState(false);
 
   // Download generated test cases straight from this tab -- reuses the same
   // multi-format bulk export the Library page uses, scoped to whichever test
@@ -139,18 +151,38 @@ export default function Crawler() {
     }
   }
 
-  // Get effective crawler configuration from selected preset or custom settings
-  function getEffectiveConfig() {
-    if (useCustomPages) {
-      return {
-        maxPages: maxPages,
-        crawlAllPages: crawlAllPages,
-      };
+  function stopImpactPolling() {
+    if (impactPollRef.current) {
+      window.clearInterval(impactPollRef.current);
+      impactPollRef.current = null;
     }
+  }
+
+  function startImpactPolling(siteId: string, jobId: string) {
+    stopImpactPolling();
+    impactPollRef.current = window.setInterval(async () => {
+      try {
+        const res = await api.crawlerGetImpactSuiteJob(siteId, jobId);
+        const job = res?.job;
+        if (!job) return;
+        setImpactJob(job);
+        setImpactMsg(job.message || null);
+        if (job.status === "completed" || job.status === "failed") {
+          stopImpactPolling();
+          setImpactBusy(false);
+        }
+      } catch {
+        /* keep polling through transient errors */
+      }
+    }, 2500);
+  }
+
+  function getEffectiveConfig() {
     const preset = CRAWL_PRESETS[selectedPreset];
     return {
       maxPages: preset.maxPages,
       crawlAllPages: preset.maxPages === 999999,
+      concurrency: Math.min(5, preset.concurrency || 5),
     };
   }
 
@@ -160,16 +192,23 @@ export default function Crawler() {
     setDetail(null);
     setSelected(new Set());
     setDiscoveredPages([]);
+    setLastModeInfo(null);
     try {
+      const config = getEffectiveConfig();
       const res = await api.crawlerRun({
         url: url.trim(),
         username: username || undefined,
         password: password || undefined,
-        maxPages: crawlAllPages ? 999999 : (Number(maxPages) || 10),
+        maxPages: config.crawlAllPages ? 999999 : config.maxPages,
         captureApi,
+        concurrency: config.concurrency,
+        mode: crawlMode === "auto" ? undefined : crawlMode,
+        coverageMode,
       });
+      setLastModeInfo({ mode: res.mode, modeReason: res.modeReason, isRerun: res.isRerun });
       const initial = await api.crawlerGetSite(res.siteId);
       setSite(initial);
+      api.crawlerGetCockpit(res.siteId).then(setCockpit).catch(() => undefined);
       stopPolling();
       pollRef.current = window.setInterval(async () => {
         try {
@@ -189,6 +228,12 @@ export default function Crawler() {
             if (updated.status === "completed") {
               const d = await api.crawlerGetSiteDetail(res.siteId);
               setDetail(d);
+              api.crawlerGetCockpit(res.siteId).then(setCockpit).catch(() => undefined);
+              api.crawlerPlanImpactSuite(res.siteId, "critical").then((p) => {
+                if (p?.plan?.estimatedTests) {
+                  setImpactMsg(`Impact suite ready: ~${p.plan.estimatedTests} test(s) on changed/new pages`);
+                }
+              }).catch(() => undefined);
             }
           }
         } catch (e: any) {
@@ -201,7 +246,10 @@ export default function Crawler() {
     }
   }
 
-  useEffect(() => () => stopPolling(), []);
+  useEffect(() => () => {
+    stopPolling();
+    stopImpactPolling();
+  }, []);
 
   // Awaitable version of the same poll-until-done loop startCrawl runs live for a
   // single URL -- runBatch (below) awaits one of these per queued URL so it can
@@ -249,6 +297,9 @@ export default function Crawler() {
           password: password || undefined,
           maxPages: config.crawlAllPages ? 999999 : config.maxPages,
           captureApi,
+          concurrency: config.concurrency,
+          mode: crawlMode === "auto" ? undefined : crawlMode,
+          coverageMode,
         });
         const finalSite = await pollUntilDone(res.siteId, (s) =>
           setBatchQueue((prev) =>
@@ -386,6 +437,45 @@ export default function Crawler() {
     }
   }
 
+  /** Add missing component-coverage scenarios from the last crawl inventory (no re-crawl). */
+  async function ensureComponentTests() {
+    if (!site) return;
+    setBusy("component-coverage");
+    setError(null);
+    try {
+      const res = await api.crawlerEnsureComponentCoverage(site.id);
+      await refreshDetail();
+      setProgressMessage(
+        res.added > 0
+          ? `Added ${res.added} component test scenario(s) across ${res.pagesUpdated} page(s). Select them below and Generate + Run.`
+          : "All discovered components already have coverage scenarios."
+      );
+    } catch (e: any) {
+      setError(e.message);
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  /** Shrink the active scenario list to minimal/standard/full without re-crawling. */
+  async function rebuildCoverage() {
+    if (!site) return;
+    setBusy("coverage-rebuild");
+    setError(null);
+    try {
+      const res = await api.crawlerRebuildCoverage(site.id, coverageMode);
+      await refreshDetail();
+      setProgressMessage(
+        `Coverage rebuilt (${res.coverageMode}): +${res.added} added, ${res.retired} retired across ${res.pagesUpdated} page(s).`
+      );
+      setTimeout(() => setProgressMessage(null), 6000);
+    } catch (e: any) {
+      setError(e.message);
+    } finally {
+      setBusy(null);
+    }
+  }
+
   // Closes most of the loop from inside this one tab: generate real Playwright
   // tests for the selected scenarios and run each one immediately (Ultrafast --
   // no profile/environment picking needed). The Allure report itself is built
@@ -496,7 +586,19 @@ export default function Crawler() {
     }
   }
 
-  const isRunning = site?.status === "running";
+  // First-time friendly: after a crawl finishes, pre-select every new scenario so
+  // "Run all tests" works without manual checkbox hunting.
+  useEffect(() => {
+    if (site?.status !== "completed" || !detail) return;
+    const ids = detail.pages.flatMap((p) =>
+      p.scenarios.filter((s) => !s.generated_test_case_id).map((s) => s.id)
+    );
+    if (ids.length === 0) return;
+    setSelected((prev) => (prev.size === 0 ? new Set(ids) : prev));
+    // Collapse every page card — keeps the list scannable until the user expands one.
+    setCollapsedPageIds(new Set(detail.pages.map((p) => p.id)));
+  }, [site?.status, detail?.pages.length]);
+
   const allScenarios = detail?.pages.flatMap((p) => p.scenarios) ?? [];
   const uiScenarioCount = allScenarios.filter((s) => s.type !== "api").length;
   const apiScenarioCount = allScenarios.filter((s) => s.type === "api").length;
@@ -507,160 +609,156 @@ export default function Crawler() {
   const negativeCount = allScenarios.filter((s) => s.type === "negative").length;
   const edgeCount = allScenarios.filter((s) => s.type === "edge").length;
   const flowCount = allScenarios.filter((s) => s.type === "flow").length;
+  const isRunning = site?.status === "running";
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-3 max-w-3xl">
       <div>
-        <h2 className="font-display text-xl tracking-tight">AI Crawler</h2>
-        <p className="text-sm text-ink/60">
-          Point it at a URL, curate the discovered scenarios, then generate and run real Playwright tests in one flow — build, view, download, or
-          email the Allure report right here, and download the generated test cases in any format.
+        <h2 className="font-display text-base tracking-tight">Test a website</h2>
+        <p className="text-xs text-ink/55 mt-0.5">
+          Enter a URL, crawl the site, then run automated tests — one flow, no extra steps.
         </p>
       </div>
 
-      {error && <div className="rounded-md border border-alert bg-alert/5 p-3 text-sm text-alert">{error}</div>}
+      {error && <div className="rounded-md border border-alert bg-alert/5 px-3 py-2 text-xs text-alert">{error}</div>}
 
-      {/* Step 0: Crawl Preset Selection */}
-      <div className="rounded-lg border border-line bg-white/60 shadow-panel p-4 space-y-4">
-        <h3 className="font-medium text-sm">Crawl Preset</h3>
-        
-        {/* Preset Selection Grid */}
-        <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
-          {Object.values(CRAWL_PRESETS).map((preset) => (
-            <button
-              key={preset.id}
-              onClick={() => { setSelectedPreset(preset.id); setUseCustomPages(false); }}
-              className={`rounded-lg border-2 p-3 text-left transition ${
-                selectedPreset === preset.id && !useCustomPages
-                  ? "border-ink bg-ink/5"
-                  : "border-line hover:border-ink/50"
-              }`}
-            >
-              <div className="text-lg mb-1">{preset.icon}</div>
-              <div className="text-xs font-medium">{preset.label}</div>
-              <div className="text-[10px] text-ink/60 mt-1">
-                {preset.maxPages === 999999 ? "Unlimited" : preset.maxPages} pages
-              </div>
-              <div className="text-[10px] text-ink/50 mt-1">
-                {preset.estimatedTime}
-              </div>
-            </button>
-          ))}
-        </div>
-        
-        {/* Selected Preset Details */}
-        {!useCustomPages && (
-          <div className="rounded border border-line/70 bg-ink/[0.02] p-3 space-y-2">
-            <p className="text-sm font-medium">{CRAWL_PRESETS[selectedPreset].label}</p>
-            <p className="text-xs text-ink/70">{CRAWL_PRESETS[selectedPreset].description}</p>
-            <div className="flex gap-4 text-xs text-ink/60">
-              <span>⏱️ {CRAWL_PRESETS[selectedPreset].estimatedTime}</span>
-              <span>💰 {CRAWL_PRESETS[selectedPreset].estimatedCost}</span>
-            </div>
-          </div>
-        )}
-        
-        {/* Custom Option */}
-        <label className="flex items-center gap-2 text-xs">
-          <input
-            type="checkbox"
-            checked={useCustomPages}
-            onChange={(e) => setUseCustomPages(e.target.checked)}
-          />
-          <span className="font-medium">Use custom max pages:</span>
-          <input
-            type="number"
-            min={1}
-            disabled={!useCustomPages}
-            value={maxPages}
-            onChange={(e) => setMaxPages(Number(e.target.value))}
-            className="w-20 px-2 py-1 rounded border border-line disabled:opacity-50"
-          />
-        </label>
-        
-        <label className="flex items-center gap-2 text-xs">
-          <input
-            type="checkbox"
-            checked={crawlAllPages}
-            onChange={(e) => setCrawlAllPages(e.target.checked)}
-            disabled={useCustomPages}
-          />
-          <span>Crawl all pages (unlimited discovery)</span>
-        </label>
-      </div>
-
-      {/* Step 1: Onboarding */}
+      {/* Setup — URL, depth, start */}
       <div className="rounded-lg border border-line bg-white/60 shadow-panel p-4 space-y-3">
-        <div className="flex items-center rounded-full border border-line bg-white/60 p-0.5 text-xs w-fit">
-          <button className={`rounded-full px-3 py-1 font-medium ${urlMode === "single" ? "bg-ink text-paper" : "text-ink/60"}`} onClick={() => setUrlMode("single")}>
-            Single URL
-          </button>
-          <button className={`rounded-full px-3 py-1 font-medium ${urlMode === "multi" ? "bg-ink text-paper" : "text-ink/60"}`} onClick={() => setUrlMode("multi")}>
-            Multiple URLs
-          </button>
-        </div>
-
-        {urlMode === "single" ? (
-          <label className="text-xs text-ink/60 space-y-1 block">
-            <span>Target URL</span>
-            <input className="w-full rounded-md border border-line px-2 py-1.5 text-sm" value={url} onChange={(e) => setUrl(e.target.value)} placeholder="https://example.com" />
-          </label>
-        ) : (
-          <label className="text-xs text-ink/60 space-y-1 block">
-            <span>Target URLs — one per line</span>
-            <textarea
-              className="w-full rounded-md border border-line px-2 py-1.5 text-sm font-mono"
-              rows={4}
-              value={multiUrls}
-              onChange={(e) => setMultiUrls(e.target.value)}
-              placeholder={"https://example.com\nhttps://staging.example.com\nhttps://another-app.com"}
-            />
-          </label>
-        )}
-
-        <div className="grid gap-3 md:grid-cols-2">
-          <label className="text-xs text-ink/60 space-y-1">
-            <span>Username (optional)</span>
-            <input className="w-full rounded-md border border-line px-2 py-1.5 text-sm" value={username} onChange={(e) => setUsername(e.target.value)} />
-          </label>
-          <label className="text-xs text-ink/60 space-y-1">
-            <span>Password (optional)</span>
-            <input type="password" className="w-full rounded-md border border-line px-2 py-1.5 text-sm" value={password} onChange={(e) => setPassword(e.target.value)} />
-          </label>
-        </div>
-        <label className="flex items-center gap-1.5 text-xs text-ink/70">
-          <input type="checkbox" checked={captureApi} onChange={(e) => setCaptureApi(e.target.checked)} />
-          Capture API calls per interaction (--capture-api) — required for API scenarios below to appear
+        <label className="block space-y-1">
+          <span className="text-xs font-medium text-ink/70">Website URL</span>
+          <input
+            className="w-full rounded-md border border-line px-3 py-2 text-sm"
+            value={url}
+            onChange={(e) => setUrl(e.target.value)}
+            placeholder="https://your-site.com"
+            disabled={isRunning}
+          />
         </label>
-        {urlMode === "multi" && <p className="text-xs text-ink/50">Same settings apply to every URL. Crawled one at a time so a local run doesn't compete with itself for resources.</p>}
-        {urlMode === "single" && knownSite?.known && (
+
+        <div className="space-y-1">
+          <span className="text-xs font-medium text-ink/70">How deep to crawl</span>
+          <div className="flex flex-wrap gap-2">
+            {(
+              [
+                { id: "quick" as PresetId, label: "Quick", hint: "~10 pages · ~5 min" },
+                { id: "comprehensive" as PresetId, label: "Standard", hint: "~50 pages · ~20 min" },
+                { id: "enterprise" as PresetId, label: "Full site", hint: "All pages" },
+              ] as const
+            ).map(({ id, label, hint }) => (
+              <button
+                key={id}
+                type="button"
+                onClick={() => setSelectedPreset(id)}
+                className={`rounded-lg border px-3 py-2 text-left text-xs transition ${
+                  selectedPreset === id ? "border-ink bg-ink/5" : "border-line hover:border-ink/40"
+                }`}
+              >
+                <span className="font-medium block">{label}</span>
+                <span className="text-ink/45">{hint}</span>
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {knownSite?.known && (
           <p className="text-xs text-signal">
-            This URL was crawled before (last: {knownSite.site?.last_crawled_at ?? "unknown"}) — this run will auto-switch to diff mode and only
-            re-capture changed pages.
+            Previously crawled — next run checks for changes only (fast re-crawl).
           </p>
         )}
-        {urlMode === "single" ? (
+
+        <div className="flex flex-wrap items-center gap-2 pt-1">
           <button
-            className="rounded-md bg-ink text-paper px-3 py-1.5 text-xs font-medium disabled:opacity-40"
-            disabled={!url.trim() || isRunning}
+            type="button"
+            className="rounded-md bg-ink text-paper px-4 py-2 text-sm font-medium disabled:opacity-40"
+            disabled={!url.trim() || isRunning || batchRunning}
             onClick={startCrawl}
           >
-            {isRunning ? "Crawling…" : knownSite?.known ? "Re-crawl (diff mode)" : "Start crawl"}
+            {isRunning ? "Crawling…" : knownSite?.known ? "Re-crawl site" : "Start crawl"}
           </button>
-        ) : (
           <button
-            className="rounded-md bg-ink text-paper px-3 py-1.5 text-xs font-medium disabled:opacity-40"
-            disabled={batchRunning}
-            onClick={runBatch}
+            type="button"
+            className="text-xs text-ink/50 underline-offset-2 hover:underline"
+            onClick={() => setShowAdvanced((v) => !v)}
           >
-            {batchRunning ? "Crawling…" : `Crawl ${new Set(multiUrls.split(/[\n,]/).map((u) => u.trim()).filter(Boolean)).size || ""} URL(s)`}
+            {showAdvanced ? "Hide options" : "Login & more options"}
           </button>
+        </div>
+
+        {showAdvanced && (
+          <div className="rounded-md border border-line/70 bg-ink/[0.02] p-3 space-y-3 text-xs">
+            <div className="grid gap-2 sm:grid-cols-2">
+              <label className="space-y-1 block">
+                <span className="text-ink/60">Username (optional)</span>
+                <input className="w-full rounded-md border border-line px-2 py-1.5 text-sm" value={username} onChange={(e) => setUsername(e.target.value)} />
+              </label>
+              <label className="space-y-1 block">
+                <span className="text-ink/60">Password (optional)</span>
+                <input type="password" className="w-full rounded-md border border-line px-2 py-1.5 text-sm" value={password} onChange={(e) => setPassword(e.target.value)} />
+              </label>
+            </div>
+            <label className="flex items-center gap-2 text-ink/70">
+              <input type="checkbox" checked={captureApi} onChange={(e) => setCaptureApi(e.target.checked)} />
+              Also test API calls (slower crawl)
+            </label>
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="text-ink/60">Re-crawl:</span>
+              {(["auto", "incremental", "full"] as const).map((m) => (
+                <button
+                  key={m}
+                  type="button"
+                  className={`rounded-full px-2.5 py-1 capitalize ${crawlMode === m ? "bg-ink text-paper" : "border border-line text-ink/60"}`}
+                  onClick={() => setCrawlMode(m)}
+                >
+                  {m}
+                </button>
+              ))}
+            </div>
+            <div className="flex items-center rounded-full border border-line bg-white/60 p-0.5 w-fit">
+              <button className={`rounded-full px-3 py-1 ${urlMode === "single" ? "bg-ink text-paper" : "text-ink/60"}`} onClick={() => setUrlMode("single")}>
+                Single URL
+              </button>
+              <button className={`rounded-full px-3 py-1 ${urlMode === "multi" ? "bg-ink text-paper" : "text-ink/60"}`} onClick={() => setUrlMode("multi")}>
+                Multiple URLs
+              </button>
+            </div>
+            {urlMode === "multi" && (
+              <>
+                <textarea
+                  className="w-full rounded-md border border-line px-2 py-1.5 text-sm font-mono"
+                  rows={3}
+                  value={multiUrls}
+                  onChange={(e) => setMultiUrls(e.target.value)}
+                  placeholder="One URL per line"
+                />
+                <button
+                  type="button"
+                  className="rounded-md bg-ink text-paper px-3 py-1.5 text-xs font-medium disabled:opacity-40"
+                  disabled={batchRunning}
+                  onClick={runBatch}
+                >
+                  {batchRunning ? "Crawling…" : "Crawl all URLs"}
+                </button>
+              </>
+            )}
+            <label className="space-y-1 block">
+              <span className="text-ink/60">Test coverage</span>
+              <select
+                className="w-full rounded-md border border-line px-2 py-1.5 text-sm"
+                value={coverageMode}
+                onChange={(e) => setCoverageMode(e.target.value as typeof coverageMode)}
+              >
+                <option value="minimal">Minimal — smoke + key flows (fastest)</option>
+                <option value="standard">Standard — forms + components</option>
+                <option value="full">Full — maximum scenarios</option>
+              </select>
+            </label>
+          </div>
         )}
       </div>
 
       {/* Multi-URL queue: live status per URL, click a completed one to curate it below */}
       {urlMode === "multi" && batchQueue.length > 0 && (
-        <div className="rounded-lg border border-line bg-white/60 shadow-panel p-4 space-y-2">
+        <div className="rounded-lg border border-line bg-white/60 shadow-panel p-3 space-y-2">
           <p className="font-medium text-sm">Crawl queue ({batchQueue.filter((b) => b.status === "completed").length}/{batchQueue.length} done)</p>
           <ul className="space-y-1.5">
             {batchQueue.map((item, i) => (
@@ -686,171 +784,113 @@ export default function Crawler() {
         </div>
       )}
 
-      {/* Step 2: live progress */}
+      {/* Live progress — one compact line + optional detail */}
       {urlMode === "single" && site && (
-        <div className="rounded-lg border border-line bg-white/60 shadow-panel p-4 space-y-3">
-          <div className="flex items-center justify-between">
-            <p className="font-medium text-sm">Crawl status</p>
-            <Pill tone={site.status === "completed" ? "good" : site.status === "failed" ? "bad" : "warn"}>{site.status}</Pill>
+        <div className="rounded-lg border border-line bg-white/60 shadow-panel px-4 py-3 space-y-2">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-sm">
+              <Pill tone={site.status === "completed" ? "good" : site.status === "failed" ? "bad" : "warn"}>
+                {site.status === "running" ? "Crawling…" : site.status}
+              </Pill>
+              <span className="text-ink/70">
+                <strong>{site.pages_discovered}</strong> pages · <strong>{site.forms_discovered}</strong> forms ·{" "}
+                <strong>{site.scenarios_discovered}</strong> tests
+              </span>
+            </div>
+            {site.status === "completed" && detail && detail.pages.length > 0 && (
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  className="text-xs text-ink/50 underline-offset-2 hover:underline"
+                  onClick={() => setShowTestDetails((v) => !v)}
+                >
+                  {showTestDetails ? "Hide test list" : `View / edit tests (${selected.size})`}
+                </button>
+                <button
+                  type="button"
+                  className="rounded-md bg-ink text-paper px-4 py-2 text-sm font-medium disabled:opacity-40"
+                  disabled={selected.size === 0 || busy === "generate-run-report"}
+                  onClick={generateRunAndReport}
+                >
+                  {busy === "generate-run-report" ? "Running tests…" : `Run all tests (${selected.size})`}
+                </button>
+              </div>
+            )}
           </div>
-          
-          {/* Progress metrics */}
-          <div className="grid gap-2 md:grid-cols-4">
-            <div className="rounded border border-line/70 bg-ink/[0.02] p-2">
-              <p className="text-[11px] uppercase tracking-wide text-ink/50">Pages</p>
-              <p className="text-lg font-semibold text-ink">{site.pages_discovered}</p>
-            </div>
-            <div className="rounded border border-line/70 bg-ink/[0.02] p-2">
-              <p className="text-[11px] uppercase tracking-wide text-ink/50">Forms</p>
-              <p className="text-lg font-semibold text-ink">{site.forms_discovered}</p>
-            </div>
-            <div className="rounded border border-line/70 bg-ink/[0.02] p-2">
-              <p className="text-[11px] uppercase tracking-wide text-ink/50">Scenarios</p>
-              <p className="text-lg font-semibold text-ink">{site.scenarios_discovered}</p>
-            </div>
-            <div className="rounded border border-line/70 bg-ink/[0.02] p-2">
-              <p className="text-[11px] uppercase tracking-wide text-ink/50">Spelling issues</p>
-              <p className="text-lg font-semibold text-ink">{site.spelling_issues_found}</p>
-            </div>
-          </div>
-
-          {site.current_page && (
-            <div className="rounded border border-line/70 bg-signal/5 p-2">
-              <p className="text-xs text-ink/60">Currently crawling:</p>
-              <p className="text-sm font-medium text-signal truncate">{site.current_page}</p>
-            </div>
+          {site.current_page && site.status === "running" && (
+            <p className="text-xs text-ink/50 truncate">Now: {site.current_page}</p>
           )}
-          
+          {progressMessage && (
+            <p className="text-xs text-signal flex items-center gap-1.5">
+              <span className="inline-block h-1.5 w-1.5 rounded-full bg-signal animate-pulse" />
+              {progressMessage}
+            </p>
+          )}
           {site.error && <p className="text-xs text-alert">{site.error}</p>}
-
-          {/* Discovered pages list */}
-          {discoveredPages.length > 0 && (
-            <div className="rounded border border-line/70 bg-white/50 p-3 space-y-2 max-h-64 overflow-y-auto">
-              <p className="text-xs font-medium text-ink/70">Discovered Pages ({discoveredPages.length})</p>
-              <ul className="space-y-1">
-                {discoveredPages.map((page, i) => (
-                  <li key={i} className="text-xs text-ink/60 flex items-start gap-2">
-                    <span className="text-ink/40 shrink-0">✓</span>
-                    <span className="truncate" title={page.url}>
-                      {page.title}
-                    </span>
-                  </li>
-                ))}
-              </ul>
-            </div>
+          {detail?.site?.recrawl_summary && site.status === "completed" && (
+            <p className="text-xs text-ink/55">
+              Re-crawl: {detail.site.recrawl_summary.unchangedPages ?? 0} unchanged,{" "}
+              {detail.site.recrawl_summary.changedPages ?? 0} changed, {detail.site.recrawl_summary.newPages ?? 0} new
+              {detail.site.recrawl_summary.restoredPages
+                ? `, ${detail.site.recrawl_summary.restoredPages} restored`
+                : ""}
+              {detail.site.recrawl_summary.temporarilyUnavailable
+                ? `, ${detail.site.recrawl_summary.temporarilyUnavailable} temporarily unavailable`
+                : ""}
+              {detail.site.recrawl_summary.removedPages
+                ? `, ${detail.site.recrawl_summary.removedPages} removed`
+                : ""}
+              {detail.site.recrawl_summary.sitemapAdded || detail.site.recrawl_summary.sitemapRemoved
+                ? ` · sitemap +${detail.site.recrawl_summary.sitemapAdded ?? 0}/-${detail.site.recrawl_summary.sitemapRemoved ?? 0}`
+                : ""}
+            </p>
           )}
         </div>
       )}
 
-      {/* Step 3: review & curate */}
-      {detail && detail.pages.length > 0 && (
-        <div className="rounded-lg border border-line bg-white/60 shadow-panel p-4 space-y-4">
+      {/* Optional test list — hidden until user wants to curate */}
+      {showTestDetails && detail && detail.pages.length > 0 && (
+        <div className="rounded-lg border border-line bg-white/60 shadow-panel p-3 space-y-3">
           <div className="flex items-center justify-between flex-wrap gap-2">
-            <p className="font-medium text-sm">Review & curate ({visibleScenarioCount} scenario(s) across {detail.pages.length} page(s))</p>
-            <div className="flex gap-2 flex-wrap">
-              <button className="rounded-md border border-ink/20 text-ink/70 px-3 py-1.5 text-xs" onClick={selectAll}>
-                Select all (filtered)
+            <p className="text-sm font-medium">
+              {selected.size} of {allScenarios.filter((s) => !s.generated_test_case_id).length} tests selected
+            </p>
+            <div className="flex gap-2 flex-wrap text-xs">
+              <button className="rounded-md border border-ink/20 text-ink/70 px-2.5 py-1" onClick={selectAllPages}>
+                Select all
               </button>
-              <button className="rounded-md border border-ink/20 text-ink/70 px-3 py-1.5 text-xs font-medium" onClick={selectAllPages} title="Select all scenarios from all pages, ignoring current filter">
-                Select all pages
-              </button>
-              <button className="rounded-md border border-ink/20 text-ink/70 px-3 py-1.5 text-xs disabled:opacity-40" disabled={selected.size === 0} onClick={clearSelection}>
+              <button className="rounded-md border border-ink/20 text-ink/70 px-2.5 py-1 disabled:opacity-40" disabled={selected.size === 0} onClick={clearSelection}>
                 Clear
               </button>
-              <button className="rounded-md border border-ink/20 text-ink/70 px-3 py-1.5 text-xs disabled:opacity-40" disabled={selected.size === 0 || busy === "bulk-delete"} onClick={deleteSelected}>
-                Delete selected ({selected.size})
-              </button>
-              <button className="rounded-md border border-ink/20 text-ink/70 px-3 py-1.5 text-xs disabled:opacity-40" disabled={selected.size === 0 || busy === "generate"} onClick={generateTests}>
-                Generate tests only ({selected.size})
-              </button>
-              <button
-                className="rounded-md bg-ink text-paper px-3 py-1.5 text-xs font-medium disabled:opacity-40"
-                disabled={selected.size === 0 || busy === "generate-run-report"}
-                onClick={generateRunAndReport}
-                title="Generate real Playwright tests and run them immediately (Ultrafast) — build the Allure report below afterward"
-              >
-                {busy === "generate-run-report" ? "Working…" : `Generate + Run (${selected.size})`}
-              </button>
             </div>
-            {progressMessage && (
-              <p className="text-xs text-signal flex items-center gap-1.5">
-                <span className="inline-block h-1.5 w-1.5 rounded-full bg-signal animate-pulse" />
-                {progressMessage}
-              </p>
-            )}
           </div>
 
-          {/* UI scenarios come from discovered page elements; API scenarios come from
-              same-origin XHR/fetch calls captured during the crawl (needs --capture-api
-              checked above). Both feed the exact same curate/generate/run/download
-              actions -- this only controls which ones are shown and selectable. */}
-          <div className="flex items-center gap-3 flex-wrap">
-            <div className="flex items-center rounded-full border border-line bg-white/60 p-0.5 text-xs w-fit">
-              <button
-                className={`rounded-full px-3 py-1 font-medium ${scenarioFilter === "ui" ? "bg-ink text-paper" : "text-ink/60"}`}
-                onClick={() => setScenarioFilter("ui")}
-              >
-                UI ({uiScenarioCount})
-              </button>
-              <button
-                className={`rounded-full px-3 py-1 font-medium ${scenarioFilter === "api" ? "bg-ink text-paper" : "text-ink/60"}`}
-                onClick={() => setScenarioFilter("api")}
-              >
-                API ({apiScenarioCount})
-              </button>
-              <button
-                className={`rounded-full px-3 py-1 font-medium ${scenarioFilter === "both" ? "bg-ink text-paper" : "text-ink/60"}`}
-                onClick={() => setScenarioFilter("both")}
-              >
-                Both ({uiScenarioCount + apiScenarioCount})
-              </button>
+          {showAdvanced && (
+            <div className="flex items-center gap-2 flex-wrap text-xs">
+              <div className="flex items-center rounded-full border border-line bg-white/60 p-0.5">
+                {(["ui", "api", "both"] as const).map((f) => (
+                  <button
+                    key={f}
+                    className={`rounded-full px-2.5 py-1 capitalize ${scenarioFilter === f ? "bg-ink text-paper" : "text-ink/60"}`}
+                    onClick={() => setScenarioFilter(f)}
+                  >
+                    {f === "both" ? `All (${uiScenarioCount + apiScenarioCount})` : `${f} (${f === "ui" ? uiScenarioCount : apiScenarioCount})`}
+                  </button>
+                ))}
+              </div>
+              <div className="flex items-center rounded-full border border-line bg-white/60 p-0.5">
+                {(["all", "smoke", "functional", "regression"] as const).map((t) => (
+                  <button
+                    key={t}
+                    className={`rounded-full px-2.5 py-1 capitalize ${tierFilter === t ? "bg-ink text-paper" : "text-ink/60"}`}
+                    onClick={() => setTierFilter(t)}
+                  >
+                    {t}
+                  </button>
+                ))}
+              </div>
             </div>
-            {apiScenarioCount === 0 && (
-              <span className="text-xs text-ink/40">
-                No API scenarios yet — check "Capture API calls per interaction" and (re-)crawl to discover the site's own backend endpoints.
-              </span>
-            )}
-          </div>
-
-          {/* Smoke = page-load for every discovered page. Functional = clicks/
-              negatives/API. Regression = happy-path + re-verify. Flow scenarios
-              (type=flow) are multi-page or in-page journeys, usually under Regression. */}
-          <div className="flex items-center gap-2 flex-wrap">
-            <span className="text-xs text-ink/50">Test suite:</span>
-            <div className="flex items-center rounded-full border border-line bg-white/60 p-0.5 text-xs w-fit">
-              <button
-                className={`rounded-full px-3 py-1 font-medium ${tierFilter === "all" ? "bg-ink text-paper" : "text-ink/60"}`}
-                onClick={() => setTierFilter("all")}
-              >
-                All ({allScenarios.length})
-              </button>
-              <button
-                className={`rounded-full px-3 py-1 font-medium ${tierFilter === "smoke" ? "bg-ink text-paper" : "text-ink/60"}`}
-                onClick={() => setTierFilter("smoke")}
-                title="Page-load smoke: every discovered page must load"
-              >
-                Smoke ({smokeCount})
-              </button>
-              <button
-                className={`rounded-full px-3 py-1 font-medium ${tierFilter === "functional" ? "bg-ink text-paper" : "text-ink/60"}`}
-                onClick={() => setTierFilter("functional")}
-                title="Clicks, negatives, edge cases, API checks"
-              >
-                Functional ({functionalCount})
-              </button>
-              <button
-                className={`rounded-full px-3 py-1 font-medium ${tierFilter === "regression" ? "bg-ink text-paper" : "text-ink/60"}`}
-                onClick={() => setTierFilter("regression")}
-                title="Happy-path + re-verify + flow journeys"
-              >
-                Regression ({regressionCount})
-              </button>
-            </div>
-            <span className="text-xs text-ink/40">
-              Flow: {flowCount} · Negative: {negativeCount} · Edge: {edgeCount} · every page gets smoke + regression + negative/edge baselines
-            </span>
-          </div>
-
+          )}
           {detail.pages.map((page) => {
             const visibleScenarios = page.scenarios.filter(scenarioVisible);
             const isCollapsed = collapsedPageIds.has(page.id);
@@ -869,6 +909,12 @@ export default function Crawler() {
                     <span className="text-xs text-ink/40">{visibleScenarios.length} scenario(s)</span>
                     {page.spellingIssues.length > 0 && <Pill tone="warn">{page.spellingIssues.length} spelling issue(s)</Pill>}
                     <Pill tone={page.change_status === "changed" ? "warn" : page.change_status === "new" ? "good" : "neutral"}>{page.change_status}</Pill>
+                    {page.changeSignals && showAdvanced && (
+                      <span className="text-[10px] text-ink/50">
+                        Structure {page.changeSignals.structure === "same" ? "✓" : page.changeSignals.structure === "changed" ? "≠" : "·"}
+                        {" · "}A11y {page.changeSignals.a11y === "same" ? "✓" : page.changeSignals.a11y === "changed" ? "≠" : "·"}
+                      </span>
+                    )}
                   </span>
                 </button>
                 {!isCollapsed && (
@@ -891,56 +937,23 @@ export default function Crawler() {
                         ))}
                       </ul>
                     )}
-                    {/* Step 1: Component Inventory -- what's actually on this page (header,
-                        navbar, forms, tables, modals, filters, pagination, cards, footer, ...),
-                        shown before Step 2's test cases so composition is visible up front. */}
-                    {page.componentInventory && page.componentInventory.length > 0 && (
-                      <div className="rounded border border-line/70 bg-ink/[0.03] p-2 space-y-1.5">
-                        <p className="text-[11px] font-semibold uppercase tracking-wide text-ink/50">Step 1 · Component inventory</p>
-                        <div className="flex flex-wrap gap-1.5">
-                          {page.componentInventory.map((c) => (
-                            <span
-                              key={c.kind}
-                              className="inline-flex items-center gap-1 rounded-full border border-line bg-white/70 px-2 py-0.5 text-[11px] text-ink/70"
-                              title={c.samples.length > 0 ? c.samples.join(", ") : undefined}
-                            >
-                              {c.label} <span className="text-ink/40">×{c.count}</span>
-                            </span>
-                          ))}
-                        </div>
-                      </div>
-                    )}
 
-                    {page.scenarios.length > 0 && (
-                      <p className="text-[11px] font-semibold uppercase tracking-wide text-ink/50 pt-1">Step 2 · Test cases</p>
-                    )}
                     {page.scenarios.length === 0 ? (
                       <p className="text-xs text-ink/40">No scenarios (unchanged page — kept from the previous crawl).</p>
                     ) : visibleScenarios.length === 0 ? (
                       <p className="text-xs text-ink/40">No {scenarioFilter === "api" ? "API" : "UI"} scenarios on this page.</p>
                     ) : (
-                      <ul className="space-y-1.5">
+                      <ul className="space-y-1">
                         {visibleScenarios.map((s) => (
-                          <li key={s.id} className="rounded border border-line/70 p-2 text-xs space-y-1">
-                            <div className="flex items-center justify-between gap-2">
-                              <label className="flex items-center gap-2">
-                                <input type="checkbox" checked={selected.has(s.id)} onChange={() => toggle(s.id)} disabled={Boolean(s.generated_test_case_id)} />
-                                <span className="font-medium">{s.title}</span>
-                                  <Pill tone={s.type === "negative" ? "bad" : s.type === "edge" ? "warn" : s.type === "flow" ? "warn" : s.type === "api" ? "neutral" : "good"}>{s.type}</Pill>
-                                {s.tier && (
-                                  <Pill tone={s.tier === "regression" ? "warn" : s.tier === "smoke" ? "good" : "neutral"}>{s.tier}</Pill>
-                                )}
-                                {s.generated_test_case_id && <Pill tone="neutral">test generated</Pill>}
-                              </label>
-                              <button className="text-alert underline disabled:opacity-40" disabled={busy === s.id} onClick={() => deleteOne(s.id)}>
-                                Delete
-                              </button>
-                            </div>
-                            <ul className="pl-4 list-disc text-ink/60">
-                              {s.steps.map((step, i) => (
-                                <li key={i}>{step}</li>
-                              ))}
-                            </ul>
+                          <li key={s.id} className="flex items-center justify-between gap-2 rounded border border-line/70 px-2 py-1.5 text-xs">
+                            <label className="flex items-center gap-2 min-w-0 flex-1">
+                              <input type="checkbox" checked={selected.has(s.id)} onChange={() => toggle(s.id)} disabled={Boolean(s.generated_test_case_id)} />
+                              <span className="truncate font-medium" title={s.title}>{s.title}</span>
+                              {s.generated_test_case_id && <Pill tone="neutral">done</Pill>}
+                            </label>
+                            <button className="text-alert shrink-0 disabled:opacity-40" disabled={busy === s.id} onClick={() => deleteOne(s.id)}>
+                              Remove
+                            </button>
                           </li>
                         ))}
                       </ul>
@@ -954,7 +967,7 @@ export default function Crawler() {
       )}
 
       {genResults && (
-        <div className="rounded-lg border border-line bg-white/60 shadow-panel p-4 space-y-2">
+        <div className="rounded-lg border border-line bg-white/60 shadow-panel p-3 space-y-2">
           <p className="font-medium text-sm">Test generation results</p>
 
           {Object.keys(runStatuses).length > 0 && (() => {
@@ -1063,8 +1076,10 @@ export default function Crawler() {
         </div>
       )}
 
-      <AllureReportPanel title="Allure report (from this crawl's runs)" sinceMs={batchStartedAt ?? undefined} autoGenerateKey={allureAutoGenKey} />
-      <BugReportPanel failures={crawlFailures} />
+      {(genResults || batchStartedAt) && (
+        <AllureReportPanel title="Test report" sinceMs={batchStartedAt ?? undefined} autoGenerateKey={allureAutoGenKey} />
+      )}
+      {crawlFailures.length > 0 && <BugReportPanel failures={crawlFailures} />}
     </div>
   );
 }

@@ -22,8 +22,11 @@ import { adminRouter } from "./routes/admin.js";
 import { screensRouter } from "./routes/screens.js";
 import { environmentsRouter } from "./routes/environments.js";
 import { crawlerRouter } from "./routes/crawler.js";
+import { tickWatchedSites } from "./services/crawlerService.js";
 import { allureRouter } from "./routes/allure.js";
 import { bugsRouter } from "./routes/bugs.js";
+import { optimizationRouter } from "./routes/optimization.js";
+import realtimeExecutionRouter from "./routes/realtimeExecution.js";
 import { attachUser, enforceReadOnlyRoles } from "./services/adminService.js";
 import { cleanupExpiredArtifacts, runScheduledProfiles } from "./services/executionService.js";
 import { runScheduledCrawlsAndDiffs } from "./services/changeSchedulerService.js";
@@ -209,6 +212,8 @@ app.use("/api/environments", environmentsRouter);
 app.use("/api/crawler", crawlerRouter);
 app.use("/api/allure", allureRouter);
 app.use("/api/bugs", bugsRouter);
+app.use("/api/optimization", optimizationRouter);
+app.use("/api/execution", realtimeExecutionRouter);
 // Embedded Allure report viewer (Phase 8 step 5): served statically so the
 // client can open it in an <iframe> instead of requiring download/unzip/open.
 app.use("/allure-report", express.static(path.join(__dirname, "..", "allure-report")));
@@ -265,6 +270,11 @@ setInterval(() => {
 setInterval(() => {
   runScheduledCrawlsAndDiffs().catch((err) => console.warn("[change-detection] scheduled tick failed:", err.message));
 }, 30 * 60_000);
+
+// Watched crawl sites (nightly incremental when due)
+setInterval(() => {
+  tickWatchedSites().catch((err) => console.warn("[crawler-watch] tick failed:", err.message));
+}, 60 * 60_000);
 
 // FR-6.9: check every hour whether a daily digest is due (self-throttles to the
 // configured cadence internally, so an hourly tick is a safe polling interval)

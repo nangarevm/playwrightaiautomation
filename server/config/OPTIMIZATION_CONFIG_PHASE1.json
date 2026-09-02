@@ -1,0 +1,176 @@
+{
+  "optimization": {
+    "framework_version": "1.0",
+    "phase": 1,
+    "enabled": true,
+    "enabledAt": "2026-08-09T00:00:00Z",
+    "description": "Phase 1: Quick Wins - 50% improvement in 2-3 hours",
+
+    "strategies": {
+      "timeoutOptimization": {
+        "enabled": true,
+        "description": "Dynamically optimize timeouts based on page type (25-35% faster)",
+        "detectPageType": true,
+        "pageTypeProfiles": {
+          "api": {
+            "domcontentloaded": 8000,
+            "load": 10000,
+            "networkidle": 1000,
+            "pollingInterval": 100
+          },
+          "spa": {
+            "domcontentloaded": 12000,
+            "load": 15000,
+            "networkidle": 2000,
+            "pollingInterval": 200
+          },
+          "static": {
+            "domcontentloaded": 10000,
+            "load": 12000,
+            "networkidle": 1500,
+            "pollingInterval": 150
+          },
+          "slow": {
+            "domcontentloaded": 18000,
+            "load": 20000,
+            "networkidle": 5000,
+            "pollingInterval": 400
+          },
+          "unknown": {
+            "domcontentloaded": 15000,
+            "load": 15000,
+            "networkidle": 3000,
+            "pollingInterval": 250
+          }
+        }
+      },
+
+      "parallelization": {
+        "enabled": true,
+        "description": "Increase parallelism from 5 workers → 15 workers (40-50% faster)",
+        "strategy": "dynamic",
+        "maxConcurrency": 15,
+        "minConcurrency": 2,
+        "batchSize": 5,
+        "memoryLimitMB": 1024,
+        "dynamicScaling": true,
+        "monitoringIntervalMs": 5000,
+        "scaleUpThreshold": 60,
+        "scaleDownThreshold": 85
+      },
+
+      "testPrioritization": {
+        "enabled": true,
+        "description": "Smart test selection - run 30 smart tests instead of 100 (30-40% faster)",
+        "profile": "balanced",
+        "weights": {
+          "smoke": 1.0,
+          "regression": 0.8,
+          "edgeCase": 0.3,
+          "negative": 0.2,
+          "functional": 0.1,
+          "api": 0.5
+        },
+        "detectRedundancy": true,
+        "redundancySimilarityThreshold": 0.8,
+        "maxTestsPerCategory": 30,
+        "expectedBugDetection": 0.92,
+        "expectedTimeReduction": 0.65
+      },
+
+      "caching": {
+        "enabled": false,
+        "description": "Phase 2: Smart caching (50-70% repeat savings)"
+      },
+
+      "promptOptimization": {
+        "enabled": false,
+        "description": "Phase 2: Optimized prompting (20-30% LLM savings)"
+      },
+
+      "modelRouting": {
+        "enabled": false,
+        "description": "Phase 2: Model routing (40-50% LLM cost savings)"
+      },
+
+      "incrementalTesting": {
+        "enabled": false,
+        "description": "Phase 3: Incremental testing (60-70% on repeats)"
+      }
+    },
+
+    "expected_improvements": {
+      "phase1": {
+        "execution_time_reduction": "50%",
+        "execution_time_before": "50 minutes",
+        "execution_time_after": "25 minutes",
+        "cost_reduction": "50%",
+        "cost_before": "$50",
+        "cost_after": "$25",
+        "test_count_reduction": "70%",
+        "tests_before": 100,
+        "tests_after": 30,
+        "bug_detection_rate": 0.92,
+        "implementation_hours": "2-3"
+      }
+    },
+
+    "feature_flags": {
+      "ENABLE_TIMEOUT_OPTIMIZATION": true,
+      "ENABLE_SMART_PARALLELIZATION": true,
+      "ENABLE_TEST_PRIORITIZATION": true,
+      "ENABLE_DYNAMIC_SCALING": true,
+      "ENABLE_REDUNDANCY_DETECTION": true,
+      "ENABLE_OPTIMIZATION_METRICS": true,
+      "ENABLE_OPTIMIZATION_DASHBOARD": true
+    },
+
+    "monitoring": {
+      "enabled": true,
+      "collectMetrics": true,
+      "trackSavings": true,
+      "dashboardEndpoint": "/api/v1/optimization/metrics",
+      "metricsInterval": 5000,
+      "retentionDays": 30
+    },
+
+    "rollback": {
+      "enabled": true,
+      "automatic": false,
+      "rollbackThresholds": {
+        "bugDetectionDrop": 0.05,
+        "errorRateIncrease": 0.1,
+        "timeoutFailureRate": 0.15
+      }
+    },
+
+    "integration": {
+      "discovery": {
+        "file": "server/src/crawler/discovery.ts",
+        "linesToModify": [119, "200-206"],
+        "changes": [
+          "Increase concurrency: 5 → 10",
+          "Apply optimized timeouts",
+          "Integrate timeoutOptimizationService"
+        ]
+      },
+      "executionService": {
+        "file": "server/src/services/executionService.ts",
+        "linesToModify": ["396", "182-222"],
+        "changes": [
+          "Update concurrency defaults: 5 → 15",
+          "Integrate testPrioritizationService",
+          "Integrate parallelExecutionService"
+        ]
+      },
+      "costTracking": {
+        "file": "server/src/services/costTrackingService.ts",
+        "changes": [
+          "Track savings per strategy",
+          "Report optimization impact",
+          "Show time/cost reduction metrics"
+        ]
+      }
+    }
+  }
+}

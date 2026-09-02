@@ -14,11 +14,39 @@ export interface CrawlOptions {
   concurrency?: number;
   /** incremental (default on re-run): skip deep interaction when page structure matches baseline. full: always deep-scan. */
   mode?: "incremental" | "full";
+  /**
+   * Scenario depth. Default "minimal": ~2–5 scenarios/page covering load, components,
+   * primary flow/form — enough for page + component coverage without LLM token blowups.
+   * "standard" adds a few negatives/edges; "full" is the exhaustive historical set.
+   */
+  coverageMode?: CoverageMode;
   /** Previously discovered page URLs for this site -- seeded first on re-crawl so coverage isn't lost. */
   knownUrls?: string[];
+  /** Max BFS hops from the start URL (default 20). */
+  maxDepth?: number;
   /** Baseline lookup used during discovery for early unchanged short-circuit (incremental mode). */
-  getBaseline?: (url: string) => { hash: string; elements: ElementRecord[] } | null;
+  getBaseline?: (url: string) => PageBaselineMeta | null;
   onProgress?: (progress: CrawlProgress) => void;
+}
+
+/** How many scenarios the crawler should emit per page / site. */
+export type CoverageMode = "minimal" | "standard" | "full";
+
+export interface PageBaselineMeta {
+  hash: string;
+  elements: ElementRecord[];
+  etag?: string | null;
+  lastModified?: string | null;
+  lastSeenAt?: string | null;
+  title?: string | null;
+  a11yHash?: string | null;
+  screenshotHash?: string | null;
+  /** Same-origin outbound links stored on the last scan -- replayed into the nav graph when this page is cheap-skipped. */
+  links?: Array<{ url: string; label: string }>;
+  httpStatus?: number | null;
+  priorChangeStatus?: string | null;
+  snapshot?: PageSnapshot | null;
+  missCount?: number;
 }
 
 export interface CrawlProgress {
@@ -26,6 +54,13 @@ export interface CrawlProgress {
   formsDiscovered: number;
   scenariosDiscovered: number;
   currentPage: string;
+  /** Cheap HTTP skips (no Playwright navigation). */
+  skippedHttp?: number;
+  /** Pages opened in browser (shallow or deep). */
+  scannedBrowser?: number;
+  /** Pages that required deep interaction. */
+  deepScans?: number;
+  reusedBaselines?: number;
 }
 
 export interface LocatorCandidate {
@@ -117,10 +152,30 @@ export interface PageRecord {
   spellingIssues: SpellingIssue[];
 }
 
+export interface PageSnapshot {
+  title?: string | null;
+  description?: string | null;
+  h1?: string | null;
+  robots?: string | null;
+  canonical?: string | null;
+  httpStatus?: number | null;
+  finalUrl?: string | null;
+  wordCount?: number;
+  images?: Array<{ src: string; alt: string }>;
+}
+
+export interface ChangeEvent {
+  type: string;
+  severity: "critical" | "high" | "medium" | "low";
+  oldValue?: string;
+  newValue?: string;
+}
+
 export interface PageDiff {
   added: string[];
   removed: string[];
   changed: string[];
+  events?: ChangeEvent[];
 }
 
 export interface CrawlResult {

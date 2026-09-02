@@ -2,6 +2,7 @@ import { lazy, Suspense, useEffect, useState } from "react";
 import { AppStateProvider, useApp, View } from "./context/AppState.js";
 import { Sidebar } from "./components/Sidebar.js";
 import { Header } from "./components/Header.js";
+import { LiveMonitoringBridge } from "./components/LiveMonitoringBridge.js";
 import Home from "./pages/Home.js";
 
 // Code-split every non-landing tab: a solo QA typically works in one or two
@@ -12,6 +13,7 @@ const Run = lazy(() => import("./pages/Run.js"));
 const Library = lazy(() => import("./pages/Library.js"));
 const ReportsHub = lazy(() => import("./pages/ReportsHub.js"));
 const SettingsHub = lazy(() => import("./pages/SettingsHub.js"));
+const CostsAndOptimization = lazy(() => import("./pages/CostsAndOptimization.js"));
 
 const PAGES: Record<View, JSX.Element> = {
   home: <Home />,
@@ -19,6 +21,7 @@ const PAGES: Record<View, JSX.Element> = {
   library: <Library />,
   reports: <ReportsHub />,
   settings: <SettingsHub />,
+  costs: <CostsAndOptimization />,
 };
 
 function Shell() {
@@ -42,9 +45,10 @@ function Shell() {
       <Sidebar />
       <div className="flex-1 min-w-0">
         <Header />
-        <main className="px-6 py-8 max-w-6xl">
+        <LiveMonitoringBridge />
+        <main className="px-4 py-5 max-w-6xl">
           {agreementRate !== null && (
-            <div className="mb-6 rounded-lg border border-line bg-white/70 p-3 text-sm text-ink/70">
+            <div className="mb-4 rounded-lg border border-line bg-white/70 p-2.5 text-sm text-ink/70">
               Review agreement rate: <span className="font-semibold text-ink">{agreementRate}%</span>
             </div>
           )}

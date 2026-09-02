@@ -13,10 +13,10 @@ export default function ReportsHub() {
   const [tab, setTab] = useState<Tab>("reports");
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-4">
       <div>
-        <h2 className="font-display text-xl tracking-tight">Reports</h2>
-        <p className="text-sm text-ink/60">Release summaries, exports, analytics, and bug findings</p>
+        <h2 className="font-display text-lg tracking-tight">Reports</h2>
+        <p className="text-xs text-ink/60">Releases, analytics, and bug findings</p>
       </div>
 
       <TabBar<Tab>

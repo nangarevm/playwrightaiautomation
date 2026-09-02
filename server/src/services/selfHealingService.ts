@@ -300,3 +300,57 @@ export function rollbackAutoHealAction(healActionId: string) {
 export function listAutoHealActions(testCaseId: string) {
   return db.prepare("SELECT * FROM auto_heal_actions WHERE test_case_id = ? ORDER BY created_at DESC").all(testCaseId);
 }
+
+export function getSelfHealSuggestThreshold(): number {
+  const row = db.prepare("SELECT self_heal_suggest_threshold FROM org_settings WHERE id = 1").get() as
+    | { self_heal_suggest_threshold: number }
+    | undefined;
+  return typeof row?.self_heal_suggest_threshold === "number" ? row.self_heal_suggest_threshold : 0.7;
+}
+
+export function getHealingMetrics() {
+  const actions = db.prepare("SELECT applied, rolled_back FROM auto_heal_actions").all() as Array<{
+    applied: number;
+    rolled_back: number;
+  }>;
+  const attempts = actions.length;
+  const applied = actions.filter((a) => Number(a.applied) === 1).length;
+  const rolledBack = actions.filter((a) => Number(a.rolled_back) === 1).length;
+  const evidence = db
+    .prepare("SELECT failure_class, failure_category FROM execution_evidence")
+    .all() as Array<{ failure_class?: string; failure_category?: string }>;
+  const byCategory: Record<string, number> = {};
+  for (const row of evidence) {
+    const key = row.failure_category || row.failure_class || "UNKNOWN";
+    byCategory[key] = (byCategory[key] || 0) + 1;
+  }
+  const quality = db
+    .prepare("SELECT readiness_score, locator_quality_json FROM automation_scripts WHERE readiness_score IS NOT NULL")
+    .all() as Array<{ readiness_score: number; locator_quality_json?: string }>;
+  let hardWaits = 0;
+  let brittle = 0;
+  for (const row of quality) {
+    try {
+      const q = JSON.parse(row.locator_quality_json || "{}");
+      hardWaits += Number(q.hardWaits || 0);
+      brittle += Number(q.risky || 0) + Number(q.nthLocators || 0) + Number(q.xpathLocators || 0);
+    } catch {
+      /* ignore */
+    }
+  }
+  const avgReadiness =
+    quality.length === 0 ? null : Math.round(quality.reduce((s, r) => s + Number(r.readiness_score || 0), 0) / quality.length);
+  return {
+    selfHealingAttempts: attempts,
+    selfHealingApplied: applied,
+    selfHealingSuccessRate: attempts === 0 ? 0 : Math.round((applied / attempts) * 100),
+    selfHealingRejectionRate: attempts === 0 ? 0 : Math.round(((attempts - applied) / attempts) * 100),
+    falseHealingRate: applied === 0 ? 0 : Math.round((rolledBack / applied) * 100),
+    avgReadinessScore: avgReadiness,
+    hardWaitCount: hardWaits,
+    brittleLocatorCount: brittle,
+    failureCategories: byCategory,
+    suggestThreshold: getSelfHealSuggestThreshold(),
+    autoHealThreshold: getSelfHealConfidenceThreshold(),
+  };
+}

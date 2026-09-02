@@ -26,10 +26,13 @@
 
 import { nanoid } from "nanoid";
 import type { ElementRecord, NavEdge, ScenarioRecord } from "./types.js";
+import { pickPreferredLocator, stripTransientLoadingLabel } from "./locatorQuality.js";
 
 const MAX_PER_FIELD_CATEGORY = 6; // cap individual-field scenarios per form (required-empty, invalid-format)
 const MAX_STANDALONE_ELEMENTS = 12; // cap per-element scenarios on a no-form page
 const MAX_FILE_FIELDS = 3; // cap file-upload fields that get the full per-format scenario set
+const MAX_STANDALONE_MINIMAL = 1;
+const MAX_STANDALONE_STANDARD = 3;
 
 // Representative formats for each file-upload field discovered on the target
 // app -- mirrors the input types this platform's own ingestion layer accepts
@@ -61,6 +64,25 @@ function makeScenario(
   locatorSources: ElementRecord[],
   tier: ScenarioRecord["tier"] = "functional"
 ): ScenarioRecord {
+  // Prefer a11y locators (label/role/placeholder) over brittle #id CSS.
+  const preferred = locatorSources
+    .map((e) => {
+      const locs = [...(e.locators || [])];
+      if (e.type === "button" && e.label) {
+        const idle = stripTransientLoadingLabel(e.label);
+        if (idle) locs.push(`page.getByRole("button", { name: ${JSON.stringify(idle)} })`);
+      }
+      if ((e.type === "input" || e.type === "textarea") && e.label) {
+        const idle = stripTransientLoadingLabel(e.label);
+        if (idle) {
+          locs.push(`page.getByLabel(${JSON.stringify(idle)})`);
+          locs.push(`page.getByRole("textbox", { name: ${JSON.stringify(idle)} })`);
+        }
+      }
+      return pickPreferredLocator(locs);
+    })
+    .filter(Boolean) as string[];
+
   return {
     id: nanoid(10),
     title,
@@ -68,18 +90,53 @@ function makeScenario(
     tier,
     flowGroup,
     steps,
-    locators: locatorSources.flatMap((e) => e.locators.slice(0, 1)),
+    locators: preferred,
   };
 }
 
-function buildFormScenarios(pageTitle: string, formElements: ElementRecord[]): ScenarioRecord[] {
+function isFilterChipLabel(label: string): boolean {
+  // Keep this list tight: only generic facet chips mistaken for submit, not real nav labels.
+  return /^(all|none|images?|videos?|audio|filter|filters|sort|close|more|\d+)$/i.test(label.trim());
+}
+
+function isSubmitLikeLabel(label: string): boolean {
+  const idle = stripTransientLoadingLabel(label);
+  return /\b(search|submit|go|find|send|save|login|log\s*in|sign\s*in|continue|next|apply|create|add|subscribe)\b/i.test(
+    idle || label
+  );
+}
+
+/** Prefer real submit/search controls; never treat category chips like "All" as submit. */
+function pickSubmitControl(formElements: ElementRecord[]): ElementRecord | undefined {
+  const buttons = formElements.filter((e) => e.type === "button" && e.label);
+  const preferred = buttons.find((b) => isSubmitLikeLabel(b.label));
+  const chosen = preferred || buttons.find((b) => !isFilterChipLabel(b.label));
+  if (!chosen) return undefined;
+  // Never bake transient loading text into scenario steps / locators.
+  const idle = stripTransientLoadingLabel(chosen.label);
+  if (idle && idle !== chosen.label) {
+    return { ...chosen, label: idle };
+  }
+  return chosen;
+}
+
+function buildFormScenarios(
+  pageTitle: string,
+  formElements: ElementRecord[],
+  coverageMode: import("./types.js").CoverageMode = "full"
+): ScenarioRecord[] {
   const inputs = formElements.filter((e) => ["input", "textarea", "dropdown", "checkbox"].includes(e.type));
-  const submit = formElements.find((e) => e.type === "button");
+  const submit = pickSubmitControl(formElements);
   if (inputs.length === 0) return [];
 
   const flowGroup = formElements[0]?.component || pageTitle;
   const scenarios: ScenarioRecord[] = [];
-  const submitStep = submit ? `And clicks "${submit.label}"` : "And submits the form";
+  const isSearchForm = /search/i.test(flowGroup) || inputs.some((i) => /search/i.test(i.label) || i.inputType === "search");
+  const submitStep = submit
+    ? `And clicks "${submit.label}"`
+    : isSearchForm
+      ? "And presses Enter to submit the search"
+      : "And submits the form";
   const submitLocator = submit ? [submit] : [];
 
   // 1. Positive: every field filled with a valid value (file fields get a
@@ -110,12 +167,16 @@ function buildFormScenarios(pageTitle: string, formElements: ElementRecord[]): S
     )
   );
 
+  // Minimal coverage: happy path + one empty-submit is enough for form pages.
+  if (coverageMode === "minimal") return scenarios;
+
   // 3. Negative, one per required field: leave just THIS field empty, others
   // valid -- catches field-specific validation bugs a single combined case
   // can't (e.g. a required checkbox whose validation only the "all empty"
   // case happened to also fail for the wrong reason).
   const requiredInputs = inputs.filter((i) => i.required === true);
-  for (const field of requiredInputs.slice(0, MAX_PER_FIELD_CATEGORY)) {
+  const fieldCap = coverageMode === "standard" ? 2 : MAX_PER_FIELD_CATEGORY;
+  for (const field of requiredInputs.slice(0, fieldCap)) {
     const skipClause = field.inputType === "file" ? `doesn't attach a file to "${field.label}"` : `leaves "${field.label}" empty`;
     scenarios.push(
       makeScenario(
@@ -131,6 +192,28 @@ function buildFormScenarios(pageTitle: string, formElements: ElementRecord[]): S
         [field, ...submitLocator]
       )
     );
+  }
+
+  if (coverageMode === "standard") {
+    // One representative invalid-format case when a typed field exists.
+    const typed = inputs.find((i) => i.inputType && ["email", "number", "tel", "url"].includes(i.inputType));
+    if (typed) {
+      scenarios.push(
+        makeScenario(
+          `Verify ${flowGroup} rejects an invalid value in "${typed.label}"`,
+          "negative",
+          flowGroup,
+          [
+            `Given the user is on "${pageTitle}"`,
+            `When the user fills in "${typed.label}" with an invalid value`,
+            submitStep,
+            `Then a validation error is shown for "${typed.label}"`,
+          ],
+          [typed, ...submitLocator]
+        )
+      );
+    }
+    return scenarios;
   }
 
   // 3b. Positive, one per genuinely optional field (has an accessible name,
@@ -328,10 +411,15 @@ function pageDisplayName(pageTitle: string, pageUrl?: string): string {
   return pageTitle;
 }
 
-/** Every discovered page always gets smoke (load) + regression (still works) baselines. */
-export function buildBaselineCoverageScenarios(pageTitle: string, elements: ElementRecord[], pageUrl?: string): ScenarioRecord[] {
+/** Every discovered page always gets a smoke load baseline; full/standard also add regression duplicate. */
+export function buildBaselineCoverageScenarios(
+  pageTitle: string,
+  elements: ElementRecord[],
+  pageUrl?: string,
+  coverageMode: import("./types.js").CoverageMode = "minimal"
+): ScenarioRecord[] {
   const label = pageDisplayName(pageTitle, pageUrl);
-  return [
+  const scenarios: ScenarioRecord[] = [
     makeScenario(
       `Verify ${label} loads successfully`,
       "positive",
@@ -340,19 +428,24 @@ export function buildBaselineCoverageScenarios(pageTitle: string, elements: Elem
       elements.slice(0, 5),
       "smoke"
     ),
-    makeScenario(
-      `Regression: verify ${label} still loads and renders key content`,
-      "positive",
-      label,
-      [
-        `Given the user navigates to "${label}"`,
-        "When the page finishes loading",
-        "Then key content is visible and the page is not blank or errored",
-      ],
-      elements.slice(0, 5),
-      "regression"
-    ),
   ];
+  if (coverageMode !== "minimal") {
+    scenarios.push(
+      makeScenario(
+        `Regression: verify ${label} still loads and renders key content`,
+        "positive",
+        label,
+        [
+          `Given the user navigates to "${label}"`,
+          "When the page finishes loading",
+          "Then key content is visible and the page is not blank or errored",
+        ],
+        elements.slice(0, 5),
+        "regression"
+      )
+    );
+  }
+  return scenarios;
 }
 
 /** Intra-page multi-step journey when the site has no cross-page nav edges yet. */
@@ -490,26 +583,49 @@ export function buildNegativeAndEdgeBaselines(pageTitle: string, elements: Eleme
   return scenarios;
 }
 
-export function buildScenariosForPage(pageTitle: string, elements: ElementRecord[], formCount: number, pageUrl?: string): ScenarioRecord[] {
+export function buildScenariosForPage(
+  pageTitle: string,
+  elements: ElementRecord[],
+  formCount: number,
+  pageUrl?: string,
+  componentInventory?: import("./types.js").ComponentInventoryItem[],
+  coverageMode: import("./types.js").CoverageMode = "minimal"
+): ScenarioRecord[] {
+  const mode = coverageMode || "minimal";
+  const label = pageDisplayName(pageTitle, pageUrl);
+
+  if (mode === "minimal") {
+    return buildMinimalScenariosForPage(pageTitle, elements, formCount, pageUrl, componentInventory || []);
+  }
+
   // Smoke page-load + regression health are required for every discovered page --
   // never skip them just because the page also has forms or clickable elements.
-  const label = pageDisplayName(pageTitle, pageUrl);
   const scenarios: ScenarioRecord[] = [
-    ...buildBaselineCoverageScenarios(pageTitle, elements, pageUrl),
-    ...buildNegativeAndEdgeBaselines(pageTitle, elements, pageUrl),
+    ...buildBaselineCoverageScenarios(pageTitle, elements, pageUrl, mode),
+    ...(mode === "full" ? buildNegativeAndEdgeBaselines(pageTitle, elements, pageUrl) : buildNegativeAndEdgeBaselines(pageTitle, elements, pageUrl).slice(0, 2)),
+    ...(mode === "full"
+      ? buildComponentCoverageScenarios(pageTitle, elements, componentInventory || [], pageUrl)
+      : buildConsolidatedComponentScenario(pageTitle, elements, componentInventory || [], pageUrl)
+        ? [buildConsolidatedComponentScenario(pageTitle, elements, componentInventory || [], pageUrl)!]
+        : []),
   ];
 
   if (formCount > 0) {
     const groups = groupByComponent(elements);
+    let formGroups = 0;
     for (const [, groupElements] of groups) {
       const hasInput = groupElements.some((e) => ["input", "textarea", "dropdown"].includes(e.type));
-      if (hasInput) scenarios.push(...buildFormScenarios(pageTitle, groupElements));
+      if (!hasInput) continue;
+      scenarios.push(...buildFormScenarios(pageTitle, groupElements, mode));
+      formGroups += 1;
+      if (mode === "standard" && formGroups >= 1) break;
     }
   }
 
   // Nav/link coverage on every page (in addition to smoke/regression baselines).
+  const standaloneCap = mode === "standard" ? MAX_STANDALONE_STANDARD : MAX_STANDALONE_ELEMENTS;
   const standalone = elements.filter((e) => ["link", "button"].includes(e.type) && e.label);
-  for (const el of standalone.slice(0, MAX_STANDALONE_ELEMENTS)) {
+  for (const el of standalone.slice(0, standaloneCap)) {
     scenarios.push(
       makeScenario(
         `Verify clicking "${el.label}" behaves as expected on ${label}`,
@@ -520,6 +636,419 @@ export function buildScenariosForPage(pageTitle: string, elements: ElementRecord
         "functional"
       )
     );
+  }
+
+  return scenarios;
+}
+
+/**
+ * Minimal pack per page: smoke load + one consolidated component check +
+ * primary form/flow action. Covers every page and its components without
+ * combinatorial scenario explosion (and thus without N LLM script calls).
+ */
+function buildMinimalScenariosForPage(
+  pageTitle: string,
+  elements: ElementRecord[],
+  formCount: number,
+  pageUrl: string | undefined,
+  inventory: import("./types.js").ComponentInventoryItem[]
+): ScenarioRecord[] {
+  const label = pageDisplayName(pageTitle, pageUrl);
+  const scenarios: ScenarioRecord[] = [
+    ...buildBaselineCoverageScenarios(pageTitle, elements, pageUrl, "minimal"),
+  ];
+
+  const consolidated = buildConsolidatedComponentScenario(pageTitle, elements, inventory, pageUrl);
+  if (consolidated) scenarios.push(consolidated);
+
+  if (formCount > 0) {
+    const groups = groupByComponent(elements);
+    for (const [, groupElements] of groups) {
+      const hasInput = groupElements.some((e) => ["input", "textarea", "dropdown"].includes(e.type));
+      if (!hasInput) continue;
+      scenarios.push(...buildFormScenarios(pageTitle, groupElements, "minimal"));
+      break; // one form group is enough in minimal mode
+    }
+  } else {
+    const cta = elements.find((e) => e.type === "button" && e.label) || elements.find((e) => e.type === "link" && e.label && !/^(https?:\/\/|www\.)/i.test(e.label));
+    if (cta) {
+      scenarios.push(
+        makeScenario(
+          `Verify primary action "${cta.label}" works on ${label}`,
+          "positive",
+          label,
+          [`Given the user is on "${label}"`, `When the user clicks "${cta.label}"`, "Then the page responds without crashing"],
+          [cta],
+          "functional"
+        )
+      );
+    }
+  }
+
+  return scenarios;
+}
+
+/**
+ * One scenario that asserts all inventory components on the page are present
+ * (and lightly exercises interactive ones) — replaces 1-scenario-per-kind.
+ */
+export function buildConsolidatedComponentScenario(
+  pageTitle: string,
+  elements: ElementRecord[],
+  inventory: import("./types.js").ComponentInventoryItem[],
+  pageUrl?: string
+): ScenarioRecord | null {
+  if (!inventory.length) return null;
+  const label = pageDisplayName(pageTitle, pageUrl);
+  const kinds = inventory.map((i) => i.label);
+  const links = elements.filter((e) => e.type === "link" && e.label && !/^(https?:\/\/|www\.)/i.test(e.label));
+  const buttons = elements.filter((e) => e.type === "button" && e.label);
+  const inputs = elements.filter((e) => (e.type === "input" || e.type === "textarea") && e.label);
+  const dropdowns = elements.filter((e) => e.type === "dropdown" && e.label);
+
+  const steps = [
+    `Given the user is on "${label}"`,
+    `Then these components are present: ${kinds.join(", ")}`,
+  ];
+  const locs: ElementRecord[] = [];
+  if (inputs[0]) {
+    steps.push(`When the user focuses "${inputs[0].label}"`);
+    locs.push(inputs[0]);
+  } else if (dropdowns[0]) {
+    steps.push(`When the user selects a valid option in "${dropdowns[0].label}"`);
+    locs.push(dropdowns[0]);
+  } else if (buttons[0]) {
+    steps.push(`When the user clicks "${buttons[0].label}"`);
+    locs.push(buttons[0]);
+  } else if (links[0]) {
+    steps.push(`When the user clicks "${links[0].label}"`);
+    locs.push(links[0]);
+  }
+  steps.push("Then the page remains stable and interactive components respond");
+
+  return makeScenario(
+    `Verify page components work on ${label}`,
+    "positive",
+    `Components: ${label}`,
+    steps,
+    locs.length ? locs : elements.slice(0, 1),
+    "smoke"
+  );
+}
+
+/**
+ * One focused positive (smoke/functional) scenario per structural component
+ * actually present on the page -- so inventory kinds like header/navbar/tables
+ * get explicit working-coverage tests, not only form/link click cases.
+ */
+export function buildComponentCoverageScenarios(
+  pageTitle: string,
+  elements: ElementRecord[],
+  inventory: import("./types.js").ComponentInventoryItem[],
+  pageUrl?: string
+): ScenarioRecord[] {
+  if (!inventory.length) return [];
+  const label = pageDisplayName(pageTitle, pageUrl);
+  const scenarios: ScenarioRecord[] = [];
+  const links = elements.filter((e) => e.type === "link" && e.label && !/^(https?:\/\/|www\.)/i.test(e.label));
+  const buttons = elements.filter((e) => e.type === "button" && e.label);
+  const inputs = elements.filter((e) => (e.type === "input" || e.type === "textarea") && e.label);
+  const dropdowns = elements.filter((e) => e.type === "dropdown" && e.label);
+  const checkboxes = elements.filter((e) => e.type === "checkbox" && e.label);
+
+  const push = (
+    title: string,
+    steps: string[],
+    locs: ElementRecord[],
+    tier: ScenarioRecord["tier"] = "smoke"
+  ) => {
+    scenarios.push(makeScenario(title, "positive", `Components: ${label}`, steps, locs.length ? locs : elements.slice(0, 1), tier));
+  };
+
+  for (const item of inventory) {
+    const sample = item.samples[0];
+    switch (item.kind) {
+      case "header":
+        push(
+          `Verify the header is visible on ${label}`,
+          [`Given the user is on "${label}"`, "Then the page header/banner is visible"],
+          elements.slice(0, 1)
+        );
+        break;
+      case "navbar":
+        push(
+          `Verify the navigation bar works on ${label}`,
+          [
+            `Given the user is on "${label}"`,
+            "Then the navigation bar is visible",
+            ...(links[0]
+              ? [`When the user clicks the nav link "${links[0].label}"`, "Then navigation completes without a crash"]
+              : []),
+          ],
+          links[0] ? [links[0]] : elements.slice(0, 1)
+        );
+        break;
+      case "breadcrumbs":
+        push(
+          `Verify breadcrumbs are present on ${label}`,
+          [`Given the user is on "${label}"`, "Then breadcrumb navigation is visible"],
+          links.slice(0, 1)
+        );
+        break;
+      case "headings":
+        push(
+          `Verify the main heading is visible on ${label}`,
+          [
+            `Given the user is on "${label}"`,
+            sample ? `Then a heading like "${sample}" is visible` : "Then at least one heading is visible",
+          ],
+          elements.slice(0, 1)
+        );
+        break;
+      case "forms":
+        push(
+          `Verify forms on ${label} are present and interactive`,
+          [
+            `Given the user is on "${label}"`,
+            "Then at least one form is visible",
+            ...(inputs[0] ? [`When the user focuses "${inputs[0].label}"`, "Then the field accepts input"] : []),
+          ],
+          inputs[0] ? [inputs[0]] : elements.slice(0, 1),
+          "functional"
+        );
+        break;
+      case "inputs":
+        if (inputs[0]) {
+          push(
+            `Verify input "${inputs[0].label}" accepts text on ${label}`,
+            [
+              `Given the user is on "${label}"`,
+              `When the user fills in "${inputs[0].label}" with a valid value`,
+              "Then the field retains the entered value",
+            ],
+            [inputs[0]],
+            "functional"
+          );
+        }
+        break;
+      case "search":
+        {
+          const searchField =
+            inputs.find((i) => /search/i.test(i.label) || i.inputType === "search") || inputs[0];
+          if (searchField) {
+            push(
+              `Verify search works on ${label}`,
+              [
+                `Given the user is on "${label}"`,
+                `When the user fills in "${searchField.label}" with a search term`,
+                ...(buttons.find((b) => /search|go|find/i.test(b.label))
+                  ? [`And clicks "${buttons.find((b) => /search|go|find/i.test(b.label))!.label}"`]
+                  : ["And submits the search"]),
+                "Then search results or an updated page state appear",
+              ],
+              [searchField, ...buttons.filter((b) => /search|go|find/i.test(b.label)).slice(0, 1)],
+              "functional"
+            );
+          } else {
+            push(
+              `Verify search UI is visible on ${label}`,
+              [`Given the user is on "${label}"`, "Then a search control is visible"],
+              elements.slice(0, 1)
+            );
+          }
+        }
+        break;
+      case "buttons":
+        if (buttons[0]) {
+          push(
+            `Verify button "${buttons[0].label}" is clickable on ${label}`,
+            [
+              `Given the user is on "${label}"`,
+              `When the user clicks "${buttons[0].label}"`,
+              "Then the page responds without crashing",
+            ],
+            [buttons[0]],
+            "functional"
+          );
+        }
+        break;
+      case "links":
+        if (links[0]) {
+          push(
+            `Verify link "${links[0].label}" is usable on ${label}`,
+            [
+              `Given the user is on "${label}"`,
+              `When the user clicks "${links[0].label}"`,
+              "Then navigation or an in-page action completes",
+            ],
+            [links[0]],
+            "functional"
+          );
+        }
+        break;
+      case "dropdowns":
+        if (dropdowns[0]) {
+          push(
+            `Verify dropdown "${dropdowns[0].label}" can be changed on ${label}`,
+            [
+              `Given the user is on "${label}"`,
+              `When the user selects a valid option in "${dropdowns[0].label}"`,
+              "Then the selection is applied",
+            ],
+            [dropdowns[0]],
+            "functional"
+          );
+        }
+        break;
+      case "checkboxes":
+        if (checkboxes[0]) {
+          push(
+            `Verify checkbox "${checkboxes[0].label}" can be toggled on ${label}`,
+            [
+              `Given the user is on "${label}"`,
+              `When the user checks "${checkboxes[0].label}"`,
+              "Then the checkbox state updates",
+            ],
+            [checkboxes[0]],
+            "functional"
+          );
+        }
+        break;
+      case "radios":
+        push(
+          `Verify radio options are present on ${label}`,
+          [`Given the user is on "${label}"`, "Then radio button options are visible and selectable"],
+          elements.filter((e) => e.type === "radio").slice(0, 1)
+        );
+        break;
+      case "tables":
+        push(
+          `Verify data table is rendered on ${label}`,
+          [
+            `Given the user is on "${label}"`,
+            "Then a table/grid is visible with at least one row of content",
+          ],
+          elements.slice(0, 1),
+          "functional"
+        );
+        break;
+      case "lists":
+        push(
+          `Verify lists render on ${label}`,
+          [`Given the user is on "${label}"`, "Then at least one list of items is visible"],
+          elements.slice(0, 1)
+        );
+        break;
+      case "images":
+        push(
+          `Verify images load on ${label}`,
+          [`Given the user is on "${label}"`, "Then key images are visible (not broken placeholders)"],
+          elements.slice(0, 1)
+        );
+        break;
+      case "videos":
+        push(
+          `Verify video media is present on ${label}`,
+          [`Given the user is on "${label}"`, "Then an embedded video or player is visible"],
+          elements.slice(0, 1)
+        );
+        break;
+      case "tabs":
+        push(
+          `Verify tabs can be switched on ${label}`,
+          [
+            `Given the user is on "${label}"`,
+            sample ? `When the user activates tab "${sample}"` : "When the user switches to another tab",
+            "Then the corresponding tab panel content is shown",
+          ],
+          buttons.slice(0, 1),
+          "functional"
+        );
+        break;
+      case "modals":
+        push(
+          `Verify modal/dialog content is reachable on ${label}`,
+          [
+            `Given the user is on "${label}"`,
+            ...(buttons.find((b) => /open|show|modal|dialog|report|contact/i.test(b.label))
+              ? [
+                  `When the user clicks "${buttons.find((b) => /open|show|modal|dialog|report|contact/i.test(b.label))!.label}"`,
+                  "Then a modal/dialog becomes visible",
+                ]
+              : ["Then a dialog region is present or can be opened from the page"]),
+          ],
+          buttons.filter((b) => /open|show|modal|dialog|report|contact/i.test(b.label)).slice(0, 1),
+          "functional"
+        );
+        break;
+      case "filters":
+        push(
+          `Verify filters are usable on ${label}`,
+          [
+            `Given the user is on "${label}"`,
+            "Then filter controls are visible",
+            ...(dropdowns[0] || inputs[0]
+              ? [
+                  `When the user adjusts "${(dropdowns[0] || inputs[0])!.label}"`,
+                  "Then filtered results update",
+                ]
+              : []),
+          ],
+          [dropdowns[0] || inputs[0]].filter(Boolean) as ElementRecord[],
+          "functional"
+        );
+        break;
+      case "pagination":
+        {
+          const next = links.find((l) => /next|>|»|page/i.test(l.label)) || buttons.find((b) => /next|>|»/i.test(b.label));
+          push(
+            `Verify pagination works on ${label}`,
+            [
+              `Given the user is on "${label}"`,
+              "Then pagination controls are visible",
+              ...(next
+                ? [`When the user clicks "${next.label}"`, "Then the next page of results loads"]
+                : []),
+            ],
+            next ? [next] : elements.slice(0, 1),
+            "functional"
+          );
+        }
+        break;
+      case "cards":
+        push(
+          `Verify content cards are displayed on ${label}`,
+          [
+            `Given the user is on "${label}"`,
+            sample ? `Then cards such as "${sample}" are visible` : "Then one or more content cards are visible",
+          ],
+          links.slice(0, 1)
+        );
+        break;
+      case "iframe":
+        push(
+          `Verify embedded iframe content is present on ${label}`,
+          [`Given the user is on "${label}"`, "Then an iframe embed is present on the page"],
+          elements.slice(0, 1)
+        );
+        break;
+      case "footer":
+        push(
+          `Verify the footer is visible on ${label}`,
+          [`Given the user is on "${label}"`, "Then the page footer is visible"],
+          elements.slice(0, 1)
+        );
+        break;
+      default:
+        push(
+          `Verify ${item.label} component is present on ${label}`,
+          [
+            `Given the user is on "${label}"`,
+            `Then the "${item.label}" component is visible${sample ? ` (e.g. "${sample}")` : ""}`,
+          ],
+          elements.slice(0, 1)
+        );
+    }
   }
 
   return scenarios;
@@ -574,6 +1103,8 @@ export function buildCrudFlowScenario(pageTitle: string, elements: ElementRecord
 const MAX_FLOW_SCENARIOS = 20; // enough journeys so multi-page sites don't leave the flow slot thin
 const MAX_FLOW_DEPTH = 6; // longest journey (in pages) worth generating a single scenario for
 const MIN_FLOW_DEPTH = 2; // a "flow" needs at least 2 hops to mean anything beyond a single page
+const MAX_FLOW_SCENARIOS_MINIMAL = 5;
+const MAX_FLOW_SCENARIOS_STANDARD = 10;
 
 // Pages whose title/URL suggests they're a journey's natural destination --
 // a completed purchase, a submitted form, a finished signup. Journeys ending
@@ -592,14 +1123,23 @@ function verbFor(via: string): string {
   return `clicks "${via}"`;
 }
 
+function isFragileVia(via: string): boolean {
+  const v = via.trim();
+  if (!v || v === "navigation") return true;
+  if (/cdn-cgi|^#|^\/[\w._/-]*$|^(https?:\/\/|www\.)/i.test(v)) return true;
+  if (v.length > 80) return true;
+  return false;
+}
+
 // Best-effort: find the element on `page` whose label matches the edge's `via`
 // text, so the flow step carries a real locator a codegen step can click --
 // falls back to the page's first button/link if no exact match (e.g. the edge
 // came from an SPA route change with via = "navigation").
 function locatorForHop(page: FlowPage, via: string): ElementRecord | null {
+  if (isFragileVia(via)) return null;
   const exact = page.elements.find((e) => e.label.trim().toLowerCase() === via.trim().toLowerCase());
   if (exact) return exact;
-  return page.elements.find((e) => ["link", "button"].includes(e.type)) ?? null;
+  return page.elements.find((e) => ["link", "button"].includes(e.type) && e.label && !isFragileVia(e.label)) ?? null;
 }
 
 // Enumerates simple paths (no repeated pages) from `startUrl` through the
@@ -633,10 +1173,12 @@ function enumeratePaths(startUrl: string, adjacency: Map<string, NavEdge[]>): Ar
 export function buildFlowScenariosForSite(
   startUrl: string,
   pages: FlowPage[],
-  edges: NavEdge[]
+  edges: NavEdge[],
+  opts?: { maxFlows?: number }
 ): Array<{ scenario: ScenarioRecord; entryUrl: string }> {
   const pageByUrl = new Map(pages.map((p) => [p.url, p]));
   if (!pageByUrl.has(startUrl) || edges.length === 0) return [];
+  const maxFlows = Math.max(1, opts?.maxFlows ?? MAX_FLOW_SCENARIOS);
 
   const adjacency = new Map<string, NavEdge[]>();
   for (const edge of edges) {
@@ -666,7 +1208,7 @@ export function buildFlowScenariosForSite(
 
   const selected: typeof ranked = [];
   for (const candidate of ranked) {
-    if (selected.length >= MAX_FLOW_SCENARIOS) break;
+    if (selected.length >= maxFlows) break;
     if (seenDestinations.has(candidate.destPage.url)) continue;
     seenDestinations.add(candidate.destPage.url);
     selected.push(candidate);
@@ -676,15 +1218,16 @@ export function buildFlowScenariosForSite(
     const pagesInPath = path.map((url) => pageByUrl.get(url)!);
     const titles = pagesInPath.map((p) => p.title);
 
+    // Multi-page flows always navigate by absolute URL. Clicking crawled link
+    // text is brittle (truncated cards, carousels, locale drift, off-page CTAs) and
+    // caused widespread TimeoutError noise that was mislabeled as product bugs.
     const steps: string[] = [`Given the user starts on "${titles[0]}"`];
     const locators: string[] = [];
     for (let i = 1; i < pagesInPath.length; i++) {
-      const fromPage = pagesInPath[i - 1];
-      const via = vias[i - 1];
-      const hopLocator = locatorForHop(fromPage, via);
-      if (hopLocator) locators.push(...hopLocator.locators.slice(0, 1));
       const connector = i === 1 ? "When" : "And";
-      steps.push(`${connector} the user ${verbFor(via)} to reach "${titles[i]}"`);
+      const via = vias[i - 1];
+      const viaNote = via && !isFragileVia(via) ? ` (via "${via}")` : "";
+      steps.push(`${connector} the user navigates to "${pagesInPath[i].url}"${viaNote}`);
     }
     steps.push(`Then the user successfully reaches "${titles[titles.length - 1]}" and the end-to-end flow completes`);
 

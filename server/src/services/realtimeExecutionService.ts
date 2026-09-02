@@ -3,6 +3,7 @@
 
 import { EventEmitter } from "events";
 import { db } from "../db.js";
+import { executionEmitter } from "./realtimeExecutionEventService.js";
 
 export interface ExecutionProgressEvent {
   type: "start" | "test_started" | "test_completed" | "bug_found" | "cost_updated" | "complete" | "error";
@@ -27,17 +28,26 @@ const activeRuns = new Set<string>();
 /**
  * Start tracking a run for real-time updates
  */
-export function startRealtimeTracking(runId: string) {
+export function startRealtimeTracking(runId: string, totalTests = 1) {
   if (!runEmitters.has(runId)) {
     runEmitters.set(runId, new EventEmitter());
     activeRuns.add(runId);
+  }
+  // Bridge to SSE EventSource used by RealtimeExecutionDashboard (F1)
+  if (!executionEmitter.getProgress(runId)) {
+    executionEmitter.startTracking(runId, Math.max(1, totalTests));
   }
 }
 
 /**
  * Stop tracking a run
  */
-export function stopRealtimeTracking(runId: string) {
+export function stopRealtimeTracking(runId: string, outcome: "completed" | "failed" = "completed") {
+  if (outcome === "failed") {
+    executionEmitter.failExecution(runId, "Run ended with failure");
+  } else {
+    executionEmitter.completeExecution(runId);
+  }
   runEmitters.delete(runId);
   activeRuns.delete(runId);
 }
@@ -56,6 +66,28 @@ export function emitProgress(event: ExecutionProgressEvent) {
   const emitter = runEmitters.get(event.runId);
   if (emitter) {
     emitter.emit("progress", event);
+  }
+  const completed =
+    (event.data?.testsPassed || 0) + (event.data?.testsFailed || 0);
+  if (event.type === "bug_found" && event.data?.testName) {
+    executionEmitter.reportBugFound(
+      event.runId,
+      `bug-${Date.now()}`,
+      event.data.testName,
+      "medium",
+      "execution"
+    );
+  } else if (event.type === "complete") {
+    executionEmitter.completeExecution(event.runId);
+  } else if (event.type === "error") {
+    executionEmitter.failExecution(event.runId, event.data?.errorMessage || "error");
+  } else {
+    executionEmitter.updateProgress(
+      event.runId,
+      completed || executionEmitter.getProgress(event.runId)?.completedTests || 0,
+      event.data?.testName,
+      event.data?.costAccumulated
+    );
   }
 }
 
