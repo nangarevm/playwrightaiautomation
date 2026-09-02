@@ -51,37 +51,24 @@ reportingRouter.get("/ultrafast-bug-report", (req, res) => {
       return res.status(400).json({ error: "siteId query parameter is required" });
     }
 
-    // Collect bugs from crawl
-    const crawlBugs = db.prepare(
-      `SELECT DISTINCT b.* FROM bug_findings b 
-       JOIN screens s ON b.screen_id = s.id 
-       WHERE s.crawl_site_id = ?`
-    ).all(siteId) as any[];
+    // Collect bugs from crawl -- reuse the same siteId -> crawl_pages -> screens
+    // (by URL) join collectCrawlBugsForSite already does elsewhere, rather than
+    // a `screens.crawl_site_id` column that doesn't exist (the old inline query
+    // here threw and was silently swallowed by the catch below, so this endpoint
+    // always returned an empty bug report for crawl-sourced findings).
+    const crawlBugs = collectCrawlBugsForSite(siteId);
 
-    // Collect bugs from recent test executions for this site
+    // Collect bugs from recent test executions for this site, joined the same way.
     const recentRuns = db.prepare(
       `SELECT DISTINCT er.id FROM execution_runs er
        JOIN automation_scripts a ON er.script_id = a.id
        JOIN test_cases tc ON a.test_case_id = tc.id
-       WHERE tc.id IN (
-         SELECT id FROM test_cases WHERE screen_id IN (
-           SELECT id FROM screens WHERE crawl_site_id = ?
-         )
-       )
+       JOIN screens s ON tc.screen_id = s.id
+       WHERE s.url_or_path IN (SELECT url FROM crawl_pages WHERE site_id = ?)
        ORDER BY er.created_at DESC LIMIT 20`
     ).all(siteId) as Array<{ id: string }>;
 
-    const executionBugs = [];
-    for (const run of recentRuns) {
-      const bugs = db.prepare(
-        `SELECT ee.id, ee.test_title as title, ee.error_message as detail, 
-                ee.duration_ms, er.id as testCaseId
-         FROM execution_evidence ee
-         JOIN execution_runs er ON ee.run_id = er.id
-         WHERE er.id = ? AND ee.error_message IS NOT NULL`
-      ).all(run.id) as any[];
-      executionBugs.push(...bugs);
-    }
+    const executionBugs = collectTestExecutionBugs(recentRuns.map((r) => r.id));
 
     const bugReport = generateUltrafastBugReport(siteId, crawlBugs, executionBugs);
     const formattedReport = formatBugReport(bugReport, format || "json");

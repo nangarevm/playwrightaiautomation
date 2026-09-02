@@ -245,20 +245,18 @@ export async function triggerUltrafastRun(input: UltrafastTriggerInput) {
     const crawlSiteId = screen?.crawl_site_id || null;
     
     if (crawlSiteId) {
-      const crawlBugs = db.prepare(
-        `SELECT DISTINCT b.* FROM bug_findings b 
-         JOIN screens s ON b.screen_id = s.id 
-         WHERE s.crawl_site_id = ?`
-      ).all(crawlSiteId) as any[];
-      
-      const executionBugs = db.prepare(
-        `SELECT ee.id, ee.test_title as title, ee.error_message as detail, 
-                er.id as testCaseId, ee.duration_ms
-         FROM execution_evidence ee
-         JOIN execution_runs er ON ee.run_id = er.id
-         WHERE er.id = ? AND ee.error_message IS NOT NULL`
-      ).all(runResult.id) as any[];
-      
+      // `screens.crawl_site_id` doesn't exist -- collectCrawlBugsForSite joins
+      // siteId -> crawl_pages -> screens by URL instead (same fix as the
+      // /reporting/ultrafast-bug-report route). The inline query here used to
+      // throw and get swallowed by the outer catch, so bugReport was silently
+      // always null for any crawl-originated run.
+      const crawlBugs = collectCrawlBugsForSite(crawlSiteId);
+
+      // collectTestExecutionBugs joins all the way back to the test case so the
+      // report shows its actual steps/expected result, not just the run id
+      // mislabeled as a test case id (the previous inline query here).
+      const executionBugs = collectTestExecutionBugs([runResult.id]);
+
       bugReport = generateUltrafastBugReport(crawlSiteId, crawlBugs, executionBugs);
     }
   } catch (err: any) {
