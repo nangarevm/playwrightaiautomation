@@ -843,6 +843,13 @@ ensureColumn("org_settings", "responsive_scan_enabled", "INTEGER NOT NULL DEFAUL
 // app -- see screensService.ts's VISUAL_DIFF_CONFIG doc comment.
 ensureColumn("screens", "visual_ignore_selectors_json", "TEXT NOT NULL DEFAULT '[]'");
 
+// #4 DOM-level checks: per-screen CSS selectors excluded from every DOM
+// check (zero-size, overlap, text-overflow, off-viewport) -- known
+// intentional patterns (an off-canvas drawer, a deliberately overlapping
+// badge). Empty by default, same reasoning as visual_ignore_selectors_json
+// above -- see domChecksService.ts's DOM_CHECKS_CONFIG doc comment.
+ensureColumn("screens", "dom_check_ignore_selectors_json", "TEXT NOT NULL DEFAULT '[]'");
+
 db.exec(`
 -- API response schema capture/validation: one row per distinct "METHOD path"
 -- endpoint seen during a crawl/execution. First sighting stores the inferred

@@ -22,6 +22,7 @@ import {
   setApiSchemaDefaultMode,
 } from '../src/services/adminService.ts';
 import { compareScreenshotToBaseline, getVisualIgnoreSelectors, setVisualIgnoreSelectors, VISUAL_DIFF_CONFIG } from '../src/services/screensService.ts';
+import { getDomCheckIgnoreSelectors, setDomCheckIgnoreSelectors, DOM_CHECKS_CONFIG } from '../src/services/domChecksService.ts';
 import { isResponsiveScanEnabled, setResponsiveScanEnabled, RESPONSIVE_VIEWPORTS } from '../src/services/responsiveService.ts';
 
 function resetData() {
@@ -293,4 +294,25 @@ test('per-screen visual ignore-selectors are stored and round-trip, with validat
   assert.throws(() => setVisualIgnoreSelectors('screen-visual-ignore', 'not-an-array'));
 
   db.prepare('DELETE FROM screens WHERE id = ?').run('screen-visual-ignore');
+});
+
+// ---- Phase 4: DOM check config/CRUD (the actual detection logic runs inside
+// a page.evaluate() callback and needs a real browser -- verified live
+// against server/src/demo-app/dom-fixture.html, not repeated here) ----
+
+test('DOM_CHECKS_CONFIG has no app-specific selector guesses by default, and per-screen ignore-selectors round-trip', () => {
+  assert.deepEqual(DOM_CHECKS_CONFIG.defaultIgnoreSelectors, []);
+
+  const now = new Date().toISOString();
+  db.prepare(`
+    INSERT INTO screens (id, name, module_name, source_input_id, url_or_path, last_captured_state_hash, change_status, last_compared_at, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, 'new', ?, ?, ?)
+  `).run('screen-dom-ignore', 'DOM ignore fixture', 'fixture', 'input-x', null, 'x', now, now, now);
+
+  assert.deepEqual(getDomCheckIgnoreSelectors('screen-dom-ignore'), []);
+  setDomCheckIgnoreSelectors('screen-dom-ignore', ['.badge-wrap']);
+  assert.deepEqual(getDomCheckIgnoreSelectors('screen-dom-ignore'), ['.badge-wrap']);
+  assert.throws(() => setDomCheckIgnoreSelectors('screen-dom-ignore', 'not-an-array'));
+
+  db.prepare('DELETE FROM screens WHERE id = ?').run('screen-dom-ignore');
 });

@@ -25,7 +25,7 @@ import { analyzeVisualDifferences, detectImageLoadingIssues, detectTextRendering
 import { analyzeConsoleError, summarizeErrors, groupErrorsByCategory, detectRelatedErrors, type ConsoleError } from "./consoleErrorService.js";
 import { validateInteraction, validateInteractionSequence, detectInteractionPatterns, type InteractionEvent } from "./interactionValidationService.js";
 import { checkAndRecordApiResponse } from "./apiSchemaService.js";
-import { runDomChecks } from "./domChecksService.js";
+import { runDomChecks, getDomCheckIgnoreSelectors } from "./domChecksService.js";
 import { checkUiApiConsistency } from "./uiApiConsistencyService.js";
 import { getVisualDiffThresholdPercent } from "./adminService.js";
 import { runResponsiveBugScan } from "./responsiveService.js";
@@ -683,7 +683,7 @@ ${Object.entries(grouped)
     // Deeper Bug Detection #4: DOM-level checks (zero-size w/ content, overlapping
     // interactive elements, text overflow, off-viewport) -- one extra
     // page.evaluate() pass on the already-loaded page, no extra navigation.
-    const domIssues = await runDomChecks(page);
+    const domIssues = await runDomChecks(page, screenId ? getDomCheckIgnoreSelectors(screenId) : []);
     for (const issue of domIssues) {
       const screenshotUrl = await screenshotNow();
       findings.push(

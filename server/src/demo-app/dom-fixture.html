@@ -1,0 +1,43 @@
+<!doctype html>
+<html>
+<head><title>DOM Checks Test Fixture</title>
+<style>
+  body { margin: 0; font-family: sans-serif; padding: 20px; }
+  /* Real bug: zero-size element with content (broken layout) */
+  .zero-size-bug { width: 0; height: 0; overflow: hidden; }
+  /* Real bug: two buttons overlapping */
+  .overlap-wrap { position: relative; height: 60px; }
+  .overlap-a { position: absolute; left: 0; top: 0; width: 150px; height: 50px; }
+  .overlap-b { position: absolute; left: 30px; top: 10px; width: 150px; height: 50px; }
+  /* Real bug: clipped text, no ellipsis, no line-clamp */
+  .overflow-bug { width: 80px; height: 20px; overflow: hidden; white-space: nowrap; }
+  /* Not a bug: legitimate multi-line clamp (should NOT be flagged) */
+  .clamped-card { width: 200px; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
+  /* Real bug: interactive element off-viewport */
+  .off-viewport-bug { position: absolute; left: -9999px; top: 0; }
+  /* Intentional overlap that should be suppressed via ignore-selectors */
+  .badge-wrap { position: relative; width: 60px; height: 60px; margin-top: 20px; }
+  .avatar { position: absolute; left: 0; top: 0; width: 50px; height: 50px; }
+  .notif-badge { position: absolute; left: 30px; top: 30px; width: 30px; height: 30px; }
+</style>
+</head>
+<body>
+  <div class="zero-size-bug">This text is invisible due to a real layout bug</div>
+
+  <div class="overlap-wrap">
+    <button class="overlap-a">Submit</button>
+    <button class="overlap-b">Cancel</button>
+  </div>
+
+  <div class="overflow-bug">This text is way too long to fit in its box and gets clipped</div>
+
+  <div class="clamped-card">This is a legitimately multi-line-clamped card summary that is intentionally truncated after two lines using the well-known -webkit-line-clamp CSS technique, which should NOT be flagged as a bug.</div>
+
+  <a href="#" class="off-viewport-bug">Hidden off-screen link</a>
+
+  <div class="badge-wrap">
+    <button class="avatar">A</button>
+    <button class="notif-badge">3</button>
+  </div>
+</body>
+</html>

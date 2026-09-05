@@ -9,6 +9,7 @@ import {
   saveVisualBaseline,
   setVisualIgnoreSelectors,
 } from "../services/screensService.js";
+import { getDomCheckIgnoreSelectors, setDomCheckIgnoreSelectors } from "../services/domChecksService.js";
 import { queueExecution } from "../services/executionService.js";
 import { getVisualDiffThresholdPercent } from "../services/adminService.js";
 import { errBody } from "../errorCodes.js";
@@ -62,6 +63,23 @@ screensRouter.put("/:id/visual-ignore-selectors", (req, res) => {
   try {
     setVisualIgnoreSelectors(req.params.id, selectors ?? []);
     res.json({ selectors: getVisualIgnoreSelectors(req.params.id) });
+  } catch (err: any) {
+    res.status(400).json(errBody(400, err.message));
+  }
+});
+
+// Deeper Bug Detection #4: known-intentional patterns to exclude from every
+// DOM check for this screen (an off-canvas drawer, a deliberately overlapping
+// badge). Empty by default; add your own rather than us guessing them.
+screensRouter.get("/:id/dom-check-ignore-selectors", (req, res) => {
+  res.json({ selectors: getDomCheckIgnoreSelectors(req.params.id) });
+});
+
+screensRouter.put("/:id/dom-check-ignore-selectors", (req, res) => {
+  const { selectors } = req.body as { selectors?: string[] };
+  try {
+    setDomCheckIgnoreSelectors(req.params.id, selectors ?? []);
+    res.json({ selectors: getDomCheckIgnoreSelectors(req.params.id) });
   } catch (err: any) {
     res.status(400).json(errBody(400, err.message));
   }
