@@ -817,6 +817,63 @@ CREATE TABLE IF NOT EXISTS preset_usage (
 );
 `);
 
+// Deeper bug detection: network/console capture, API schema validation, visual
+// regression, DOM-level checks, responsive/multi-viewport, and UI-vs-API
+// consistency all layer onto the existing Bug Detection Engine (bugDetectionService.ts)
+// rather than a parallel pipeline -- bug_findings gets two additive columns
+// (existing rows keep working; `source` is unchanged), and two small new tables
+// hold the state genuinely new to this pass (stored API schemas to diff against,
+// and declarative UI-count-vs-API-count rules).
+ensureColumn("bug_findings", "category", "TEXT"); // 'console-error'|'api-status'|'api-schema'|'ui-visual'|'ui-dom'|'ui-api-mismatch'|'functional' -- see bugDetectionService.ts's CATEGORY doc for the full mapping from existing finding types
+ensureColumn("bug_findings", "viewport", "TEXT"); // 'desktop'|'tablet'|'mobile' when found during a responsive scan; null otherwise
+
+// Configurable thresholds (QA-Lead editable, mirroring self_heal/ultrafast
+// confidence thresholds above) -- deliberately NOT hardcoded in the scanning
+// code itself.
+ensureColumn("org_settings", "visual_diff_threshold_percent", "REAL NOT NULL DEFAULT 1.0");
+ensureColumn("org_settings", "api_schema_default_mode", "TEXT NOT NULL DEFAULT 'baseline'"); // 'baseline' (accept current shape as the new normal) | 'strict' (fail on any drift)
+ensureColumn("org_settings", "responsive_scan_enabled", "INTEGER NOT NULL DEFAULT 1"); // #5: mobile/tablet re-scan on top of the existing desktop scan
+
+db.exec(`
+-- API response schema capture/validation: one row per distinct "METHOD path"
+-- endpoint seen during a crawl/execution. First sighting stores the inferred
+-- shape as the baseline; every later sighting is diffed against it (see
+-- apiSchemaService.ts). Reviewable/editable directly (list/update mode/reset),
+-- not just a write-only cache.
+CREATE TABLE IF NOT EXISTS api_schemas (
+  id TEXT PRIMARY KEY,
+  endpoint_key TEXT NOT NULL UNIQUE, -- "METHOD /path", e.g. "GET /api/orders"
+  method TEXT NOT NULL,
+  path TEXT NOT NULL,
+  mode TEXT NOT NULL DEFAULT 'baseline', -- 'baseline' | 'strict'
+  schema_json TEXT NOT NULL, -- inferred shape (see apiSchemaService.inferShape)
+  sample_response_json TEXT, -- last sample body captured (truncated), for human review
+  sample_status INTEGER,
+  site_id TEXT, -- optional: crawl_sites.id this endpoint was first seen on
+  seen_count INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+-- Declarative UI-vs-API consistency rules (#6): "the element count matched by
+-- this selector on this screen should equal the count found at this JSON path
+-- in this endpoint's response". Kept as data (not inferred) because reliably
+-- auto-pairing an arbitrary list/table with the right endpoint/field is not a
+-- solvable heuristic in general -- a human names the pairing once, then every
+-- future crawl/execution checks it automatically.
+CREATE TABLE IF NOT EXISTS ui_api_consistency_rules (
+  id TEXT PRIMARY KEY,
+  screen_id TEXT NOT NULL,
+  name TEXT,
+  dom_selector TEXT NOT NULL, -- CSS selector; number of matched visible elements is the "UI count"
+  api_endpoint_key TEXT NOT NULL, -- "METHOD /path" matching api_schemas.endpoint_key / a captured response
+  json_path TEXT NOT NULL DEFAULT '', -- dot path to an array/number in the response body; '' = root array length or a top-level count/total field
+  is_active INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY (screen_id) REFERENCES screens(id)
+);
+`);
+
 // Seed a default user per SRS user class (FR-8.1) so RBAC is usable out of the box
 const userCount = (db.prepare("SELECT COUNT(*) as count FROM users").get() as any).count as number;
 if (userCount === 0) {

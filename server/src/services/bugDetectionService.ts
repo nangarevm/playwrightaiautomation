@@ -16,13 +16,19 @@ import { fileURLToPath } from "url";
 import { chromium } from "playwright";
 import { nanoid } from "nanoid";
 import { db } from "../db.js";
-import { getScreen } from "./screensService.js";
+import { getScreen, compareScreenshotToBaseline } from "./screensService.js";
 import { fileGenericBug } from "./integrationsService.js";
 import type { SpellingIssue } from "../crawler/types.js";
 import { originOf, normalizeUrl } from "../crawler/urlUtils.js";
+import { isLikelyApiResponse } from "../crawler/network.js";
 import { analyzeVisualDifferences, detectImageLoadingIssues, detectTextRenderingIssues } from "./visualDetectionService.js";
 import { analyzeConsoleError, summarizeErrors, groupErrorsByCategory, detectRelatedErrors, type ConsoleError } from "./consoleErrorService.js";
 import { validateInteraction, validateInteractionSequence, detectInteractionPatterns, type InteractionEvent } from "./interactionValidationService.js";
+import { checkAndRecordApiResponse } from "./apiSchemaService.js";
+import { runDomChecks } from "./domChecksService.js";
+import { checkUiApiConsistency } from "./uiApiConsistencyService.js";
+import { getVisualDiffThresholdPercent } from "./adminService.js";
+import { runResponsiveBugScan } from "./responsiveService.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const UPLOAD_DIR = path.join(__dirname, "..", "uploads");
@@ -30,14 +36,36 @@ if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
 export type BugSeverity = "critical" | "high" | "medium" | "low";
 export type BugSource = "ui_exploratory" | "api_fuzz" | "regression";
+// The six-value taxonomy a finding is tagged with, plus 'functional' for the
+// pre-existing FR-7.6 regression-on-failure findings (a test-execution
+// failure, not one of the six proactive-detection categories below). The rule
+// used to assign a category to every *existing* finding type (none of them
+// were tagged before this pass) is: what signal actually detected it --
+//   console-error      <- console.error / uncaught exception (page.on('console'|'pageerror'))
+//   api-status          <- an HTTP status/network-connection signal, whether the
+//                          request was for the page itself, an image, a link, or
+//                          an XHR/fetch call (4xx/5xx, failed request, nav timeout,
+//                          API fuzz crash, "2xx with an error body")
+//   api-schema           <- a captured API response's JSON shape drifted from its
+//                          stored baseline (apiSchemaService.ts)
+//   ui-visual             <- a pixel-diff against a stored screenshot baseline
+//                          exceeded its threshold (screensService.ts)
+//   ui-dom                <- a DOM/rendering-level signal: broken image, stuck
+//                          spinner, empty body, spelling, or the new zero-size/
+//                          overlap/text-overflow/off-viewport checks (domChecksService.ts)
+//   ui-api-mismatch     <- a declared UI-count-vs-API-count rule disagreed
+//                          (uiApiConsistencyService.ts)
+export type BugCategory = "console-error" | "api-status" | "api-schema" | "ui-visual" | "ui-dom" | "ui-api-mismatch" | "functional";
 
 export interface BugFindingInput {
   source: BugSource;
+  category?: BugCategory;
   severity: BugSeverity;
   title: string;
   detail: string;
   screenId?: string | null;
   runId?: string | null;
+  viewport?: string | null;
   evidence?: Record<string, any>;
   stepsToReproduce?: string[];
   screenshotUrl?: string | null;
@@ -47,11 +75,13 @@ export interface BugFindingInput {
 export interface BugFindingRow {
   id: string;
   source: BugSource;
+  category: BugCategory | null;
   severity: BugSeverity;
   title: string;
   detail: string;
   screen_id: string | null;
   run_id: string | null;
+  viewport: string | null;
   evidence: string;
   steps_to_reproduce: string | null;
   screenshot_url: string | null;
@@ -69,11 +99,13 @@ export function recordBugFinding(input: BugFindingInput): BugFindingRow {
   const row: BugFindingRow = {
     id,
     source: input.source,
+    category: input.category ?? null,
     severity: input.severity,
     title: input.title,
     detail: input.detail,
     screen_id: input.screenId ?? null,
     run_id: input.runId ?? null,
+    viewport: input.viewport ?? null,
     evidence: JSON.stringify(input.evidence ?? {}),
     steps_to_reproduce: JSON.stringify(input.stepsToReproduce ?? []),
     screenshot_url: input.screenshotUrl ?? null,
@@ -85,18 +117,19 @@ export function recordBugFinding(input: BugFindingInput): BugFindingRow {
     updated_at: now,
   };
   db.prepare(`
-    INSERT INTO bug_findings (id, source, severity, title, detail, screen_id, run_id, evidence, steps_to_reproduce, screenshot_url, video_url, status, created_at, updated_at)
-    VALUES (@id, @source, @severity, @title, @detail, @screen_id, @run_id, @evidence, @steps_to_reproduce, @screenshot_url, @video_url, @status, @created_at, @updated_at)
+    INSERT INTO bug_findings (id, source, category, severity, title, detail, screen_id, run_id, viewport, evidence, steps_to_reproduce, screenshot_url, video_url, status, created_at, updated_at)
+    VALUES (@id, @source, @category, @severity, @title, @detail, @screen_id, @run_id, @viewport, @evidence, @steps_to_reproduce, @screenshot_url, @video_url, @status, @created_at, @updated_at)
   `).run(row);
   return row;
 }
 
-export function listBugFindings(filter?: { status?: string; severity?: string; screenId?: string }): BugFindingRow[] {
+export function listBugFindings(filter?: { status?: string; severity?: string; screenId?: string; category?: string }): BugFindingRow[] {
   const clauses: string[] = [];
   const params: Record<string, string> = {};
   if (filter?.status) { clauses.push("status = @status"); params.status = filter.status; }
   if (filter?.severity) { clauses.push("severity = @severity"); params.severity = filter.severity; }
   if (filter?.screenId) { clauses.push("screen_id = @screen_id"); params.screen_id = filter.screenId; }
+  if (filter?.category) { clauses.push("category = @category"); params.category = filter.category; }
   const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
   return db.prepare(`SELECT * FROM bug_findings ${where} ORDER BY created_at DESC`).all(params) as BugFindingRow[];
 }
@@ -202,6 +235,7 @@ export async function fuzzApiEndpoint(baseUrl: string, endpointTemplate: string,
         const headerLines = Object.entries(headers).map(([k, v]) => `-H "${k}: ${v}"`).join(" ");
         const finding = recordBugFinding({
           source: "api_fuzz",
+          category: "api-status",
           severity: "high",
           title: `${endpointTemplate} crashes (HTTP ${res.status}) on ${fuzz.label}`,
           detail: `GET ${url} returned HTTP ${res.status} instead of a clean 4xx -- unvalidated input reached a server-side failure.`,
@@ -240,18 +274,29 @@ const SCAN_NAV_TIMEOUT_MS = 30000;
 // images, a load spinner that never resolves. The whole session is screen-
 // recorded (attached to every finding from this scan) and each individual
 // finding also gets its own screenshot taken at the moment it's detected.
+export interface ScanScreenOptions {
+  /** Deeper Bug Detection #5: which viewport to scan at. Defaults to the original 1280x800 desktop size. */
+  viewport?: { name: string; width: number; height: number };
+  /** Deeper Bug Detection #6: run declarative UI-vs-API consistency rules for this screen. Defaults to true when a real screenId is available. */
+  checkUiApiConsistency?: boolean;
+}
+
+const DESKTOP_VIEWPORT = { name: "desktop", width: 1280, height: 800 };
+
 export async function scanScreenForUiBugs(
   screen: { id: string; name: string; url_or_path: string | null },
   runId?: string,
-  catalogScreenId?: string | null
+  catalogScreenId?: string | null,
+  options?: ScanScreenOptions
 ): Promise<BugFindingRow[]> {
   if (!screen.url_or_path) return [];
   const screenId = catalogScreenId ?? null;
+  const viewport = options?.viewport ?? DESKTOP_VIEWPORT;
   const findings: BugFindingRow[] = [];
   const browser = await chromium.launch({ headless: true });
   const context = await browser.newContext({
-    viewport: { width: 1280, height: 800 },
-    recordVideo: { dir: UPLOAD_DIR, size: { width: 1280, height: 800 } },
+    viewport: { width: viewport.width, height: viewport.height },
+    recordVideo: { dir: UPLOAD_DIR, size: { width: viewport.width, height: viewport.height } },
   });
 
   async function screenshotNow(): Promise<string | null> {
@@ -270,6 +315,11 @@ export async function scanScreenForUiBugs(
     const serverErrors: Array<{ url: string; status: number }> = [];
     const clientErrors: Array<{ url: string; status: number }> = [];
     const failedRequests: Array<{ url: string; error: string }> = [];
+    // Deeper Bug Detection #2: candidate XHR/fetch responses worth validating
+    // as API calls -- the response body is read after the page settles (below),
+    // not inline in this listener, so a slow/streaming body never blocks or
+    // races the rest of the scan.
+    const apiResponseCandidates: Array<{ response: import("playwright").Response; method: string }> = [];
 
     page.on("console", (msg) => {
       if (msg.type() === "error") {
@@ -289,6 +339,11 @@ export async function scanScreenForUiBugs(
       else if (res.status() >= 400 && res.request().resourceType() === "document") {
         clientErrors.push({ url: res.url(), status: res.status() });
       }
+      const req = res.request();
+      const resourceType = req.resourceType();
+      if ((resourceType === "xhr" || resourceType === "fetch") && isLikelyApiResponse(res.headers()["content-type"] || "", res.url())) {
+        apiResponseCandidates.push({ response: res, method: req.method().toUpperCase() });
+      }
     });
     page.on("requestfailed", (req) => {
       failedRequests.push({ url: req.url(), error: (req.failure()?.errorText || "request failed").slice(0, 200) });
@@ -306,6 +361,7 @@ export async function scanScreenForUiBugs(
       const screenshotUrl = await screenshotNow();
       const finding = recordBugFinding({
         source: "ui_exploratory",
+        category: "api-status",
         severity: "critical",
         title: `${screen.name} failed to load`,
         detail: `Navigating to ${screen.url_or_path} did not complete: ${navErr.message}`,
@@ -324,6 +380,7 @@ export async function scanScreenForUiBugs(
       const screenshotUrl = await screenshotNow();
       const finding = recordBugFinding({
         source: "ui_exploratory",
+        category: "api-status",
         severity: mainResponse.status() >= 500 ? "critical" : "high",
         title: `${screen.name} returned HTTP ${mainResponse.status()}`,
         detail: `The main document at ${screen.url_or_path} returned HTTP ${mainResponse.status()} instead of a successful response.`,
@@ -349,6 +406,7 @@ export async function scanScreenForUiBugs(
       const screenshotUrl = await screenshotNow();
       const finding = recordBugFinding({
         source: "ui_exploratory",
+        category: "api-status",
         severity: "critical",
         title: `Server error(s) while loading ${screen.name}`,
         detail: serverErrors.map((e) => `HTTP ${e.status} — ${e.url}`).join("\n"),
@@ -365,6 +423,7 @@ export async function scanScreenForUiBugs(
       const screenshotUrl = await screenshotNow();
       const finding = recordBugFinding({
         source: "ui_exploratory",
+        category: "console-error",
         severity: "high",
         title: `JavaScript error on ${screen.name}`,
         detail: pageErrors.join("\n"),
@@ -382,6 +441,7 @@ export async function scanScreenForUiBugs(
       findings.push(
         recordBugFinding({
           source: "ui_exploratory",
+          category: "ui-dom",
           severity: "medium",
           title: `Broken image(s) on ${screen.name}`,
           detail: brokenImages.join("\n"),
@@ -400,6 +460,7 @@ export async function scanScreenForUiBugs(
       findings.push(
         recordBugFinding({
           source: "ui_exploratory",
+          category: "api-status",
           severity: "medium",
           title: `Broken internal link(s) on ${screen.name}`,
           detail: brokenLinks.map((l) => `HTTP ${l.status} — ${l.url} (${l.label})`).join("\n"),
@@ -417,6 +478,7 @@ export async function scanScreenForUiBugs(
       findings.push(
         recordBugFinding({
           source: "ui_exploratory",
+          category: "ui-dom",
           severity: "medium",
           title: `Stuck loading indicator on ${screen.name}`,
           detail: `${stuckSpinners} loading indicator(s) still animating ${SPINNER_GRACE_MS}ms after the page reported idle.`,
@@ -436,6 +498,7 @@ export async function scanScreenForUiBugs(
       findings.push(
         recordBugFinding({
           source: "ui_exploratory",
+          category: "console-error",
           severity: summary.bySeverity.critical || summary.bySeverity.high ? "high" : "medium",
           title: `Console error(s) on ${screen.name} (${summary.total} total)`,
           detail: `
@@ -483,6 +546,7 @@ ${Object.entries(grouped)
       findings.push(
         recordBugFinding({
           source: "ui_exploratory",
+          category: "api-status",
           severity: "high",
           title: `Client error loading ${screen.name}`,
           detail: clientErrors.map((e) => `HTTP ${e.status} — ${e.url}`).join("\n"),
@@ -501,6 +565,7 @@ ${Object.entries(grouped)
       findings.push(
         recordBugFinding({
           source: "ui_exploratory",
+          category: "api-status",
           severity: "medium",
           title: `Failed network request(s) on ${screen.name}`,
           detail: criticalFailedRequests.slice(0, 8).map((r) => `${r.error} — ${r.url}`).join("\n"),
@@ -519,6 +584,7 @@ ${Object.entries(grouped)
       findings.push(
         recordBugFinding({
           source: "ui_exploratory",
+          category: "ui-dom",
           severity: "high",
           title: `${screen.name} appears blank or nearly empty`,
           detail: "The page body has very little visible text after load — the page may be broken or failed to render content.",
@@ -529,6 +595,104 @@ ${Object.entries(grouped)
           screenshotUrl,
         })
       );
+    }
+
+    // Deeper Bug Detection #4: DOM-level checks (zero-size w/ content, overlapping
+    // interactive elements, text overflow, off-viewport) -- one extra
+    // page.evaluate() pass on the already-loaded page, no extra navigation.
+    const domIssues = await runDomChecks(page);
+    for (const issue of domIssues) {
+      const screenshotUrl = await screenshotNow();
+      findings.push(
+        recordBugFinding({
+          source: "ui_exploratory",
+          category: "ui-dom",
+          severity: issue.severity,
+          title: `${issue.kind.replace(/_/g, " ")} on ${screen.name} (${viewport.name})`,
+          detail: issue.message,
+          screenId,
+          runId,
+          viewport: viewport.name,
+          evidence: { kind: issue.kind, samples: issue.samples, count: issue.count },
+          stepsToReproduce: [...baseSteps, `Observe: ${issue.message}`, `Examples: ${issue.samples.join("; ")}`],
+          screenshotUrl,
+        })
+      );
+    }
+
+    // Deeper Bug Detection #2: validate each captured API response's schema
+    // against its stored baseline and flag a 2xx-with-error-shaped-body
+    // anomaly regardless of mode. Bodies captured here also feed the
+    // UI-vs-API consistency check right below (same page load, same data).
+    const capturedApiBodies = new Map<string, unknown>();
+    for (const candidate of apiResponseCandidates.slice(0, 30)) {
+      let body: unknown;
+      try {
+        body = await candidate.response.json();
+      } catch {
+        continue; // not a parseable JSON body -- nothing to validate
+      }
+      let pathname = candidate.response.url();
+      try {
+        pathname = new URL(candidate.response.url()).pathname;
+      } catch {
+        /* keep the full URL as a fallback path */
+      }
+      const endpointKey = `${candidate.method} ${pathname}`;
+      capturedApiBodies.set(endpointKey, body);
+      findings.push(
+        ...checkAndRecordApiResponse({
+          method: candidate.method,
+          path: pathname,
+          status: candidate.response.status(),
+          body,
+          screenId,
+          runId,
+        })
+      );
+    }
+
+    // Deeper Bug Detection #6: declarative UI-count-vs-API-count rules, checked
+    // against the bodies just captured for this same page load.
+    if (screenId && (options?.checkUiApiConsistency ?? true) && capturedApiBodies.size > 0) {
+      findings.push(...(await checkUiApiConsistency(page, screenId, screen.name, capturedApiBodies, runId)));
+    }
+
+    // Deeper Bug Detection #3: pixel-diff against this screen's stored baseline
+    // for this viewport, if one has been saved (screensService.saveVisualBaseline).
+    // No baseline yet -- nothing to compare against, not itself a finding.
+    if (screenId) {
+      try {
+        const currentScreenshot = await page.screenshot({ fullPage: true });
+        const diff = compareScreenshotToBaseline(screenId, currentScreenshot, {
+          viewportName: viewport.name,
+          thresholdPercent: getVisualDiffThresholdPercent(),
+        });
+        if (diff.hasBaseline && diff.visualChangeDetected) {
+          const screenshotUrl = diff.diffImage ? saveUploadFile(diff.diffImage, ".png") : await screenshotNow();
+          findings.push(
+            recordBugFinding({
+              source: "ui_exploratory",
+              category: "ui-visual",
+              severity: (diff.diffPercentage ?? 0) > 25 ? "high" : "medium",
+              title: `Visual regression on ${screen.name} (${viewport.name}): ${diff.diffPercentage}% of pixels differ`,
+              detail: `Pixel diff against the stored baseline is ${diff.diffPercentage}%, above the configured threshold of ${diff.thresholdPercent}%.`,
+              screenId,
+              runId,
+              viewport: viewport.name,
+              evidence: { diffPercentage: diff.diffPercentage, thresholdPercent: diff.thresholdPercent, dimensions: diff.dimensions },
+              stepsToReproduce: [
+                ...baseSteps,
+                `Compare against the saved visual baseline for this screen (${viewport.name}).`,
+                `Observe: ${diff.diffPercentage}% of pixels differ (threshold: ${diff.thresholdPercent}%). See the attached diff image.`,
+              ],
+              screenshotUrl,
+            })
+          );
+        }
+      } catch {
+        // Visual diff is supplementary evidence -- never fail the scan over it.
+      }
     }
   } finally {
     await context.close();
@@ -559,10 +723,10 @@ ${Object.entries(grouped)
 // Orchestrator: run the exploratory UI scan for a single cataloged Screen.
 // Called automatically right after an execution run completes (see
 // executionService.runExecution) and available on demand via POST /api/bugs/scan.
-export async function runBugScanForScreen(screenId: string, runId?: string): Promise<BugFindingRow[]> {
+export async function runBugScanForScreen(screenId: string, runId?: string, options?: ScanScreenOptions): Promise<BugFindingRow[]> {
   const screen = getScreen(screenId) as { id: string; name: string; url_or_path: string | null } | undefined;
   if (!screen) throw new Error("Screen not found.");
-  return scanScreenForUiBugs(screen, runId, screenId);
+  return scanScreenForUiBugs(screen, runId, screenId, options);
 }
 
 async function checkBrokenInternalLinks(
@@ -616,6 +780,7 @@ export function fileSpellingFindings(screenId: string, screenName: string, issue
     findings.push(
       recordBugFinding({
         source: "ui_exploratory",
+        category: "ui-dom",
         severity: "low",
         title: `Spelling issue on ${screenName}: "${issue.word}"`,
         detail: `Misspelled "${issue.word}" in ${issue.context}${issue.suggestions?.[0] ? ` (suggested: "${issue.suggestions[0]}")` : ""}`,
@@ -664,6 +829,13 @@ export async function runPostCrawlBugScan(
 
     const uiFindings = await scanScreenForUiBugs(scanTarget, undefined, screenId);
     allFindings.push(...uiFindings);
+
+    // Deeper Bug Detection #5: also re-scan at mobile/tablet viewport sizes for
+    // every cataloged screen touched by this crawl (desktop is the scan above).
+    if (screenId) {
+      const responsiveFindings = await runResponsiveBugScan(screenId).catch(() => [] as BugFindingRow[]);
+      allFindings.push(...responsiveFindings);
+    }
 
     const apis = JSON.parse(page.apis_json || "[]") as Array<{ method: string; endpoint: string }>;
     for (const api of apis) {

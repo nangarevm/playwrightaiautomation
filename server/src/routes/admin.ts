@@ -4,10 +4,12 @@ import {
   createUser,
   disableSsoUser,
   exportProject,
+  getApiSchemaDefaultMode,
   getAuditRetentionPolicy,
   getCostSavingSetting,
   getOrgRedactionSetting,
   getSsoConfig,
+  getVisualDiffThresholdPercent,
   importProject,
   listAuditLog,
   listBusinessRules,
@@ -17,13 +19,16 @@ import {
   requireRole,
   routeTestCaseToOwner,
   sampleTestCasesForReReview,
+  setApiSchemaDefaultMode,
   setBusinessRuleActive,
   setCriticalPath,
   setCostSavingMode,
   setOrgRedactionSetting,
+  setVisualDiffThresholdPercent,
   ssoCallback,
   submitSecondReviewerSignOff,
 } from "../services/adminService.js";
+import { isResponsiveScanEnabled, setResponsiveScanEnabled } from "../services/responsiveService.js";
 import { errBody } from "../errorCodes.js";
 
 export const adminRouter = Router();
@@ -114,6 +119,49 @@ adminRouter.get("/org-settings/cost-saving", (_req, res) => {
 adminRouter.put("/org-settings/cost-saving", (req, res) => {
   const { enabled } = req.body as { enabled?: boolean };
   res.json(setCostSavingMode(Boolean(enabled), req.user));
+});
+
+// Deeper Bug Detection #3: percent-of-pixels-differing threshold above which a
+// visual regression finding is filed -- same readable-by-anyone/QA-Lead-writes
+// pattern as the toggles above.
+adminRouter.get("/org-settings/visual-diff-threshold", (_req, res) => {
+  res.json({ visual_diff_threshold_percent: getVisualDiffThresholdPercent() });
+});
+
+adminRouter.put("/org-settings/visual-diff-threshold", requireRole("QA Lead"), (req, res) => {
+  const { threshold } = req.body as { threshold?: number };
+  try {
+    res.json(setVisualDiffThresholdPercent(Number(threshold), req.user));
+  } catch (err: any) {
+    res.status(400).json(errBody(400, err.message));
+  }
+});
+
+// Deeper Bug Detection #2: default mode ('baseline' | 'strict') applied to a
+// newly discovered API endpoint's stored schema.
+adminRouter.get("/org-settings/api-schema-default-mode", (_req, res) => {
+  res.json({ api_schema_default_mode: getApiSchemaDefaultMode() });
+});
+
+adminRouter.put("/org-settings/api-schema-default-mode", requireRole("QA Lead"), (req, res) => {
+  const { mode } = req.body as { mode?: string };
+  try {
+    res.json(setApiSchemaDefaultMode(String(mode), req.user));
+  } catch (err: any) {
+    res.status(400).json(errBody(400, err.message));
+  }
+});
+
+// Deeper Bug Detection #5: on/off toggle for the mobile/tablet re-scan layered
+// on top of the existing desktop bug scan.
+adminRouter.get("/org-settings/responsive-scan", (_req, res) => {
+  res.json({ responsive_scan_enabled: isResponsiveScanEnabled() });
+});
+
+adminRouter.put("/org-settings/responsive-scan", requireRole("QA Lead"), (req, res) => {
+  const { enabled } = req.body as { enabled?: boolean };
+  setResponsiveScanEnabled(Boolean(enabled));
+  res.json({ responsive_scan_enabled: isResponsiveScanEnabled() });
 });
 
 // FR-2.11: QA-Lead-managed domain/business rules

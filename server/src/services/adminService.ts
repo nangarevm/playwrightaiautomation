@@ -274,6 +274,46 @@ export function setUltrafastConfidenceThreshold(threshold: number, updatedBy: Cu
   return { ultrafast_confidence_threshold: getUltrafastConfidenceThreshold() };
 }
 
+// Deeper bug detection (#3 visual regression): QA-Lead-editable threshold, in
+// percent of pixels differing, above which screensService.diffAgainstVisualBaseline's
+// pixel-diff result is treated as a real "UI changed" bug rather than noise
+// (sub-pixel anti-aliasing/font-rendering jitter between runs).
+export function getVisualDiffThresholdPercent(): number {
+  const row = db.prepare("SELECT visual_diff_threshold_percent FROM org_settings WHERE id = 1").get() as { visual_diff_threshold_percent: number };
+  return row.visual_diff_threshold_percent;
+}
+
+export function setVisualDiffThresholdPercent(threshold: number, updatedBy: CurrentUser | undefined) {
+  if (typeof threshold !== "number" || threshold < 0 || threshold > 100) {
+    throw new Error("threshold must be a number between 0 and 100 (percent of pixels differing)");
+  }
+  const now = new Date().toISOString();
+  db.prepare("UPDATE org_settings SET visual_diff_threshold_percent = ?, updated_by = ?, updated_at = ? WHERE id = 1").run(threshold, updatedBy?.id ?? null, now);
+  logAudit(updatedBy, "org_visual_diff_threshold_changed", "org_settings", "1", { threshold });
+  return { visual_diff_threshold_percent: getVisualDiffThresholdPercent() };
+}
+
+// Deeper bug detection (#2 API schema validation): the default mode a newly
+// discovered endpoint's stored schema starts in -- 'baseline' silently accepts
+// whatever shape is first seen as the new normal (no drift ever flagged);
+// 'strict' flags any later drift as an api-schema bug. Per-endpoint mode can
+// still be overridden individually (see apiSchemaService.updateApiSchemaMode);
+// this is only the default applied when an endpoint is first captured.
+export function getApiSchemaDefaultMode(): "baseline" | "strict" {
+  const row = db.prepare("SELECT api_schema_default_mode FROM org_settings WHERE id = 1").get() as { api_schema_default_mode: "baseline" | "strict" };
+  return row.api_schema_default_mode;
+}
+
+export function setApiSchemaDefaultMode(mode: string, updatedBy: CurrentUser | undefined) {
+  if (mode !== "baseline" && mode !== "strict") {
+    throw new Error("mode must be 'baseline' or 'strict'");
+  }
+  const now = new Date().toISOString();
+  db.prepare("UPDATE org_settings SET api_schema_default_mode = ?, updated_by = ?, updated_at = ? WHERE id = 1").run(mode, updatedBy?.id ?? null, now);
+  logAudit(updatedBy, "org_api_schema_default_mode_changed", "org_settings", "1", { mode });
+  return { api_schema_default_mode: getApiSchemaDefaultMode() };
+}
+
 // FR-2.11: QA-Lead-managed domain/business rules, persisted as a real entity
 // (previously a free-text string re-typed per generation call) so generation
 // can pull the active set automatically and a threshold demonstrably shows up

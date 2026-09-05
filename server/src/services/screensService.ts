@@ -26,11 +26,13 @@ function ensureVisualBaselineDir() {
 
 // FR-5.9: capture a real screenshot via Playwright headless Chromium against a screen's URL.
 // Genuine rendering, not a stand-in -- verified in this dev environment (chromium launches and
-// page.screenshot() returns real PNG bytes).
-async function captureScreenshot(url: string): Promise<Buffer> {
+// page.screenshot() returns real PNG bytes). Viewport is parameterized (Deeper Bug Detection #5)
+// so the same capture path serves desktop and the responsive mobile/tablet scans, defaulting to
+// the original 1280x800 desktop size so existing (pre-#5) baselines/callers are unaffected.
+async function captureScreenshot(url: string, viewport: { width: number; height: number } = { width: 1280, height: 800 }): Promise<Buffer> {
   const browser = await chromium.launch({ headless: true });
   try {
-    const page = await browser.newPage({ viewport: { width: 1280, height: 800 } });
+    const page = await browser.newPage({ viewport });
     await page.goto(url, { waitUntil: "load", timeout: 15000 });
     return await page.screenshot({ fullPage: true });
   } finally {
@@ -38,11 +40,15 @@ async function captureScreenshot(url: string): Promise<Buffer> {
   }
 }
 
-// FR-5.9: real pixel-difference-percentage comparison between two PNG buffers, using
-// pixelmatch (decoded via pngjs) rather than a content-hash stand-in. Buffers of differing
-// dimensions are handled by comparing against the larger canvas (mismatched pixels beyond the
-// smaller image's bounds count as differences), so a real percentage is always produced.
-function comparePngBuffers(beforePng: Buffer, afterPng: Buffer): { diffPercentage: number; width: number; height: number } {
+// FR-5.9 / Deeper Bug Detection #3: real pixel-difference-percentage comparison
+// between two PNG buffers, using pixelmatch (decoded via pngjs) rather than a
+// content-hash stand-in. Buffers of differing dimensions are handled by
+// comparing against the larger canvas (mismatched pixels beyond the smaller
+// image's bounds count as differences), so a real percentage is always
+// produced. Also returns the rendered diff image itself (pixelmatch's own
+// highlighted-difference output) so a visual-regression bug finding can attach
+// it as evidence, not just report a percentage.
+function comparePngBuffers(beforePng: Buffer, afterPng: Buffer): { diffPercentage: number; width: number; height: number; diffImage: Buffer } {
   const before = PNG.sync.read(beforePng);
   const after = PNG.sync.read(afterPng);
   const width = Math.max(before.width, after.width);
@@ -59,7 +65,12 @@ function comparePngBuffers(beforePng: Buffer, afterPng: Buffer): { diffPercentag
   const diff = new PNG({ width, height });
   const mismatched = pixelmatch(a.data, b.data, diff.data, width, height, { threshold: 0.1 });
   const totalPixels = width * height;
-  return { diffPercentage: totalPixels === 0 ? 0 : parseFloat(((mismatched / totalPixels) * 100).toFixed(2)), width, height };
+  return {
+    diffPercentage: totalPixels === 0 ? 0 : parseFloat(((mismatched / totalPixels) * 100).toFixed(2)),
+    width,
+    height,
+    diffImage: PNG.sync.write(diff),
+  };
 }
 
 // FR-1.10/FR-2.14: a short, human-readable "screen" name for input types that
@@ -176,15 +187,58 @@ export function getScreenChangeSummary(screenId: string) {
 // not a content-hash stand-in. `content`-only calls (no url) fall back to the earlier
 // content-hash approach for callers that don't have a live URL to render (e.g. HTML-only
 // inputs) -- that fallback path is honestly still a hash, not pixels.
-export async function saveVisualBaseline(screenId: string, params: { content?: string; url?: string }) {
+// Deeper Bug Detection #5 (responsive): a baseline is per-viewport, keyed by an
+// optional viewport name suffix on the stored file, so "desktop" (the default,
+// unsuffixed -- preserves every pre-#5 baseline's file path unchanged) and
+// "tablet"/"mobile" each get their own independent screenshot to diff against.
+function baselineFilePath(screenId: string, viewportName?: string): string {
+  const suffix = viewportName && viewportName !== "desktop" ? `__${viewportName}` : "";
+  return path.join(VISUAL_BASELINE_DIR, `${screenId}${suffix}.png`);
+}
+
+/**
+ * Compare an already-captured screenshot against a screen's stored baseline,
+ * without launching a second browser to re-navigate the page. For a caller
+ * (bugDetectionService.scanScreenForUiBugs) that's mid-scan and already has a
+ * full-page screenshot in hand -- diffAgainstVisualBaseline below is for a
+ * caller that only has a URL and needs the screenshot captured for it.
+ */
+export function compareScreenshotToBaseline(
+  screenId: string,
+  currentScreenshot: Buffer,
+  opts?: { viewportName?: string; thresholdPercent?: number }
+): { hasBaseline: boolean; visualChangeDetected: boolean; diffPercentage?: number; thresholdPercent?: number; dimensions?: { width: number; height: number }; method?: "pixel-diff"; diffImage?: Buffer } {
+  const filePath = baselineFilePath(screenId, opts?.viewportName);
+  if (!fs.existsSync(filePath)) return { hasBaseline: false, visualChangeDetected: false };
+  const beforePng = fs.readFileSync(filePath);
+  const { diffPercentage, width, height, diffImage } = comparePngBuffers(beforePng, currentScreenshot);
+  const threshold = opts?.thresholdPercent ?? 1.0;
+  return {
+    hasBaseline: true,
+    visualChangeDetected: diffPercentage > threshold,
+    diffPercentage,
+    thresholdPercent: threshold,
+    dimensions: { width, height },
+    method: "pixel-diff",
+    diffImage,
+  };
+}
+
+export async function saveVisualBaseline(screenId: string, params: { content?: string; url?: string; viewport?: { name: string; width: number; height: number } }) {
   const now = new Date().toISOString();
   if (params.url) {
     ensureVisualBaselineDir();
-    const screenshot = await captureScreenshot(params.url);
-    const filePath = path.join(VISUAL_BASELINE_DIR, `${screenId}.png`);
+    const screenshot = await captureScreenshot(params.url, params.viewport);
+    const filePath = baselineFilePath(screenId, params.viewport?.name);
     fs.writeFileSync(filePath, screenshot);
-    const ref = JSON.stringify({ type: "screenshot", path: filePath, capturedAt: now });
-    db.prepare("UPDATE screens SET visual_baseline_ref = ?, updated_at = ? WHERE id = ?").run(ref, now, screenId);
+    const ref = JSON.stringify({ type: "screenshot", path: filePath, capturedAt: now, viewport: params.viewport?.name ?? "desktop" });
+
+    if (!params.viewport || params.viewport.name === "desktop") {
+      // The desktop baseline is still the Screen's single `visual_baseline_ref`
+      // (unchanged from before #5) so getScreenChangeSummary's `visual_baseline_set`
+      // and every existing caller keep working exactly as they did.
+      db.prepare("UPDATE screens SET visual_baseline_ref = ?, updated_at = ? WHERE id = ?").run(ref, now, screenId);
+    }
     return getScreen(screenId);
   }
 
@@ -194,36 +248,51 @@ export async function saveVisualBaseline(screenId: string, params: { content?: s
   return getScreen(screenId);
 }
 
-export async function diffAgainstVisualBaseline(screenId: string, params: { content?: string; url?: string }) {
+export async function diffAgainstVisualBaseline(
+  screenId: string,
+  params: { content?: string; url?: string; viewport?: { name: string; width: number; height: number }; thresholdPercent?: number }
+) {
   const screen = getScreen(screenId) as any;
   if (!screen) throw new Error("Screen not found");
-  if (!screen.visual_baseline_ref) return { hasBaseline: false, visualChangeDetected: false };
 
-  let baseline: { type: "screenshot" | "hash"; path?: string; hash?: string };
-  try {
-    baseline = JSON.parse(screen.visual_baseline_ref);
-  } catch {
-    // Pre-migration baselines were a raw hash string, not JSON -- treat as legacy hash type.
-    baseline = { type: "hash", hash: screen.visual_baseline_ref };
-  }
+  const isDesktop = !params.viewport || params.viewport.name === "desktop";
+  const filePath = baselineFilePath(screenId, params.viewport?.name);
+  // Non-desktop viewports have their own baseline file, not the Screen's single
+  // visual_baseline_ref column -- check the file directly rather than the column.
+  const hasBaseline = isDesktop ? Boolean(screen.visual_baseline_ref) : fs.existsSync(filePath);
+  if (!hasBaseline) return { hasBaseline: false, visualChangeDetected: false };
 
-  if (baseline.type === "screenshot" && baseline.path && fs.existsSync(baseline.path)) {
-    if (!params.url) {
-      throw new Error("This screen's baseline is a real screenshot -- a url is required to diff against it");
+  if (isDesktop) {
+    let baseline: { type: "screenshot" | "hash"; path?: string; hash?: string };
+    try {
+      baseline = JSON.parse(screen.visual_baseline_ref);
+    } catch {
+      // Pre-migration baselines were a raw hash string, not JSON -- treat as legacy hash type.
+      baseline = { type: "hash", hash: screen.visual_baseline_ref };
     }
-    const currentScreenshot = await captureScreenshot(params.url);
-    const beforePng = fs.readFileSync(baseline.path);
-    const { diffPercentage, width, height } = comparePngBuffers(beforePng, currentScreenshot);
-    return {
-      hasBaseline: true,
-      visualChangeDetected: diffPercentage > 0,
-      diffPercentage,
-      dimensions: { width, height },
-      method: "pixel-diff",
-    };
+    if (baseline.type === "hash" || !baseline.path) {
+      // Legacy/fallback content-hash comparison.
+      const currentHash = hashContent(params.content ?? "");
+      return { hasBaseline: true, visualChangeDetected: currentHash !== baseline.hash, method: "content-hash" };
+    }
+  } else if (!fs.existsSync(filePath)) {
+    return { hasBaseline: false, visualChangeDetected: false };
   }
 
-  // Legacy/fallback content-hash comparison.
-  const currentHash = hashContent(params.content ?? "");
-  return { hasBaseline: true, visualChangeDetected: currentHash !== baseline.hash, method: "content-hash" };
+  if (!params.url) {
+    throw new Error("This screen's baseline is a real screenshot -- a url is required to diff against it");
+  }
+  const currentScreenshot = await captureScreenshot(params.url, params.viewport);
+  const beforePng = fs.readFileSync(filePath);
+  const { diffPercentage, width, height, diffImage } = comparePngBuffers(beforePng, currentScreenshot);
+  const threshold = params.thresholdPercent ?? 1.0;
+  return {
+    hasBaseline: true,
+    visualChangeDetected: diffPercentage > threshold,
+    diffPercentage,
+    thresholdPercent: threshold,
+    dimensions: { width, height },
+    method: "pixel-diff" as const,
+    diffImage, // rendered diff PNG buffer, only worth reading when visualChangeDetected is true
+  };
 }

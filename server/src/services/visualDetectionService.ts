@@ -117,6 +117,7 @@ export function recordVisualBugs(screenId: string, screenName: string, differenc
   for (const diff of differences) {
     recordBugFinding({
       source: "ui_exploratory",
+      category: "ui-visual",
       screenId,
       title: `Visual Issue: ${diff.type}`,
       severity: diff.severity === "critical" ? "critical" : diff.severity === "high" ? "high" : "medium",

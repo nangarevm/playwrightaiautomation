@@ -7,6 +7,7 @@ import { db } from "../db.js";
 import { recordTimeBreakdownForRun, updateFlakyFlagForScript } from "./reportingService.js";
 import { autoFileBugOnRegression, notifyAllOnRunComplete } from "./integrationsService.js";
 import { runBugScanForScreen, recordBugFinding, publishFailureEvidence } from "./bugDetectionService.js";
+import { runResponsiveBugScan } from "./responsiveService.js";
 import { decryptSecret } from "./secretsService.js";
 import { getEnvironment, preflightHealthCheck } from "./environmentsService.js";
 import { logAudit } from "./adminService.js";
@@ -968,6 +969,7 @@ export function runExecution(scriptId: string, targetUrl: string, input: any = {
 
                 recordBugFinding({
                   source: "regression",
+                  category: "functional",
                   severity: "high",
                   title: `Possible product defect: ${ft.title}`,
                   detail: ft.errorMessage || ft.failureLabel,
@@ -1059,6 +1061,9 @@ export function runExecution(scriptId: string, targetUrl: string, input: any = {
         // test itself asserts. Best-effort, never blocks the run response.
         if (testCase?.screen_id) {
           runBugScanForScreen(testCase.screen_id, runId).catch(() => undefined);
+          // Deeper Bug Detection #5: also re-run at mobile/tablet viewport sizes
+          // (desktop is the scan just above) -- same best-effort, never-blocks pattern.
+          runResponsiveBugScan(testCase.screen_id, runId).catch(() => undefined);
         }
 
         resolve({
