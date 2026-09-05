@@ -314,6 +314,25 @@ export function setApiSchemaDefaultMode(mode: string, updatedBy: CurrentUser | u
   return { api_schema_default_mode: getApiSchemaDefaultMode() };
 }
 
+// Phase 1 hardening: how many identical (method+path) API calls within a
+// single page visit before it's flagged as a likely duplicate/excessive-
+// request bug (a polling storm, a re-render loop refiring the same fetch).
+// Configurable rather than hardcoded, same pattern as every other threshold above.
+export function getMaxDuplicateRequests(): number {
+  const row = db.prepare("SELECT max_duplicate_requests FROM org_settings WHERE id = 1").get() as { max_duplicate_requests: number };
+  return row.max_duplicate_requests;
+}
+
+export function setMaxDuplicateRequests(count: number, updatedBy: CurrentUser | undefined) {
+  if (typeof count !== "number" || !Number.isInteger(count) || count < 1) {
+    throw new Error("count must be a positive integer");
+  }
+  const now = new Date().toISOString();
+  db.prepare("UPDATE org_settings SET max_duplicate_requests = ?, updated_by = ?, updated_at = ? WHERE id = 1").run(count, updatedBy?.id ?? null, now);
+  logAudit(updatedBy, "org_max_duplicate_requests_changed", "org_settings", "1", { count });
+  return { max_duplicate_requests: getMaxDuplicateRequests() };
+}
+
 // FR-2.11: QA-Lead-managed domain/business rules, persisted as a real entity
 // (previously a free-text string re-typed per generation call) so generation
 // can pull the active set automatically and a threshold demonstrably shows up

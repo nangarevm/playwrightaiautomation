@@ -210,6 +210,38 @@ export function diffShape(baseline: ShapeNode, actual: ShapeNode, path = "$"): S
   return issues;
 }
 
+/**
+ * Phase 1 hardening: a 2xx array/object response that's empty where this
+ * endpoint's own learned baseline shows data is normally present -- e.g. a
+ * list endpoint that has always returned populated arrays suddenly returning
+ * `[]`, or an object endpoint whose baseline has fields it has NEVER once
+ * seen entirely absent now returning `{}`. False-positive risk: a genuinely
+ * empty result set (a search with zero matches, a brand-new account with no
+ * orders yet) is legitimate and looks identical at the shape level -- this
+ * heuristic can only ever be a hint, not a certainty, which is why it's
+ * `medium` severity rather than `high`/`critical` like a real schema-drift
+ * finding. Suppress a noisy endpoint by switching it to 'baseline' mode
+ * (re-learning also re-widens optionalFields, which lowers this check's
+ * sensitivity for that endpoint) or by editing/deleting its stored schema.
+ */
+export function detectUnexpectedEmpty(baseline: ShapeNode, actual: unknown): "array" | "object" | null {
+  if (Array.isArray(actual) && actual.length === 0 && baseline.kind === "array" && baseline.item !== null) {
+    return "array";
+  }
+  if (
+    actual &&
+    typeof actual === "object" &&
+    !Array.isArray(actual) &&
+    Object.keys(actual as Record<string, unknown>).length === 0 &&
+    baseline.kind === "object" &&
+    Object.keys(baseline.fields).length > 0 &&
+    baseline.optionalFields.length < Object.keys(baseline.fields).length
+  ) {
+    return "object";
+  }
+  return null;
+}
+
 /** Heuristic: a 2xx response whose body reads like an error payload -- the classic "200 OK with an error inside" API bug. */
 export function looksLikeErrorBody(body: unknown): boolean {
   if (!body || typeof body !== "object" || Array.isArray(body)) return false;
@@ -299,6 +331,10 @@ export interface ApiValidationInput {
   screenId?: string | null;
   runId?: string | null;
   siteId?: string | null;
+  /** Phase 1 hardening: the response's own content-type header, set when jsonParseFailed is true so the malformed-JSON check can tell "claims JSON, isn't" from "never claimed to be JSON". */
+  contentType?: string;
+  /** Phase 1 hardening: true when the caller tried response.json() and it threw -- body is always undefined in this case. */
+  jsonParseFailed?: boolean;
 }
 
 /**
@@ -312,6 +348,32 @@ export interface ApiValidationInput {
 export function checkAndRecordApiResponse(input: ApiValidationInput): BugFindingRow[] {
   const endpointKey = `${input.method} ${input.path}`;
   const findings: BugFindingRow[] = [];
+
+  if (input.jsonParseFailed) {
+    // Only flag it when the response actually claims to be JSON -- a
+    // non-JSON content-type failing to parse as JSON is expected (e.g. a 204
+    // No Content, or a redirect the fetch layer already resolved), not a bug.
+    if (/application\/json/i.test(input.contentType || "")) {
+      findings.push(
+        recordBugFinding({
+          source: "api_fuzz",
+          category: "api-status",
+          severity: "high",
+          title: `${endpointKey} returned malformed JSON`,
+          detail: `The response declares "Content-Type: ${input.contentType}" but the body could not be parsed as JSON -- any caller doing response.json() will crash instead of getting a usable error.`,
+          screenId: input.screenId ?? null,
+          runId: input.runId ?? null,
+          evidence: { endpointKey, status: input.status, contentType: input.contentType },
+          stepsToReproduce: [
+            `Call ${endpointKey}`,
+            `Observe: the response Content-Type header is "${input.contentType}", but the body fails to parse as JSON.`,
+            "Expected: either valid JSON, or a content-type that doesn't promise JSON.",
+          ],
+        })
+      );
+    }
+    return findings; // no parsed body -- nothing else to validate
+  }
 
   const isErrorShaped = input.status >= 200 && input.status < 300 && looksLikeErrorBody(input.body);
   if (isErrorShaped) {
@@ -350,6 +412,33 @@ export function checkAndRecordApiResponse(input: ApiValidationInput): BugFinding
   } catch {
     db.prepare("UPDATE api_schemas SET seen_count = seen_count + 1, updated_at = ? WHERE id = ?").run(new Date().toISOString(), existing.id);
     return findings; // corrupted stored schema -- don't crash the scan over it
+  }
+
+  // Phase 1 hardening: a 2xx response that's empty where this endpoint's own
+  // learned baseline shows data is normally present -- a status anomaly, not
+  // schema drift, so (like the error-shaped-body check above) it runs
+  // regardless of mode rather than being gated behind 'strict'.
+  if (input.status >= 200 && input.status < 300) {
+    const emptyKind = detectUnexpectedEmpty(baselineShape, input.body);
+    if (emptyKind) {
+      findings.push(
+        recordBugFinding({
+          source: "api_fuzz",
+          category: "api-status",
+          severity: "medium",
+          title: `${endpointKey} returned an empty ${emptyKind} where data was expected`,
+          detail: `This endpoint's learned baseline has always returned a populated ${emptyKind === "array" ? "array" : "object (with fields present)"}, but this response is empty. This may be a legitimate zero-result case (e.g. an empty search) rather than a defect -- verify before treating as a confirmed bug.`,
+          screenId: input.screenId ?? null,
+          runId: input.runId ?? null,
+          evidence: { endpointKey, status: input.status, emptyKind },
+          stepsToReproduce: [
+            `Call ${endpointKey}`,
+            `Observe: HTTP ${input.status} with an empty ${emptyKind}, where the baseline for this endpoint has always seen data.`,
+            "Confirm whether this specific request should legitimately have zero results.",
+          ],
+        })
+      );
+    }
   }
 
   if (existing.mode === "baseline") {

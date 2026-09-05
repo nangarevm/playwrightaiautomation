@@ -7,6 +7,7 @@ import {
   getApiSchemaDefaultMode,
   getAuditRetentionPolicy,
   getCostSavingSetting,
+  getMaxDuplicateRequests,
   getOrgRedactionSetting,
   getSsoConfig,
   getVisualDiffThresholdPercent,
@@ -23,6 +24,7 @@ import {
   setBusinessRuleActive,
   setCriticalPath,
   setCostSavingMode,
+  setMaxDuplicateRequests,
   setOrgRedactionSetting,
   setVisualDiffThresholdPercent,
   ssoCallback,
@@ -147,6 +149,21 @@ adminRouter.put("/org-settings/api-schema-default-mode", requireRole("QA Lead"),
   const { mode } = req.body as { mode?: string };
   try {
     res.json(setApiSchemaDefaultMode(String(mode), req.user));
+  } catch (err: any) {
+    res.status(400).json(errBody(400, err.message));
+  }
+});
+
+// Phase 1 hardening: identical (method+path) calls within one page visit
+// before it's flagged as a likely duplicate/excessive-request bug.
+adminRouter.get("/org-settings/max-duplicate-requests", (_req, res) => {
+  res.json({ max_duplicate_requests: getMaxDuplicateRequests() });
+});
+
+adminRouter.put("/org-settings/max-duplicate-requests", requireRole("QA Lead"), (req, res) => {
+  const { count } = req.body as { count?: number };
+  try {
+    res.json(setMaxDuplicateRequests(Number(count), req.user));
   } catch (err: any) {
     res.status(400).json(errBody(400, err.message));
   }

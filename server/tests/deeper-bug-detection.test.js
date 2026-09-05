@@ -7,6 +7,7 @@ import {
   mergeShape,
   diffShape,
   looksLikeErrorBody,
+  detectUnexpectedEmpty,
   checkAndRecordApiResponse,
   listApiSchemas,
   getApiSchemaByKey,
@@ -20,6 +21,8 @@ import {
   setVisualDiffThresholdPercent,
   getApiSchemaDefaultMode,
   setApiSchemaDefaultMode,
+  getMaxDuplicateRequests,
+  setMaxDuplicateRequests,
 } from '../src/services/adminService.ts';
 import { compareScreenshotToBaseline, getVisualIgnoreSelectors, setVisualIgnoreSelectors, VISUAL_DIFF_CONFIG } from '../src/services/screensService.ts';
 import { getDomCheckIgnoreSelectors, setDomCheckIgnoreSelectors, DOM_CHECKS_CONFIG } from '../src/services/domChecksService.ts';
@@ -366,4 +369,66 @@ test('DOM_CHECKS_CONFIG has no app-specific selector guesses by default, and per
   assert.throws(() => setDomCheckIgnoreSelectors('screen-dom-ignore', 'not-an-array'));
 
   db.prepare('DELETE FROM screens WHERE id = ?').run('screen-dom-ignore');
+});
+
+// ---- Phase 1 hardening: malformed-JSON, empty-response, duplicate-requests, unhandled-rejection config ----
+
+test('checkAndRecordApiResponse flags malformed JSON only when the response claims application/json', () => {
+  const claimsJson = checkAndRecordApiResponse({
+    method: 'GET',
+    path: '/api/malformed',
+    status: 200,
+    body: undefined,
+    contentType: 'application/json; charset=utf-8',
+    jsonParseFailed: true,
+  });
+  assert.equal(claimsJson.length, 1);
+  assert.equal(claimsJson[0].category, 'api-status');
+  assert.match(claimsJson[0].title, /malformed JSON/);
+
+  const notJson = checkAndRecordApiResponse({
+    method: 'GET',
+    path: '/api/not-json',
+    status: 200,
+    body: undefined,
+    contentType: 'text/plain',
+    jsonParseFailed: true,
+  });
+  assert.equal(notJson.length, 0, 'a non-JSON content-type failing to parse as JSON is expected, not a bug');
+});
+
+test('detectUnexpectedEmpty flags an empty array/object only when the baseline has previously seen real data', () => {
+  const arrayBaseline = inferShape([{ sku: 'a' }, { sku: 'b' }]);
+  assert.equal(detectUnexpectedEmpty(arrayBaseline, []), 'array');
+  assert.equal(detectUnexpectedEmpty(arrayBaseline, [{ sku: 'c' }]), null, 'non-empty is fine');
+
+  const emptyArrayBaseline = inferShape([]);
+  assert.equal(detectUnexpectedEmpty(emptyArrayBaseline, []), null, 'baseline itself never saw data -- nothing to compare against');
+
+  const objectBaseline = inferShape({ id: 1, total: 42 });
+  assert.equal(detectUnexpectedEmpty(objectBaseline, {}), 'object');
+
+  const allOptionalBaseline = { kind: 'object', fields: { promo: { kind: 'primitive', types: ['string'], nullable: false } }, optionalFields: ['promo'] };
+  assert.equal(detectUnexpectedEmpty(allOptionalBaseline, {}), null, 'every field is already known-optional -- an empty object is not anomalous');
+});
+
+test('checkAndRecordApiResponse flags an empty array against a populated baseline, regardless of schema mode', () => {
+  checkAndRecordApiResponse({ method: 'GET', path: '/api/inventory', status: 200, body: [{ sku: 'a' }, { sku: 'b' }] });
+  const findings = checkAndRecordApiResponse({ method: 'GET', path: '/api/inventory', status: 200, body: [] });
+  const emptyFinding = findings.find((f) => /empty array where data was expected/.test(f.title));
+  assert.ok(emptyFinding, 'expected an empty-response-where-data-expected finding');
+  assert.equal(emptyFinding.severity, 'medium');
+});
+
+test('max_duplicate_requests defaults to 5 and is QA-Lead editable, with validation', () => {
+  assert.equal(getMaxDuplicateRequests(), 5);
+  setMaxDuplicateRequests(3, undefined);
+  assert.equal(getMaxDuplicateRequests(), 3);
+  assert.throws(() => setMaxDuplicateRequests(0, undefined));
+  assert.throws(() => setMaxDuplicateRequests(1.5, undefined));
+  setMaxDuplicateRequests(5, undefined); // restore default for other tests
+});
+
+test('BUG_SCAN_CONFIG carries a duplicate-request fallback used only if the live org_settings lookup throws', () => {
+  assert.equal(BUG_SCAN_CONFIG.maxDuplicateRequestsFallback, 5);
 });

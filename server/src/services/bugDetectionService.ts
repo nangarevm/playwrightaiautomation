@@ -27,7 +27,7 @@ import { validateInteraction, validateInteractionSequence, detectInteractionPatt
 import { checkAndRecordApiResponse } from "./apiSchemaService.js";
 import { runDomChecks, getDomCheckIgnoreSelectors } from "./domChecksService.js";
 import { checkUiApiConsistency } from "./uiApiConsistencyService.js";
-import { getVisualDiffThresholdPercent } from "./adminService.js";
+import { getVisualDiffThresholdPercent, getMaxDuplicateRequests } from "./adminService.js";
 import { runResponsiveBugScan } from "./responsiveService.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -303,6 +303,14 @@ export const BUG_SCAN_CONFIG = {
   // own as you discover them, e.g. `/ResizeObserver loop limit exceeded/i`
   // (a well-known Chrome no-op warning many sites see and ignore).
   ignoredConsolePatterns: [/^Failed to load resource: the server responded with a status of \d+/i] as RegExp[],
+
+  // Phase 1 hardening: identical (method+path) XHR/fetch calls within one page
+  // visit at or above this count are flagged as a likely duplicate/excessive-
+  // request bug (a polling storm, a re-render loop refiring the same fetch on
+  // every state change). Reads the live org_settings value at scan time via
+  // adminService.getMaxDuplicateRequests() (see the response listener below) --
+  // this constant is only the fallback used if that lookup ever throws.
+  maxDuplicateRequestsFallback: 5,
 };
 
 function isIgnoredUrl(url: string): boolean {
@@ -372,6 +380,33 @@ export async function scanScreenForUiBugs(
     // not inline in this listener, so a slow/streaming body never blocks or
     // races the rest of the scan.
     const apiResponseCandidates: Array<{ response: import("playwright").Response; method: string }> = [];
+    // Phase 1 hardening: unhandled promise rejections, captured as their own
+    // signal rather than folded indiscriminately into the generic pageerror
+    // bucket below -- a rejected promise nobody awaited/caught is a distinct,
+    // very common real-world JS bug (a fire-and-forget async call whose
+    // failure is silently swallowed) worth naming specifically in a root-cause
+    // narrative instead of being reported as an undifferentiated "JavaScript
+    // error". Chromium's own pageerror event ALSO fires for the same
+    // rejection (CDP reports both via the same Runtime.exceptionThrown
+    // mechanism), so pageErrors is filtered below to exclude anything already
+    // captured here -- otherwise the same defect would produce two findings.
+    const unhandledRejections: string[] = [];
+    // Phase 1 hardening: count identical (method+path) XHR/fetch calls made
+    // during this one page visit, to flag a likely polling-storm/re-render-
+    // loop bug (see the duplicate-request check after the page settles below).
+    const apiCallCounts = new Map<string, number>();
+
+    await page.exposeFunction("__reportUnhandledRejection", (message: string) => {
+      unhandledRejections.push(String(message).slice(0, 300));
+    });
+    await page.addInitScript(() => {
+      window.addEventListener("unhandledrejection", (event) => {
+        const reason: any = (event as any).reason;
+        const message = reason && reason.message ? String(reason.message) : String(reason);
+        // @ts-ignore -- installed by page.exposeFunction above
+        if (typeof window.__reportUnhandledRejection === "function") window.__reportUnhandledRejection(message);
+      });
+    });
 
     page.on("console", (msg) => {
       if (msg.type() === "error") {
@@ -410,8 +445,19 @@ export async function scanScreenForUiBugs(
       }
       const req = res.request();
       const resourceType = req.resourceType();
-      if ((resourceType === "xhr" || resourceType === "fetch") && isLikelyApiResponse(res.headers()["content-type"] || "", res.url())) {
-        apiResponseCandidates.push({ response: res, method: req.method().toUpperCase() });
+      if (resourceType === "xhr" || resourceType === "fetch") {
+        const method = req.method().toUpperCase();
+        let pathname = res.url();
+        try {
+          pathname = new URL(res.url()).pathname;
+        } catch {
+          /* keep the full URL as a fallback key */
+        }
+        const callKey = `${method} ${pathname}`;
+        apiCallCounts.set(callKey, (apiCallCounts.get(callKey) ?? 0) + 1);
+        if (isLikelyApiResponse(res.headers()["content-type"] || "", res.url())) {
+          apiResponseCandidates.push({ response: res, method });
+        }
       }
     });
     page.on("requestfailed", (req) => {
@@ -492,19 +538,48 @@ export async function scanScreenForUiBugs(
       findings.push(finding);
       autoFileIfSevere(finding);
     }
-    if (pageErrors.length) {
+    // Only report a pageerror as a generic "JavaScript error" if it wasn't
+    // already captured more specifically as an unhandled promise rejection
+    // above -- see the unhandledRejections listener setup for why the same
+    // underlying event can otherwise surface through both channels.
+    const genericPageErrors = pageErrors.filter(
+      (m) => !unhandledRejections.some((u) => m.includes(u) || u.includes(m))
+    );
+    if (genericPageErrors.length) {
       const screenshotUrl = await screenshotNow();
       const finding = recordBugFinding({
         source: "ui_exploratory",
         category: "console-error",
         severity: "high",
         title: `JavaScript error on ${screen.name}`,
-        detail: pageErrors.join("\n"),
+        detail: genericPageErrors.join("\n"),
         screenId,
         runId,
         viewport: viewport.name,
-        evidence: { pageErrors },
-        stepsToReproduce: [...baseSteps, "Observe: an uncaught JavaScript exception is thrown -- open the browser console to see it.", `Error message: ${pageErrors[0]}`],
+        evidence: { pageErrors: genericPageErrors },
+        stepsToReproduce: [...baseSteps, "Observe: an uncaught JavaScript exception is thrown -- open the browser console to see it.", `Error message: ${genericPageErrors[0]}`],
+        screenshotUrl,
+      });
+      findings.push(finding);
+      autoFileIfSevere(finding);
+    }
+    if (unhandledRejections.length) {
+      const screenshotUrl = await screenshotNow();
+      const finding = recordBugFinding({
+        source: "ui_exploratory",
+        category: "console-error",
+        severity: "high",
+        title: `Unhandled promise rejection on ${screen.name}`,
+        detail: unhandledRejections.join("\n"),
+        screenId,
+        runId,
+        viewport: viewport.name,
+        evidence: { unhandledRejections },
+        stepsToReproduce: [
+          ...baseSteps,
+          "Observe: a promise rejects and nothing awaits/catches it -- open the browser console to see it.",
+          `Rejection reason: ${unhandledRejections[0]}`,
+        ],
         screenshotUrl,
       });
       findings.push(finding);
@@ -648,6 +723,44 @@ ${Object.entries(grouped)
       );
     }
 
+    // Phase 1 hardening: identical (method+path) XHR/fetch calls repeated
+    // above the configured threshold in one page visit -- a likely polling
+    // storm or a re-render loop refiring the same fetch on every state
+    // change. False-positive risk: legitimate short-interval polling
+    // (a live dashboard, a status-check loop) will trip this by design --
+    // raise org_settings.max_duplicate_requests (adminService.
+    // setMaxDuplicateRequests) for screens that intentionally poll.
+    const duplicateThreshold = (() => {
+      try {
+        return getMaxDuplicateRequests();
+      } catch {
+        return BUG_SCAN_CONFIG.maxDuplicateRequestsFallback;
+      }
+    })();
+    const duplicateCalls = Array.from(apiCallCounts.entries()).filter(([, count]) => count >= duplicateThreshold);
+    if (duplicateCalls.length) {
+      const screenshotUrl = await screenshotNow();
+      findings.push(
+        recordBugFinding({
+          source: "ui_exploratory",
+          category: "api-status",
+          severity: "medium",
+          title: `Duplicate/excessive API call(s) on ${screen.name}`,
+          detail: duplicateCalls.map(([key, count]) => `${key} was called ${count} times in one page visit`).join("\n"),
+          screenId,
+          runId,
+          viewport: viewport.name,
+          evidence: { duplicateCalls: duplicateCalls.map(([callKey, count]) => ({ callKey, count })), threshold: duplicateThreshold },
+          stepsToReproduce: [
+            ...baseSteps,
+            `Open DevTools Network tab and filter by XHR/Fetch.`,
+            `Observe: ${duplicateCalls.map(([key, count]) => `${key} fired ${count} times`).join("; ")} (threshold: ${duplicateThreshold}).`,
+          ],
+          screenshotUrl,
+        })
+      );
+    }
+
     // Noise filtering already happened at capture time (the requestfailed
     // listener above skips BUG_SCAN_CONFIG.ignoredUrlPatterns), so every entry
     // reaching here is already a non-noise failure -- no second filter needed.
@@ -720,17 +833,41 @@ ${Object.entries(grouped)
     // UI-vs-API consistency check right below (same page load, same data).
     const capturedApiBodies = new Map<string, unknown>();
     for (const candidate of apiResponseCandidates.slice(0, 30)) {
-      let body: unknown;
-      try {
-        body = await candidate.response.json();
-      } catch {
-        continue; // not a parseable JSON body -- nothing to validate
-      }
       let pathname = candidate.response.url();
       try {
         pathname = new URL(candidate.response.url()).pathname;
       } catch {
         /* keep the full URL as a fallback path */
+      }
+      let body: unknown;
+      let jsonParseFailed = false;
+      try {
+        body = await candidate.response.json();
+      } catch {
+        jsonParseFailed = true; // handled explicitly below instead of silently skipping
+      }
+      if (jsonParseFailed) {
+        // Phase 1 hardening: previously this candidate was silently dropped
+        // (`continue`) whenever the body didn't parse as JSON, meaning an
+        // endpoint that ADVERTISES a JSON content-type but returns malformed/
+        // truncated JSON was never flagged as anything -- callers relying on
+        // res.json() in production would crash with no corresponding finding
+        // here. Only flag it when the response actually claimed to be JSON;
+        // a non-JSON content-type failing to parse as JSON is expected, not a bug.
+        const contentType = candidate.response.headers()["content-type"] || "";
+        findings.push(
+          ...checkAndRecordApiResponse({
+            method: candidate.method,
+            path: pathname,
+            status: candidate.response.status(),
+            body: undefined,
+            contentType,
+            jsonParseFailed: true,
+            screenId,
+            runId,
+          })
+        );
+        continue;
       }
       const endpointKey = `${candidate.method} ${pathname}`;
       capturedApiBodies.set(endpointKey, body);

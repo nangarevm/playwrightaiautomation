@@ -123,6 +123,21 @@ app.get("/demo/api/orders", (req, res) => {
 app.get("/demo/api/products", (_req, res) => {
   res.json({ items: [1, 2, 3, 4, 5] });
 });
+// Phase 1 hardening verification fixtures: a JSON-content-type endpoint that
+// returns unparsable JSON (malformed-JSON detection), and a togglable
+// endpoint whose baseline always returns populated data but can return an
+// empty array on demand (empty-response-where-data-expected detection).
+app.get("/demo/api/malformed-json", (_req, res) => {
+  res.setHeader("content-type", "application/json");
+  res.status(200).send("{not valid json,,,");
+});
+app.get("/demo/api/inventory", (req, res) => {
+  if (req.query.variant === "2") {
+    res.json([]);
+  } else {
+    res.json([{ sku: "a" }, { sku: "b" }]);
+  }
+});
 // FR-1.1: serve uploaded screenshots so the client can render real thumbnails
 app.use("/uploads", express.static(uploadDir));
 

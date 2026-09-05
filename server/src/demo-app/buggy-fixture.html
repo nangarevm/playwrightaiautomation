@@ -13,6 +13,23 @@
     // for baseline-capture-then-drift-detection verification.
     const variant = new URLSearchParams(location.search).get('variant') || '1';
     fetch('/demo/api/orders?variant=' + variant).catch(() => {});
+
+    // Phase 1 hardening: an unhandled promise rejection (own signal, distinct
+    // from the generic uncaught-exception above).
+    Promise.reject(new Error('boom - unhandled rejection'));
+
+    // Phase 1 hardening: duplicate/excessive API calls -- fire the same GET
+    // repeatedly in one page visit (a stand-in for a polling-storm/re-render
+    // loop bug).
+    for (let i = 0; i < 6; i++) fetch('/demo/api/products').catch(() => {});
+
+    // Phase 1 hardening: malformed JSON (claims application/json, doesn't parse).
+    fetch('/demo/api/malformed-json').catch(() => {});
+
+    // Phase 1 hardening: empty-response-where-data-expected -- baseline
+    // always returns 2 items; ?inventoryVariant=2 flips it to an empty array.
+    const inventoryVariant = new URLSearchParams(location.search).get('inventoryVariant') || '1';
+    fetch('/demo/api/inventory?variant=' + inventoryVariant).catch(() => {});
   </script>
 </body>
 </html>

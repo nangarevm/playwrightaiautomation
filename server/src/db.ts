@@ -856,6 +856,11 @@ ensureColumn("screens", "dom_check_ignore_selectors_json", "TEXT NOT NULL DEFAUL
 // viewport sizes" ask (desktop already exists; mobile+tablet added here).
 ensureColumn("org_settings", "responsive_viewports_json", `TEXT NOT NULL DEFAULT '[{"name":"mobile","width":390,"height":844},{"name":"tablet","width":768,"height":1024}]'`);
 
+// Phase 1 hardening: how many identical (method+path) API calls within one
+// page visit is tolerated before it's flagged as a likely polling-storm/
+// re-render-loop bug, rather than a hardcoded inline number.
+ensureColumn("org_settings", "max_duplicate_requests", "INTEGER NOT NULL DEFAULT 5");
+
 db.exec(`
 -- API response schema capture/validation: one row per distinct "METHOD path"
 -- endpoint seen during a crawl/execution. First sighting stores the inferred
