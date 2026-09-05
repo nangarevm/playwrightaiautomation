@@ -602,3 +602,121 @@ test('per-screen accessibility ignore-rules round-trip, with validation', () => 
   assert.deepEqual(getAccessibilityIgnoreRules('screen-a11y-ignore'), ['color-contrast']);
   assert.throws(() => setAccessibilityIgnoreRules('screen-a11y-ignore', 'not-an-array'));
 });
+
+// ---- Phase 3a: field-type-aware mutation (fieldTypeInferenceService) ----
+
+import { classifyFieldMutationStrategy, generateMutationValues, representativeInvalidValue, generateFieldCombinationMatrix, FIELD_COMBINATION_CONFIG } from '../src/services/fieldTypeInferenceService.ts';
+
+test('classifyFieldMutationStrategy maps known input types and treats checkboxes/dropdowns/file as unmutable', () => {
+  assert.equal(classifyFieldMutationStrategy({ type: 'input', inputType: 'email' }), 'email');
+  assert.equal(classifyFieldMutationStrategy({ type: 'input', inputType: 'number' }), 'number');
+  assert.equal(classifyFieldMutationStrategy({ type: 'input', inputType: 'tel' }), 'tel');
+  assert.equal(classifyFieldMutationStrategy({ type: 'input', inputType: 'url' }), 'url');
+  assert.equal(classifyFieldMutationStrategy({ type: 'input', inputType: 'date' }), 'date');
+  assert.equal(classifyFieldMutationStrategy({ type: 'input', inputType: 'password' }), 'password');
+  assert.equal(classifyFieldMutationStrategy({ type: 'textarea' }), 'text');
+  assert.equal(classifyFieldMutationStrategy({ type: 'checkbox' }), 'unmutable');
+  assert.equal(classifyFieldMutationStrategy({ type: 'dropdown' }), 'unmutable');
+  assert.equal(classifyFieldMutationStrategy({ type: 'input', inputType: 'file' }), 'unmutable');
+});
+
+test('generateMutationValues returns a concrete, non-empty deterministic value set per mutable strategy, and none for unmutable fields', () => {
+  const emailValues = generateMutationValues({ type: 'input', inputType: 'email' });
+  assert.ok(emailValues.length > 0);
+  assert.ok(emailValues.every((v) => typeof v.value === 'string' && typeof v.label === 'string'));
+  assert.ok(emailValues.some((v) => v.label === 'invalid format'));
+
+  assert.deepEqual(generateMutationValues({ type: 'checkbox' }), []);
+});
+
+test('representativeInvalidValue returns a concrete literal value, not a description', () => {
+  const value = representativeInvalidValue({ type: 'input', inputType: 'email' });
+  assert.equal(value, 'not-an-email');
+  assert.ok(!/isn't a valid|invalid value that/i.test(value));
+});
+
+test('generateFieldCombinationMatrix requires at least 2 mutable fields and is capped', () => {
+  const single = generateFieldCombinationMatrix([{ type: 'input', label: 'Email', inputType: 'email', locators: [], component: 'x' }]);
+  assert.deepEqual(single, []);
+
+  const manyFields = Array.from({ length: 6 }, (_, i) => ({ type: 'input', label: `Field ${i}`, inputType: 'text', locators: [], component: 'x' }));
+  const combos = generateFieldCombinationMatrix(manyFields);
+  assert.ok(combos.length <= FIELD_COMBINATION_CONFIG.maxCombinations);
+  assert.ok(combos.length > 0);
+  for (const c of combos) {
+    assert.equal(c.states.length, 2);
+    assert.ok(c.states.some((s) => s.state === 'invalid'));
+    assert.ok(c.states.some((s) => s.state === 'empty'));
+  }
+});
+
+// ---- Phase 3b: state-transition testing config/CRUD (runFlow's actual
+// execution needs a real browser -- verified live against
+// server/src/demo-app/state-transition-fixture.html, not repeated here,
+// same pattern as the Phase 2/4 browser-dependent checks above) ----
+
+import { defineFlow, getFlow, listFlows, deleteFlow, buildCreateEditDeleteRefreshTemplate, buildDuplicateSubmitTemplate, buildRapidClickTemplate, buildBackForwardAfterMutationTemplate, buildSessionExpiryMidFlowTemplate } from '../src/services/stateTransitionService.ts';
+
+test('defineFlow validates step/invariant shape and persists, getFlow/listFlows/deleteFlow round-trip', () => {
+  insertScreen('screen-flow-1');
+  assert.throws(() => defineFlow({ name: 'no steps', steps: [], invariants: [] }));
+  assert.throws(() =>
+    defineFlow({ name: 'no invariants', steps: [{ action: 'navigate', url: 'http://x' }], invariants: [] })
+  );
+  assert.throws(() =>
+    defineFlow({
+      name: 'bad afterStep',
+      steps: [{ action: 'navigate', url: 'http://x' }],
+      invariants: [{ afterStep: 5, type: 'visible', selector: '.x', message: 'm' }],
+    })
+  );
+
+  const flow = defineFlow({
+    name: 'Delete then verify gone',
+    screenId: 'screen-flow-1',
+    steps: [
+      { action: 'navigate', url: 'http://localhost/x' },
+      { action: 'click', selector: '#delete' },
+      { action: 'refresh' },
+    ],
+    invariants: [{ afterStep: 2, type: 'not_visible', selector: '.record', message: 'still visible' }],
+  });
+  assert.ok(flow.id);
+
+  const reloaded = getFlow(flow.id);
+  assert.equal(reloaded.name, 'Delete then verify gone');
+  assert.equal(JSON.parse(reloaded.steps_json).length, 3);
+
+  const listed = listFlows('screen-flow-1');
+  assert.equal(listed.length, 1);
+  assert.equal(listed[0].id, flow.id);
+
+  deleteFlow(flow.id);
+  assert.equal(getFlow(flow.id), undefined);
+});
+
+test('named template builders produce a valid {steps, invariants} pair matching each master-prompt worked pattern', () => {
+  const t1 = buildCreateEditDeleteRefreshTemplate({
+    url: 'http://x', createSelector: '#new', fillSelector: '#name', value: 'Test', saveSelector: '#save',
+    recordSelector: 'text=Test', deleteSelector: '#delete',
+  });
+  assert.ok(t1.steps.some((s) => s.action === 'refresh'));
+  assert.equal(t1.invariants[0].type, 'not_visible');
+
+  const t2 = buildDuplicateSubmitTemplate({ url: 'http://x', fillSelector: '#name', value: 'Test', saveSelector: '#save', recordSelector: '.record' });
+  assert.equal(t2.steps.filter((s) => s.action === 'click').length, 2, 'duplicate-submit clicks save twice');
+  assert.equal(t2.invariants[0].type, 'count_equals');
+  assert.equal(t2.invariants[0].count, 1);
+
+  const t3 = buildRapidClickTemplate({ url: 'http://x', clickSelector: '#like', counterSelector: '.count', expectedText: '1', clicks: 5 });
+  assert.equal(t3.steps.filter((s) => s.action === 'click').length, 5);
+  assert.equal(t3.invariants[0].type, 'text_equals');
+
+  const t4 = buildBackForwardAfterMutationTemplate({ url: 'http://x', deleteSelector: '#delete', recordSelector: '.record' });
+  assert.deepEqual(t4.steps.map((s) => s.action), ['navigate', 'click', 'back', 'forward']);
+  assert.equal(t4.invariants[0].type, 'not_visible');
+
+  const t5 = buildSessionExpiryMidFlowTemplate({ url: 'http://x', triggerSelector: '#action', loginIndicatorSelector: '#login-form' });
+  assert.ok(t5.steps.some((s) => s.action === 'clear_cookies'));
+  assert.equal(t5.invariants[0].type, 'visible');
+});

@@ -885,6 +885,38 @@ ensureColumn("screens", "accessibility_ignore_rules_json", "TEXT NOT NULL DEFAUL
 ensureColumn("org_settings", "accessibility_enabled", "INTEGER NOT NULL DEFAULT 1");
 ensureColumn("org_settings", "accessibility_wcag_level", "TEXT NOT NULL DEFAULT 'AA'"); // 'A' | 'AA' | 'AAA'
 
+// Phase 3b: state-transition testing (master prompt #10) -- a declarative,
+// human/integration-defined ordered action list plus assertions ("invariants")
+// checked at specific points in that sequence (e.g. "after delete+refresh,
+// this record must no longer be visible"). Kept as data, same reasoning as
+// ui_api_consistency_rules -- reliably auto-inferring which button "deletes a
+// record" vs. "opens a form" on an arbitrary crawled site is not a solvable
+// heuristic in general, so a human/integration names the concrete flow once
+// (stateTransitionService.ts also ships template builders for the master
+// prompt's own named patterns: create-edit-delete-refresh-verify-gone,
+// duplicate-submit, rapid-click, back/forward-after-mutation,
+// session-expiry-mid-flow), then it can be re-run automatically.
+db.exec(`
+CREATE TABLE IF NOT EXISTS state_transition_flows (
+  id TEXT PRIMARY KEY,
+  screen_id TEXT,
+  name TEXT NOT NULL,
+  steps_json TEXT NOT NULL,
+  invariants_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY (screen_id) REFERENCES screens(id)
+);
+
+CREATE TABLE IF NOT EXISTS state_transition_runs (
+  id TEXT PRIMARY KEY,
+  flow_id TEXT NOT NULL,
+  status TEXT NOT NULL,
+  violated_invariants_json TEXT,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY (flow_id) REFERENCES state_transition_flows(id)
+);
+`);
+
 db.exec(`
 -- API response schema capture/validation: one row per distinct "METHOD path"
 -- endpoint seen during a crawl/execution. First sighting stores the inferred

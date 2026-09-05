@@ -26,6 +26,7 @@
 
 import { nanoid } from "nanoid";
 import type { ElementRecord, NavEdge, ScenarioRecord } from "./types.js";
+import { representativeInvalidValue, generateFieldCombinationMatrix } from "../services/fieldTypeInferenceService.js";
 
 const MAX_PER_FIELD_CATEGORY = 6; // cap individual-field scenarios per form (required-empty, invalid-format)
 const MAX_STANDALONE_ELEMENTS = 12; // cap per-element scenarios on a no-form page
@@ -198,9 +199,14 @@ function buildFormScenarios(pageTitle: string, formElements: ElementRecord[]): S
   }
 
   // 4. Negative, one per format-typed field: an invalid value in just that
-  // field, everything else valid.
+  // field, everything else valid. Phase 3a (fieldTypeInferenceService):
+  // the step names a concrete, deterministic value to type -- "enters
+  // 'not-an-email' into 'Email'" -- instead of the vague "a value that
+  // isn't a valid email" this used to say, so the scenario is directly
+  // reproducible without a human/automation having to invent a value.
   const formatInputs = inputs.filter((i) => i.inputType && ["email", "number", "tel", "url"].includes(i.inputType));
   for (const field of formatInputs.slice(0, MAX_PER_FIELD_CATEGORY)) {
+    const invalidValue = representativeInvalidValue(field);
     scenarios.push(
       makeScenario(
         `Verify ${flowGroup} rejects an invalid ${field.inputType} in "${field.label}"`,
@@ -208,11 +214,39 @@ function buildFormScenarios(pageTitle: string, formElements: ElementRecord[]): S
         flowGroup,
         [
           `Given the user is on "${pageTitle}"`,
-          `When the user enters a value that isn't a valid ${field.inputType} into "${field.label}"`,
+          `When the user enters "${invalidValue}" into "${field.label}"`,
           submitStep,
           `Then a format-validation error is shown for "${field.label}" and the form is not submitted`,
         ],
         [field, ...submitLocator]
+      )
+    );
+  }
+
+  // 4b. Phase 3b (fieldTypeInferenceService): field-combination-matrix
+  // edge cases -- TWO fields simultaneously wrong (one invalid, one empty),
+  // everything else valid. Catches a validation bug the one-field-at-a-time
+  // negatives above can't: a form that short-circuits on the first error and
+  // never reports/handles the second (e.g. a submit handler that returns
+  // early after the first failed field-level check).
+  const combinations = generateFieldCombinationMatrix(inputs);
+  for (const combo of combinations) {
+    const invalidField = combo.states.find((s) => s.state === "invalid")!.field;
+    const emptyField = combo.states.find((s) => s.state === "empty")!.field;
+    const invalidValue = representativeInvalidValue(invalidField);
+    scenarios.push(
+      makeScenario(
+        `Verify ${flowGroup} handles ${combo.label} (multi-field validation)`,
+        "edge",
+        flowGroup,
+        [
+          `Given the user is on "${pageTitle}"`,
+          `When the user enters "${invalidValue}" into "${invalidField.label}"`,
+          `And leaves "${emptyField.label}" empty`,
+          submitStep,
+          `Then validation errors are shown for both "${invalidField.label}" and "${emptyField.label}", and the form is not submitted`,
+        ],
+        [invalidField, emptyField, ...submitLocator]
       )
     );
   }

@@ -1,0 +1,26 @@
+<!doctype html>
+<html>
+<head><title>State Transition Fixture</title></head>
+<body>
+  <h1>Records</h1>
+  <ul id="record-list"></ul>
+  <button id="delete-btn">Delete first record</button>
+  <script>
+    // Deliberate bug: "deleting" a record only removes it from the in-memory
+    // array, never from localStorage, so a refresh re-reads the stale,
+    // still-containing-the-"deleted"-record localStorage value -- the
+    // record reappears after delete + refresh.
+    function render() {
+      const records = JSON.parse(localStorage.getItem('records') || '["Record A","Record B"]');
+      localStorage.setItem('records', JSON.stringify(records));
+      document.getElementById('record-list').innerHTML = records.map((r) => `<li class="record">${r}</li>`).join('');
+    }
+    document.getElementById('delete-btn').addEventListener('click', () => {
+      // Bug: removes from the DOM directly, never updates localStorage.
+      const first = document.querySelector('.record');
+      if (first) first.remove();
+    });
+    render();
+  </script>
+</body>
+</html>
