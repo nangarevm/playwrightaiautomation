@@ -235,6 +235,35 @@ export function markBugFindingFiled(id: string, provider: string, externalId: st
   return getBugFinding(id);
 }
 
+// Phase 5: records one reproduction attempt for an existing finding, without
+// inserting a new row -- the complement to the automatic bump inside
+// recordBugFinding (which only ever runs when the SAME fingerprint reappears,
+// i.e. a successful reproduction). Call this directly for a reproduction
+// attempt that did NOT reproduce the defect (reproduced: false), so
+// reproducibility_successes/attempts stays an honest ratio rather than
+// always reading 1:1 -- see bugReportingService.reverifyHighConfidenceFinding.
+export function recordReproductionAttempt(id: string, reproduced: boolean): BugFindingRow {
+  const existing = getBugFinding(id);
+  if (!existing) throw new Error("Bug finding not found.");
+  const attempts = existing.reproducibility_attempts + 1;
+  const successes = existing.reproducibility_successes + (reproduced ? 1 : 0);
+  const confidenceScore = scoreConfidence(
+    { category: existing.category, severity: existing.severity, evidence: existing.evidence, reproducibility_attempts: attempts, reproducibility_successes: successes },
+    { isCorrelated: !!existing.correlation_group_id }
+  );
+  const priority = derivePriority(existing.severity, confidenceScore);
+  const now = new Date().toISOString();
+  db.prepare("UPDATE bug_findings SET reproducibility_attempts = ?, reproducibility_successes = ?, confidence_score = ?, priority = ?, updated_at = ? WHERE id = ?").run(
+    attempts,
+    successes,
+    confidenceScore,
+    priority,
+    now,
+    id
+  );
+  return getBugFinding(id)!;
+}
+
 // Video is only finalized once the browser context that recorded it closes, so
 // findings created mid-scan are inserted with video_url = null and backfilled
 // here once the recording is on disk. Mutates the passed-in row objects too --

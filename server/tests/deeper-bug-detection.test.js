@@ -820,3 +820,91 @@ test('getExplorationSession/listExplorationSessions/stopExplorationSession handl
   assert.ok(Array.isArray(listExplorationSessions()));
   assert.ok(EXPLORATION_CONFIG.maxCandidateActionsPerStep > 0);
 });
+
+// ---- Phase 5: bug reporting service (formatBugReport/dashboard are pure
+// logic over already-recorded findings; reverifyHighConfidenceFinding's
+// actual rescan needs a real browser -- verified live above, not repeated here) ----
+
+import { formatBugReport, getBugDashboard, getBugGroup, inferAndPersistRootCause, BUG_REPORTING_CONFIG } from '../src/services/bugReportingService.ts';
+import { recordReproductionAttempt } from '../src/services/bugDetectionService.ts';
+
+test('formatBugReport produces every required master-prompt #24 section, and labels an inferred root cause explicitly', () => {
+  insertScreen('screen-report-1');
+  const anchor = recordBugFinding({ source: 'ui_exploratory', category: 'api-status', severity: 'critical', title: 'Server error', detail: 'HTTP 500 on POST /api/order', screenId: 'screen-report-1', evidence: { url: 'http://x/checkout' }, stepsToReproduce: ['Navigate to checkout', 'Submit order', 'Observe: HTTP 500'] });
+  const spinner = recordBugFinding({ source: 'ui_exploratory', category: 'ui-dom', severity: 'medium', title: 'Stuck spinner', detail: 'spinner stuck', screenId: 'screen-report-1' });
+  correlateFindings([anchor, spinner]);
+
+  const report = formatBugReport(anchor.id);
+  for (const section of ['# Bug Report:', '**Severity:**', '**Priority:**', '**Confidence:**', '**Category:**', '**URL:**', '**Status:**', '## Steps to Reproduce', '## Expected Result', '## Actual Result', '## Evidence', '## Probable Root Cause']) {
+    assert.ok(report.includes(section), `report missing section: ${section}`);
+  }
+  assert.ok(report.includes('http://x/checkout'));
+  assert.ok(report.includes('AI Inference'), 'a correlated group\'s root cause must be explicitly labeled as inferred, never presented as fact');
+
+  assert.throws(() => formatBugReport('does-not-exist'));
+});
+
+test('formatBugReport on a standalone (uncorrelated) finding reports "not yet analyzed" rather than fabricating a root cause', () => {
+  insertScreen('screen-report-2');
+  const standalone = recordBugFinding({ source: 'ui_exploratory', category: 'ui-visual', severity: 'low', title: 'Minor visual diff', detail: '0.6% pixels differ', screenId: 'screen-report-2' });
+  const report = formatBugReport(standalone.id);
+  assert.ok(report.includes('Not yet analyzed'));
+  assert.ok(!report.includes('AI Inference'));
+});
+
+test('inferAndPersistRootCause ranks a stronger-signal category as the root cause and persists the narrative to every finding in the group', () => {
+  insertScreen('screen-report-3');
+  const schemaFinding = recordBugFinding({ source: 'api_fuzz', category: 'api-schema', severity: 'high', title: 'Schema drift', detail: 'field type changed', screenId: 'screen-report-3' });
+  const consoleFinding = recordBugFinding({ source: 'ui_exploratory', category: 'console-error', severity: 'high', title: 'JS error', detail: 'TypeError', screenId: 'screen-report-3' });
+  correlateFindings([schemaFinding, consoleFinding]);
+  const groupId = getBugFinding(schemaFinding.id).correlation_group_id;
+
+  const narrative = inferAndPersistRootCause(groupId);
+  assert.match(narrative, /"Schema drift".*most likely root cause/);
+  assert.equal(getBugFinding(schemaFinding.id).root_cause_is_inferred, 1);
+  assert.equal(getBugFinding(consoleFinding.id).root_cause_narrative, narrative);
+
+  assert.equal(inferAndPersistRootCause('no-such-group'), null);
+});
+
+test('getBugDashboard rolls up category/priority/severity counts, new-vs-recurring, and correlation stats correctly', () => {
+  insertScreen('screen-dash-1');
+  const f1 = recordBugFinding({ source: 'ui_exploratory', category: 'ui-dom', severity: 'medium', title: 'Bug A', detail: 'detail A', screenId: 'screen-dash-1' });
+  recordBugFinding({ source: 'ui_exploratory', category: 'console-error', severity: 'high', title: 'Bug B', detail: 'detail B', screenId: 'screen-dash-1' });
+  recordReproductionAttempt(f1.id, true); // simulate a recurring (reproduced-again) finding
+
+  const dashboard = getBugDashboard();
+  assert.equal(dashboard.totalFindings, 2);
+  assert.equal(dashboard.byCategory['ui-dom'], 1);
+  assert.equal(dashboard.byCategory['console-error'], 1);
+  assert.equal(dashboard.newCount, 1, 'Bug B was never reproduced again -- still "new"');
+  assert.equal(dashboard.recurringCount, 1, 'Bug A was reproduced a second time -- "recurring"');
+  assert.ok(dashboard.topFailingPages.some((p) => p.screenId === 'screen-dash-1' && p.count === 2));
+  assert.ok(typeof dashboard.averageConfidence === 'number');
+});
+
+test('getBugGroup throws for an unknown correlation group id', () => {
+  assert.throws(() => getBugGroup('does-not-exist'));
+});
+
+test('recordReproductionAttempt bumps attempts always, but successes only when reproduced=true, and never double-inserts a row', () => {
+  insertScreen('screen-repro-1');
+  const f = recordBugFinding({ source: 'ui_exploratory', category: 'ui-dom', severity: 'medium', title: 'Flaky-looking bug', detail: 'detail', screenId: 'screen-repro-1' });
+  assert.equal(f.reproducibility_attempts, 1);
+  assert.equal(f.reproducibility_successes, 1);
+
+  const notReproduced = recordReproductionAttempt(f.id, false);
+  assert.equal(notReproduced.id, f.id);
+  assert.equal(notReproduced.reproducibility_attempts, 2);
+  assert.equal(notReproduced.reproducibility_successes, 1, 'a failed reproduction attempt must not bump successes');
+
+  const reproduced = recordReproductionAttempt(f.id, true);
+  assert.equal(reproduced.reproducibility_attempts, 3);
+  assert.equal(reproduced.reproducibility_successes, 2);
+
+  assert.throws(() => recordReproductionAttempt('does-not-exist', true));
+});
+
+test('BUG_REPORTING_CONFIG has a sensible re-verification confidence bar', () => {
+  assert.ok(BUG_REPORTING_CONFIG.reverifyConfidenceThreshold > 0 && BUG_REPORTING_CONFIG.reverifyConfidenceThreshold < 1);
+});

@@ -8,6 +8,7 @@ import {
   updateBugFindingStatus,
 } from "../services/bugDetectionService.js";
 import { runResponsiveBugScan } from "../services/responsiveService.js";
+import { formatBugReport, getBugDashboard, getBugGroup, reverifyHighConfidenceFinding } from "../services/bugReportingService.js";
 import {
   createConsistencyRule,
   deleteConsistencyRule,
@@ -71,6 +72,23 @@ bugsRouter.delete("/consistency-rules/:id", (req, res) => {
   res.status(204).end();
 });
 
+// Phase 5: developer-ready reporting. IMPORTANT: these literal-prefix routes
+// (dashboard, groups/:id) must stay registered before the single-segment
+// `GET /:id` below, for the same reason the consistency-rules block above
+// is -- Express matches routes in registration order, so `GET /:id` would
+// otherwise swallow `GET /dashboard` as id="dashboard".
+bugsRouter.get("/dashboard", (_req, res) => {
+  res.json(getBugDashboard());
+});
+
+bugsRouter.get("/groups/:correlationGroupId", (req, res) => {
+  try {
+    res.json(getBugGroup(req.params.correlationGroupId));
+  } catch (err: any) {
+    res.status(404).json(errBody(404, err.message));
+  }
+});
+
 bugsRouter.get("/:id", (req, res) => {
   const finding = getBugFinding(req.params.id);
   if (!finding) return res.status(404).json(errBody(404, "Bug finding not found."));
@@ -125,4 +143,25 @@ bugsRouter.post("/:id/file", async (req, res) => {
     return res.status(502).json(errBody(502, result?.reason || "Bug filing failed."));
   }
   res.json(markBugFindingFiled(req.params.id, result.provider!, result.externalId));
+});
+
+// Phase 5: formatted export (master prompt #24's template shape) for a single finding.
+bugsRouter.get("/:id/report", (req, res) => {
+  try {
+    res.type("text/markdown").send(formatBugReport(req.params.id));
+  } catch (err: any) {
+    res.status(404).json(errBody(404, err.message));
+  }
+});
+
+// Phase 5: bounded re-verification for a high-confidence finding before its
+// confidence is treated as final (master prompt #21).
+bugsRouter.post("/:id/reverify", async (req, res) => {
+  const finding = getBugFinding(req.params.id);
+  if (!finding) return res.status(404).json(errBody(404, "Bug finding not found."));
+  try {
+    res.json(await reverifyHighConfidenceFinding(req.params.id));
+  } catch (err: any) {
+    res.status(400).json(errBody(400, err.message || "Re-verification failed."));
+  }
 });
