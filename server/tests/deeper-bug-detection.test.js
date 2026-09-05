@@ -23,7 +23,7 @@ import {
 } from '../src/services/adminService.ts';
 import { compareScreenshotToBaseline, getVisualIgnoreSelectors, setVisualIgnoreSelectors, VISUAL_DIFF_CONFIG } from '../src/services/screensService.ts';
 import { getDomCheckIgnoreSelectors, setDomCheckIgnoreSelectors, DOM_CHECKS_CONFIG } from '../src/services/domChecksService.ts';
-import { isResponsiveScanEnabled, setResponsiveScanEnabled, RESPONSIVE_VIEWPORTS } from '../src/services/responsiveService.ts';
+import { isResponsiveScanEnabled, setResponsiveScanEnabled, RESPONSIVE_VIEWPORTS, getResponsiveViewports, setResponsiveViewports } from '../src/services/responsiveService.ts';
 
 function resetData() {
   db.prepare('DELETE FROM bug_findings').run();
@@ -263,6 +263,28 @@ test('responsive scan toggle defaults on and is settable', () => {
     assert.ok(RESPONSIVE_VIEWPORTS.some((v) => v.name === 'tablet'));
   } finally {
     setResponsiveScanEnabled(original);
+  }
+});
+
+// ---- Phase 5: responsive viewport list is genuinely configurable (not a
+// fixed in-code array), with validation. The actual per-viewport scanning
+// (correctly tagging findings with viewport, catching a mobile-only bug)
+// runs through the real browser -- verified live against
+// server/src/demo-app/responsive-fixture.html, not repeated here. ----
+
+test('responsive viewport list defaults to mobile+tablet and is QA-Lead editable, with validation', () => {
+  const original = getResponsiveViewports();
+  try {
+    assert.deepEqual(original, RESPONSIVE_VIEWPORTS);
+
+    setResponsiveViewports([{ name: 'small-mobile', width: 320, height: 568 }]);
+    assert.deepEqual(getResponsiveViewports(), [{ name: 'small-mobile', width: 320, height: 568 }]);
+
+    assert.throws(() => setResponsiveViewports([]));
+    assert.throws(() => setResponsiveViewports([{ name: 'bad' }]));
+    assert.throws(() => setResponsiveViewports('not-an-array'));
+  } finally {
+    setResponsiveViewports(original);
   }
 });
 

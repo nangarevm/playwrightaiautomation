@@ -850,6 +850,12 @@ ensureColumn("screens", "visual_ignore_selectors_json", "TEXT NOT NULL DEFAULT '
 // above -- see domChecksService.ts's DOM_CHECKS_CONFIG doc comment.
 ensureColumn("screens", "dom_check_ignore_selectors_json", "TEXT NOT NULL DEFAULT '[]'");
 
+// #5 responsive: which extra viewports (beyond the existing desktop scan) to
+// re-run every check at. Configurable rather than a fixed in-code list, same
+// as every other Deeper Bug Detection tunable -- default covers the "2-3
+// viewport sizes" ask (desktop already exists; mobile+tablet added here).
+ensureColumn("org_settings", "responsive_viewports_json", `TEXT NOT NULL DEFAULT '[{"name":"mobile","width":390,"height":844},{"name":"tablet","width":768,"height":1024}]'`);
+
 db.exec(`
 -- API response schema capture/validation: one row per distinct "METHOD path"
 -- endpoint seen during a crawl/execution. First sighting stores the inferred

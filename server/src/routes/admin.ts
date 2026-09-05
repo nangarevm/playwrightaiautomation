@@ -28,7 +28,7 @@ import {
   ssoCallback,
   submitSecondReviewerSignOff,
 } from "../services/adminService.js";
-import { isResponsiveScanEnabled, setResponsiveScanEnabled } from "../services/responsiveService.js";
+import { isResponsiveScanEnabled, setResponsiveScanEnabled, getResponsiveViewports, setResponsiveViewports } from "../services/responsiveService.js";
 import { errBody } from "../errorCodes.js";
 
 export const adminRouter = Router();
@@ -162,6 +162,22 @@ adminRouter.put("/org-settings/responsive-scan", requireRole("QA Lead"), (req, r
   const { enabled } = req.body as { enabled?: boolean };
   setResponsiveScanEnabled(Boolean(enabled));
   res.json({ responsive_scan_enabled: isResponsiveScanEnabled() });
+});
+
+// Deeper Bug Detection #5: the extra viewports (beyond desktop) every check
+// re-runs at.
+adminRouter.get("/org-settings/responsive-viewports", (_req, res) => {
+  res.json({ viewports: getResponsiveViewports() });
+});
+
+adminRouter.put("/org-settings/responsive-viewports", requireRole("QA Lead"), (req, res) => {
+  const { viewports } = req.body as { viewports?: Array<{ name: string; width: number; height: number }> };
+  try {
+    setResponsiveViewports(viewports ?? []);
+    res.json({ viewports: getResponsiveViewports() });
+  } catch (err: any) {
+    res.status(400).json(errBody(400, err.message));
+  }
 });
 
 // FR-2.11: QA-Lead-managed domain/business rules

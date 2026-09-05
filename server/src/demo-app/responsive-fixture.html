@@ -1,0 +1,24 @@
+<!doctype html>
+<html>
+<head><title>Responsive Test Fixture</title>
+<style>
+  body { margin: 0; font-family: sans-serif; }
+  .nav { padding: 10px; }
+  .logo, .menu-btn { display: inline-block; padding: 10px 20px; }
+  /* Bug: only below 480px, the nav switches to absolute positioning and the
+     menu button overlaps the logo -- a classic "works on desktop/tablet,
+     broken on mobile" responsive layout regression. */
+  @media (max-width: 480px) {
+    .nav { position: relative; height: 50px; padding: 0; }
+    .logo { position: absolute; left: 0; top: 0; width: 180px; height: 50px; }
+    .menu-btn { position: absolute; left: 120px; top: 0; width: 180px; height: 50px; }
+  }
+</style>
+</head>
+<body>
+  <div class="nav">
+    <a href="#" class="logo">MyApp</a>
+    <button class="menu-btn">Menu</button>
+  </div>
+</body>
+</html>
