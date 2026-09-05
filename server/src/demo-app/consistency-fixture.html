@@ -1,0 +1,30 @@
+<!doctype html>
+<html>
+<head><title>UI-API Consistency Test Fixture</title></head>
+<body>
+  <h1>Products</h1>
+  <ul id="exact-list"></ul>
+
+  <h2>Page 1 (paginated -- legitimately shows a subset)</h2>
+  <ul id="paginated-list"></ul>
+
+  <h2>Buggy list (rendering drops the last item)</h2>
+  <ul id="buggy-list"></ul>
+
+  <script>
+    fetch('/demo/api/products').then((r) => r.json()).then((data) => {
+      const items = data.items;
+
+      // Renders ALL items -- should match exactly.
+      document.getElementById('exact-list').innerHTML = items.map((i) => `<li class="item-exact">Product ${i}</li>`).join('');
+
+      // Deliberately renders only the first 3 (a "page 1 of 2" UI) -- a
+      // legitimate subset, not a bug.
+      document.getElementById('paginated-list').innerHTML = items.slice(0, 3).map((i) => `<li class="item-paginated">Product ${i}</li>`).join('');
+
+      // Deliberate off-by-one rendering bug: drops the last item.
+      document.getElementById('buggy-list').innerHTML = items.slice(0, items.length - 1).map((i) => `<li class="item-buggy">Product ${i}</li>`).join('');
+    });
+  </script>
+</body>
+</html>

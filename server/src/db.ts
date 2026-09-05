@@ -890,11 +890,19 @@ CREATE TABLE IF NOT EXISTS ui_api_consistency_rules (
   dom_selector TEXT NOT NULL, -- CSS selector; number of matched visible elements is the "UI count"
   api_endpoint_key TEXT NOT NULL, -- "METHOD /path" matching api_schemas.endpoint_key / a captured response
   json_path TEXT NOT NULL DEFAULT '', -- dot path to an array/number in the response body; '' = root array length or a top-level count/total field
+  comparison_mode TEXT NOT NULL DEFAULT 'exact', -- 'exact' (uiCount must equal apiCount) | 'at-most' (uiCount may be less than apiCount without flagging -- for paginated/virtualized lists that legitimately render a subset)
   is_active INTEGER NOT NULL DEFAULT 1,
   created_at TEXT NOT NULL,
   FOREIGN KEY (screen_id) REFERENCES screens(id)
 );
 `);
+
+// #6 UI-vs-API consistency: comparison_mode is declared on the CREATE TABLE
+// above for a fresh database, but that statement is a no-op against a
+// database that already has the table from before this column existed --
+// ensureColumn (which must run AFTER the CREATE TABLE above, not before)
+// covers that case the same way every other schema evolution in this file does.
+ensureColumn("ui_api_consistency_rules", "comparison_mode", "TEXT NOT NULL DEFAULT 'exact'");
 
 // Seed a default user per SRS user class (FR-8.1) so RBAC is usable out of the box
 const userCount = (db.prepare("SELECT COUNT(*) as count FROM users").get() as any).count as number;

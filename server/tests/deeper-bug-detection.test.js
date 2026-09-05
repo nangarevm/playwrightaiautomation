@@ -229,6 +229,35 @@ test('checkUiApiConsistency flags a mismatch and stays silent on a match', async
   db.prepare('DELETE FROM screens WHERE id = ?').run('screen-consistency');
 });
 
+// False-positive fix: a paginated/virtualized list legitimately renders
+// fewer elements than the API returned -- 'at-most' mode must not flag that,
+// while still catching the UI somehow rendering MORE than the API returned.
+test("checkUiApiConsistency 'at-most' mode tolerates the UI rendering fewer items (pagination) but still flags rendering more", async () => {
+  const now = new Date().toISOString();
+  db.prepare(`
+    INSERT INTO screens (id, name, module_name, source_input_id, url_or_path, last_captured_state_hash, change_status, last_compared_at, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, 'new', ?, ?, ?)
+  `).run('screen-paginated', 'Paginated list', 'fixture', 'input-x', null, 'x', now, now, now);
+
+  const rule = createConsistencyRule({ screenId: 'screen-paginated', name: 'Page 1 rows', domSelector: '.row', apiEndpointKey: 'GET /api/items', comparisonMode: 'at-most' });
+  assert.equal(rule.comparison_mode, 'at-most');
+
+  const bodies = new Map([['GET /api/items', { items: [1, 2, 3, 4, 5] }]]); // API has 5 total
+
+  const pageOfThree = { locator: () => ({ count: async () => 3 }) }; // UI shows page 1 of 3 -- legitimate
+  const noFalsePositive = await checkUiApiConsistency(pageOfThree, 'screen-paginated', 'Paginated list', bodies);
+  assert.equal(noFalsePositive.length, 0);
+
+  const rendersTooMany = { locator: () => ({ count: async () => 7 }) }; // UI somehow renders more than the API has -- a real bug
+  const stillCatchesRealBug = await checkUiApiConsistency(rendersTooMany, 'screen-paginated', 'Paginated list', bodies);
+  assert.equal(stillCatchesRealBug.length, 1);
+
+  const rules = db.prepare('SELECT id FROM ui_api_consistency_rules WHERE screen_id = ?').all('screen-paginated');
+  for (const r of rules) deleteConsistencyRule(r.id);
+  db.prepare('DELETE FROM bug_findings WHERE screen_id = ?').run('screen-paginated'); // FK to screens, must go first
+  db.prepare('DELETE FROM screens WHERE id = ?').run('screen-paginated');
+});
+
 // ---- adminService: new configurable thresholds ----
 
 test('visual diff threshold and API schema default mode are QA-Lead editable with validation', () => {

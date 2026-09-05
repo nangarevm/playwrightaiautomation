@@ -116,6 +116,13 @@ app.get("/demo/api/orders", (req, res) => {
     res.json({ id: 1, total: 42.5, items: ["a"] });
   }
 });
+// Phase 6 verification fixture: a fixed 5-item list, used by
+// consistency-fixture.html to prove the UI-vs-API consistency check across
+// an exact match, a legitimate paginated subset (comparison_mode 'at-most'),
+// and a genuine rendering bug (comparison_mode 'exact').
+app.get("/demo/api/products", (_req, res) => {
+  res.json({ items: [1, 2, 3, 4, 5] });
+});
 // FR-1.1: serve uploaded screenshots so the client can render real thumbnails
 app.use("/uploads", express.static(uploadDir));
 

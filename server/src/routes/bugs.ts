@@ -44,15 +44,16 @@ bugsRouter.get("/consistency-rules", (req, res) => {
 });
 
 bugsRouter.post("/consistency-rules", (req, res) => {
-  const { screenId, name, domSelector, apiEndpointKey, jsonPath } = req.body as {
+  const { screenId, name, domSelector, apiEndpointKey, jsonPath, comparisonMode } = req.body as {
     screenId?: string;
     name?: string;
     domSelector?: string;
     apiEndpointKey?: string;
     jsonPath?: string;
+    comparisonMode?: "exact" | "at-most";
   };
   try {
-    res.status(201).json(createConsistencyRule({ screenId: screenId!, name, domSelector: domSelector!, apiEndpointKey: apiEndpointKey!, jsonPath }));
+    res.status(201).json(createConsistencyRule({ screenId: screenId!, name, domSelector: domSelector!, apiEndpointKey: apiEndpointKey!, jsonPath, comparisonMode }));
   } catch (err: any) {
     res.status(400).json(errBody(400, err.message));
   }
