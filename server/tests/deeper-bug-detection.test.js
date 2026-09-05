@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { db } from '../src/db.ts';
-import { recordBugFinding, getBugFinding, listBugFindings } from '../src/services/bugDetectionService.ts';
+import { recordBugFinding, getBugFinding, listBugFindings, BUG_SCAN_CONFIG } from '../src/services/bugDetectionService.ts';
 import {
   inferShape,
   diffShape,
@@ -32,6 +32,18 @@ function resetData() {
 
 test.beforeEach(() => {
   resetData();
+});
+
+// ---- Phase 1 config contract (regression guard against the two live-tested fixes) ----
+
+test('BUG_SCAN_CONFIG suppresses Chromium\'s own auto-echoed network-failure console noise by default, and known third-party URL noise', () => {
+  const consoleMsg = 'Failed to load resource: the server responded with a status of 404 (Not Found)';
+  assert.ok(BUG_SCAN_CONFIG.ignoredConsolePatterns.some((p) => p.test(consoleMsg)), 'default ignoredConsolePatterns must suppress the Chromium auto-echo, or the 404 double-reports as both api-status and console-error');
+  assert.ok(BUG_SCAN_CONFIG.ignoredUrlPatterns.some((p) => p.test('https://www.google-analytics.com/collect')));
+  assert.ok(BUG_SCAN_CONFIG.ignoredUrlPatterns.some((p) => p.test('https://example.com/favicon.ico')));
+  // App-specific console noise is intentionally NOT pre-guessed -- only the
+  // one universal Chromium behavior above is a default.
+  assert.equal(BUG_SCAN_CONFIG.ignoredConsolePatterns.length, 1);
 });
 
 // ---- bug_findings category/viewport (additive columns) ----

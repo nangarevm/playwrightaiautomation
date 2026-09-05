@@ -265,8 +265,56 @@ export async function fuzzApiEndpoints(baseUrl: string, endpointTemplates: strin
   return all;
 }
 
-const SPINNER_GRACE_MS = 1500;
-const SCAN_NAV_TIMEOUT_MS = 30000;
+// Phase 1 config: every tunable value for console/network capture lives here,
+// not scattered as inline magic numbers/regex. Edit this object directly (no
+// separate config file exists yet in this codebase -- every other tunable in
+// this service, e.g. adminService's confidence thresholds, is also a constant
+// or a DB-backed setting, not a file, so this follows that precedent) to
+// adjust behavior for your site without touching the scan logic below.
+export const BUG_SCAN_CONFIG = {
+  // How long to wait after the page reports network-idle before checking
+  // whether a loading spinner is still animating (some spinners take a
+  // moment to naturally resolve after idle).
+  spinnerGraceMs: 1500,
+  // Max time to wait for initial navigation before treating it as a failed load.
+  navTimeoutMs: 30000,
+
+  // URL substrings/patterns excluded from EVERY network-based finding in this
+  // file (server/client errors, failed requests, broken links) -- known
+  // third-party noise that isn't your app's own bug. The default list below
+  // is a reasonable starting point (ad/analytics beacons, favicon probes);
+  // add your own site's known-noisy third-party calls (chat widgets, feature-
+  // flag probes that 404 by design, etc.) rather than us guessing what's
+  // noisy for your specific app.
+  ignoredUrlPatterns: [/favicon/i, /analytics/i, /tracking/i, /google-analytics/i, /doubleclick/i] as RegExp[],
+
+  // Message substrings/patterns excluded from console-error and uncaught-
+  // exception findings. The one default entry below is NOT an app-specific
+  // guess -- it's a universal Chromium behavior confirmed by live testing
+  // against a fixture page: Chromium auto-echoes every failed network
+  // request into the console as "Failed to load resource: ... status of
+  // NNN", which would otherwise double-report the exact same defect the
+  // response listener above already captures more precisely (with the real
+  // status code and resource type) as an api-status finding. Beyond that,
+  // we have no visibility into which OTHER console messages your app logs
+  // as expected noise (a third-party widget logging via console.error, a
+  // benign framework warning), so per the ground rule "don't guess a
+  // default silently," nothing app-specific is pre-added here -- add your
+  // own as you discover them, e.g. `/ResizeObserver loop limit exceeded/i`
+  // (a well-known Chrome no-op warning many sites see and ignore).
+  ignoredConsolePatterns: [/^Failed to load resource: the server responded with a status of \d+/i] as RegExp[],
+};
+
+function isIgnoredUrl(url: string): boolean {
+  return BUG_SCAN_CONFIG.ignoredUrlPatterns.some((p) => p.test(url));
+}
+
+function isIgnoredConsoleMessage(message: string): boolean {
+  return BUG_SCAN_CONFIG.ignoredConsolePatterns.some((p) => p.test(message));
+}
+
+const SPINNER_GRACE_MS = BUG_SCAN_CONFIG.spinnerGraceMs;
+const SCAN_NAV_TIMEOUT_MS = BUG_SCAN_CONFIG.navTimeoutMs;
 
 // UI exploratory scan: load a cataloged Screen's URL headlessly and watch for
 // the same class of bug a manual exploratory tester would catch by just
@@ -293,7 +341,11 @@ export async function scanScreenForUiBugs(
   const screenId = catalogScreenId ?? null;
   const viewport = options?.viewport ?? DESKTOP_VIEWPORT;
   const findings: BugFindingRow[] = [];
-  const browser = await chromium.launch({ headless: true });
+  // SCAN_CHROMIUM_PATH is an optional escape hatch for a Chromium binary at a
+  // non-standard path (e.g. a deployment that pins its own browser build) --
+  // undefined by default, which preserves Playwright's normal auto-resolution
+  // for everyone who hasn't set it.
+  const browser = await chromium.launch({ headless: true, executablePath: process.env.SCAN_CHROMIUM_PATH || undefined });
   const context = await browser.newContext({
     viewport: { width: viewport.width, height: viewport.height },
     recordVideo: { dir: UPLOAD_DIR, size: { width: viewport.width, height: viewport.height } },
@@ -313,7 +365,7 @@ export async function scanScreenForUiBugs(
     const consoleErrors: ConsoleError[] = [];
     const pageErrors: string[] = [];
     const serverErrors: Array<{ url: string; status: number }> = [];
-    const clientErrors: Array<{ url: string; status: number }> = [];
+    const clientErrors: Array<{ url: string; status: number; resourceType: string }> = [];
     const failedRequests: Array<{ url: string; error: string }> = [];
     // Deeper Bug Detection #2: candidate XHR/fetch responses worth validating
     // as API calls -- the response body is read after the page settles (below),
@@ -323,9 +375,11 @@ export async function scanScreenForUiBugs(
 
     page.on("console", (msg) => {
       if (msg.type() === "error") {
+        const message = msg.text().slice(0, 500);
+        if (isIgnoredConsoleMessage(message)) return;
         consoleErrors.push({
           type: (msg.type() as any) || "error",
-          message: msg.text().slice(0, 500),
+          message,
           source: msg.location()?.url,
           line: msg.location()?.lineNumber,
           column: msg.location()?.columnNumber,
@@ -333,11 +387,26 @@ export async function scanScreenForUiBugs(
         });
       }
     });
-    page.on("pageerror", (err) => pageErrors.push(err.message.slice(0, 300)));
+    page.on("pageerror", (err) => {
+      const message = err.message.slice(0, 300);
+      if (isIgnoredConsoleMessage(message)) return;
+      pageErrors.push(message);
+    });
     page.on("response", (res) => {
-      if (res.status() >= 500) serverErrors.push({ url: res.url(), status: res.status() });
-      else if (res.status() >= 400 && res.request().resourceType() === "document") {
-        clientErrors.push({ url: res.url(), status: res.status() });
+      if (!isIgnoredUrl(res.url())) {
+        if (res.status() >= 500) {
+          serverErrors.push({ url: res.url(), status: res.status() });
+        } else if (res.status() >= 400) {
+          const resourceType = res.request().resourceType();
+          // "image" is deliberately excluded here -- a broken image is already
+          // caught more informatively by the naturalWidth===0 DOM check below
+          // (category ui-dom), which points at the actual <img> element rather
+          // than a bare URL. Flagging it again here would double-report the
+          // same underlying issue under two categories.
+          if (resourceType !== "image") {
+            clientErrors.push({ url: res.url(), status: res.status(), resourceType });
+          }
+        }
       }
       const req = res.request();
       const resourceType = req.resourceType();
@@ -346,6 +415,7 @@ export async function scanScreenForUiBugs(
       }
     });
     page.on("requestfailed", (req) => {
+      if (isIgnoredUrl(req.url())) return;
       failedRequests.push({ url: req.url(), error: (req.failure()?.errorText || "request failed").slice(0, 200) });
     });
 
@@ -457,11 +527,17 @@ export async function scanScreenForUiBugs(
     const brokenLinks = await checkBrokenInternalLinks(page, screen.url_or_path);
     if (brokenLinks.length) {
       const screenshotUrl = await screenshotNow();
+      // Severity scales with the worst status code found in the batch, same
+      // tiering as the main-document check above: a 5xx (server-side crash)
+      // is worse than a 4xx (broken/moved link), and an unreachable link
+      // (status 0 -- request threw, e.g. DNS/connection failure) is worst.
+      const worstStatus = Math.min(...brokenLinks.map((l) => (l.status === 0 ? -1 : l.status)));
+      const brokenLinksSeverity: BugSeverity = worstStatus === -1 || worstStatus >= 500 ? "high" : "medium";
       findings.push(
         recordBugFinding({
           source: "ui_exploratory",
           category: "api-status",
-          severity: "medium",
+          severity: brokenLinksSeverity,
           title: `Broken internal link(s) on ${screen.name}`,
           detail: brokenLinks.map((l) => `HTTP ${l.status} — ${l.url} (${l.label})`).join("\n"),
           screenId,
@@ -543,23 +619,30 @@ ${Object.entries(grouped)
 
     if (clientErrors.length) {
       const screenshotUrl = await screenshotNow();
+      const hasDocumentError = clientErrors.some((e) => e.resourceType === "document");
       findings.push(
         recordBugFinding({
           source: "ui_exploratory",
           category: "api-status",
           severity: "high",
-          title: `Client error loading ${screen.name}`,
-          detail: clientErrors.map((e) => `HTTP ${e.status} — ${e.url}`).join("\n"),
+          title: hasDocumentError ? `Client error loading ${screen.name}` : `${clientErrors.length} failed API/resource request(s) on ${screen.name}`,
+          detail: clientErrors.map((e) => `HTTP ${e.status} (${e.resourceType}) — ${e.url}`).join("\n"),
           screenId,
           runId,
           evidence: { clientErrors },
-          stepsToReproduce: [...baseSteps, `Observe: page load returned HTTP ${clientErrors[0].status}.`],
+          stepsToReproduce: [
+            ...baseSteps,
+            `Observe: ${clientErrors.length} request(s) returned a 4xx client error -- ${clientErrors.map((e) => `HTTP ${e.status} on ${e.url}`).join("; ")}`,
+          ],
           screenshotUrl,
         })
       );
     }
 
-    const criticalFailedRequests = failedRequests.filter((r) => !/favicon|analytics|tracking|google-analytics|doubleclick/i.test(r.url));
+    // Noise filtering already happened at capture time (the requestfailed
+    // listener above skips BUG_SCAN_CONFIG.ignoredUrlPatterns), so every entry
+    // reaching here is already a non-noise failure -- no second filter needed.
+    const criticalFailedRequests = failedRequests;
     if (criticalFailedRequests.length > 0) {
       const screenshotUrl = await screenshotNow();
       findings.push(
@@ -748,6 +831,7 @@ async function checkBrokenInternalLinks(
     .catch(() => [] as Array<{ href: string; label: string }>);
 
   const sameOriginLinks = links.filter((l) => {
+    if (isIgnoredUrl(l.href)) return false;
     try {
       return new URL(l.href).origin === origin && !l.href.includes("#");
     } catch {

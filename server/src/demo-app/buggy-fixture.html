@@ -1,0 +1,14 @@
+<!doctype html>
+<html>
+<head><title>Bug Detection Test Fixture</title></head>
+<body>
+  <h1>Bug Detection Test Fixture</h1>
+  <p>Deliberately triggers known bug classes, one per Deeper Bug Detection phase, for live verification.</p>
+  <script>
+    // Phase 1: a failed network request (404)
+    fetch('/api/does-not-exist').catch(() => {});
+    // Phase 1: an uncaught JS exception
+    setTimeout(() => { undefinedFunctionThatDoesNotExist(); }, 50);
+  </script>
+</body>
+</html>
