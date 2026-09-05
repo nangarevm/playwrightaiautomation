@@ -1,0 +1,22 @@
+<!doctype html>
+<html>
+<head><title>Phase 1B Correlation Fixture</title></head>
+<body>
+  <h1>Placing your order...</h1>
+  <div class="animate-spin" role="progressbar">Loading order confirmation...</div>
+  <script>
+    // Simulates one user action (submitting an order) that produces three
+    // independent-looking findings which are really one underlying defect:
+    // a failing order API call, a spinner that never resolves because the
+    // failure was never handled, and an unhandled rejection from the
+    // downstream code that assumed the call would succeed.
+    fetch('/demo/api/order-fail', { method: 'POST' }).then((res) => {
+      if (!res.ok) {
+        return res.json().then(() => {
+          throw new Error('Cannot read properties of undefined (reading \'id\') -- order response was not ok');
+        });
+      }
+    });
+  </script>
+</body>
+</html>

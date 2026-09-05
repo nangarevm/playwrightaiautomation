@@ -35,6 +35,14 @@ function resetData() {
   db.prepare('DELETE FROM screens').run();
 }
 
+function insertScreen(id) {
+  const now = new Date().toISOString();
+  db.prepare(`
+    INSERT INTO screens (id, name, module_name, source_input_id, url_or_path, last_captured_state_hash, change_status, last_compared_at, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, 'new', ?, ?, ?)
+  `).run(id, id, 'fixture', 'input-x', null, 'x', now, now, now);
+}
+
 test.beforeEach(() => {
   resetData();
 });
@@ -431,4 +439,130 @@ test('max_duplicate_requests defaults to 5 and is QA-Lead editable, with validat
 
 test('BUG_SCAN_CONFIG carries a duplicate-request fallback used only if the live org_settings lookup throws', () => {
   assert.equal(BUG_SCAN_CONFIG.maxDuplicateRequestsFallback, 5);
+});
+
+// ---- Phase 1B: fingerprint / correlation / confidence skeleton ----
+
+import { computeFingerprint } from '../src/services/bugFingerprintService.ts';
+import { correlateFindings } from '../src/services/bugCorrelationService.ts';
+import { scoreConfidence, derivePriority, CONFIDENCE_CONFIG } from '../src/services/bugConfidenceService.ts';
+
+test('computeFingerprint is stable across volatile numbers/urls but differs across screens/categories/messages', () => {
+  const a = computeFingerprint({ screenId: 's1', category: 'api-status', title: 't', detail: 'HTTP 500 on https://x.test/api/orders/123' });
+  const b = computeFingerprint({ screenId: 's1', category: 'api-status', title: 't', detail: 'HTTP 500 on https://x.test/api/orders/456' });
+  assert.equal(a, b, 'only the volatile id differs -- same fingerprint expected');
+
+  const differentScreen = computeFingerprint({ screenId: 's2', category: 'api-status', title: 't', detail: 'HTTP 500 on https://x.test/api/orders/123' });
+  assert.notEqual(a, differentScreen);
+
+  const differentCategory = computeFingerprint({ screenId: 's1', category: 'console-error', title: 't', detail: 'HTTP 500 on https://x.test/api/orders/123' });
+  assert.notEqual(a, differentCategory);
+
+  const differentMessage = computeFingerprint({ screenId: 's1', category: 'api-status', title: 't', detail: 'a totally different failure entirely' });
+  assert.notEqual(a, differentMessage);
+});
+
+test('recordBugFinding dedupes a recurring finding across scans by bumping reproducibility instead of inserting a new row', () => {
+  insertScreen('screen-dedup');
+  const first = recordBugFinding({ source: 'ui_exploratory', category: 'api-status', severity: 'high', title: 'Broken link on X', detail: 'HTTP 500 on https://x.test/a', screenId: 'screen-dedup' });
+  assert.equal(first.reproducibility_attempts, 1);
+  assert.equal(first.reproducibility_successes, 1);
+
+  const second = recordBugFinding({ source: 'ui_exploratory', category: 'api-status', severity: 'high', title: 'Broken link on X', detail: 'HTTP 500 on https://x.test/a', screenId: 'screen-dedup' });
+  assert.equal(second.id, first.id, 'same underlying defect must reuse the same row, not insert a duplicate');
+  assert.equal(second.reproducibility_attempts, 2);
+  assert.equal(second.reproducibility_successes, 2);
+
+  const rows = listBugFindings({ screenId: 'screen-dedup' });
+  assert.equal(rows.length, 1);
+});
+
+test('recordBugFinding reopens a resolved finding that recurs, but leaves an ignored finding ignored', () => {
+  insertScreen('screen-status');
+  insertScreen('screen-status-2');
+  const resolved = recordBugFinding({ source: 'ui_exploratory', category: 'ui-dom', severity: 'medium', title: 'Broken image', detail: 'broken.png', screenId: 'screen-status' });
+  db.prepare("UPDATE bug_findings SET status = 'resolved' WHERE id = ?").run(resolved.id);
+  const recurred = recordBugFinding({ source: 'ui_exploratory', category: 'ui-dom', severity: 'medium', title: 'Broken image', detail: 'broken.png', screenId: 'screen-status' });
+  assert.equal(recurred.status, 'open', 'a resolved bug that recurs should reopen');
+
+  const ignored = recordBugFinding({ source: 'ui_exploratory', category: 'ui-dom', severity: 'low', title: 'Spelling issue', detail: 'teh -> the', screenId: 'screen-status-2' });
+  db.prepare("UPDATE bug_findings SET status = 'ignored' WHERE id = ?").run(ignored.id);
+  const stillIgnored = recordBugFinding({ source: 'ui_exploratory', category: 'ui-dom', severity: 'low', title: 'Spelling issue', detail: 'teh -> the', screenId: 'screen-status-2' });
+  assert.equal(stillIgnored.status, 'ignored', 'an explicitly-ignored finding must not resurface as open on a repeat scan');
+  assert.equal(stillIgnored.reproducibility_attempts, 2, 'reproducibility still advances even while ignored');
+});
+
+test('correlateFindings groups an anchor (api-status) with supporting findings (ui-dom, console-error) when there is exactly one anchor', () => {
+  insertScreen('screen-corr-1');
+  const anchor = recordBugFinding({ source: 'ui_exploratory', category: 'api-status', severity: 'critical', title: 'Server error', detail: 'HTTP 500 on POST /api/order', screenId: 'screen-corr-1' });
+  const spinner = recordBugFinding({ source: 'ui_exploratory', category: 'ui-dom', severity: 'medium', title: 'Stuck spinner', detail: 'spinner stuck', screenId: 'screen-corr-1' });
+  const jsError = recordBugFinding({ source: 'ui_exploratory', category: 'console-error', severity: 'high', title: 'JS error', detail: 'TypeError: x is undefined', screenId: 'screen-corr-1' });
+  const unrelated = recordBugFinding({ source: 'ui_exploratory', category: 'ui-visual', severity: 'low', title: 'Visual diff', detail: '2% pixels differ', screenId: 'screen-corr-1' });
+
+  correlateFindings([anchor, spinner, jsError, unrelated]);
+
+  const reloadedAnchor = getBugFinding(anchor.id);
+  const reloadedSpinner = getBugFinding(spinner.id);
+  const reloadedJsError = getBugFinding(jsError.id);
+  const reloadedUnrelated = getBugFinding(unrelated.id);
+
+  assert.ok(reloadedAnchor.correlation_group_id, 'anchor should be grouped');
+  assert.equal(reloadedSpinner.correlation_group_id, reloadedAnchor.correlation_group_id);
+  assert.equal(reloadedJsError.correlation_group_id, reloadedAnchor.correlation_group_id);
+  assert.equal(reloadedUnrelated.correlation_group_id, null, 'ui-visual is not a supporting category and must stay ungrouped here');
+});
+
+test('correlateFindings stays silent (no grouping) when there are two or more competing anchors, per its documented false-positive guard', () => {
+  insertScreen('screen-corr-2');
+  const anchor1 = recordBugFinding({ source: 'ui_exploratory', category: 'api-status', severity: 'high', title: 'Server error A', detail: 'HTTP 500 on POST /api/a', screenId: 'screen-corr-2' });
+  const anchor2 = recordBugFinding({ source: 'ui_exploratory', category: 'api-status', severity: 'high', title: 'Server error B', detail: 'HTTP 500 on POST /api/b', screenId: 'screen-corr-2' });
+  const spinner = recordBugFinding({ source: 'ui_exploratory', category: 'ui-dom', severity: 'medium', title: 'Stuck spinner', detail: 'spinner stuck', screenId: 'screen-corr-2' });
+
+  correlateFindings([anchor1, anchor2, spinner]);
+
+  assert.equal(getBugFinding(anchor1.id).correlation_group_id, null);
+  assert.equal(getBugFinding(anchor2.id).correlation_group_id, null);
+  assert.equal(getBugFinding(spinner.id).correlation_group_id, null, 'ambiguous which anchor this belongs to -- must not guess');
+});
+
+test('correlateFindings groups two findings that independently name the same endpoint key, regardless of anchor count', () => {
+  insertScreen('screen-corr-3');
+  const schemaFinding = recordBugFinding({ source: 'api_fuzz', category: 'api-schema', severity: 'high', title: 'Schema drift', detail: 'field changed', screenId: 'screen-corr-3', evidence: { endpointKey: 'GET /api/orders' } });
+  const mismatchFinding = recordBugFinding({ source: 'ui_exploratory', category: 'ui-api-mismatch', severity: 'medium', title: 'Count mismatch', detail: 'count differs', screenId: 'screen-corr-3', evidence: { rule: { endpointKey: 'GET /api/orders' } } });
+
+  correlateFindings([schemaFinding, mismatchFinding]);
+
+  const a = getBugFinding(schemaFinding.id);
+  const b = getBugFinding(mismatchFinding.id);
+  assert.ok(a.correlation_group_id);
+  assert.equal(a.correlation_group_id, b.correlation_group_id);
+});
+
+test('scoreConfidence weights category/reproducibility/correlation deterministically and stays within [min, max]', () => {
+  const base = scoreConfidence({ category: 'ui-dom', severity: 'medium', evidence: '{}', reproducibility_attempts: 1, reproducibility_successes: 1 });
+  const reproduced = scoreConfidence({ category: 'ui-dom', severity: 'medium', evidence: '{}', reproducibility_attempts: 3, reproducibility_successes: 3 });
+  assert.ok(reproduced > base, 'reproducing the same finding again must raise confidence');
+
+  const correlated = scoreConfidence({ category: 'ui-dom', severity: 'medium', evidence: '{}', reproducibility_attempts: 1, reproducibility_successes: 1 }, { isCorrelated: true });
+  assert.ok(correlated > base, 'corroboration by another signal in the same scan must raise confidence');
+
+  const schemaScore = scoreConfidence({ category: 'api-schema', severity: 'high', evidence: '{}', reproducibility_attempts: 1, reproducibility_successes: 1 });
+  const visualScore = scoreConfidence({ category: 'ui-visual', severity: 'high', evidence: '{}', reproducibility_attempts: 1, reproducibility_successes: 1 });
+  assert.ok(schemaScore > visualScore, 'a structural schema diff is a stronger signal than a bare pixel-diff');
+
+  const smallVisualDiff = scoreConfidence({ category: 'ui-visual', severity: 'medium', evidence: JSON.stringify({ diffPercentage: 1.5, thresholdPercent: 1.0 }), reproducibility_attempts: 1, reproducibility_successes: 1 });
+  const bigVisualDiff = scoreConfidence({ category: 'ui-visual', severity: 'medium', evidence: JSON.stringify({ diffPercentage: 40, thresholdPercent: 1.0 }), reproducibility_attempts: 1, reproducibility_successes: 1 });
+  assert.ok(bigVisualDiff > smallVisualDiff, 'a diff far above threshold is less likely to be animation/timestamp noise than one barely over it');
+
+  for (const score of [base, reproduced, correlated, schemaScore, visualScore, smallVisualDiff, bigVisualDiff]) {
+    assert.ok(score >= CONFIDENCE_CONFIG.min && score <= CONFIDENCE_CONFIG.max);
+  }
+});
+
+test('derivePriority never assigns P0/P1/P2 to a low-severity finding regardless of confidence, and requires high confidence for P0', () => {
+  assert.equal(derivePriority('low', 0.95), 'P3');
+  assert.equal(derivePriority('critical', 0.95), 'P0');
+  assert.equal(derivePriority('critical', 0.3), 'P1');
+  assert.equal(derivePriority('high', 0.95), 'P1');
+  assert.equal(derivePriority('medium', 0.95), 'P2');
 });

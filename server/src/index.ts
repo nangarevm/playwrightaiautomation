@@ -138,6 +138,13 @@ app.get("/demo/api/inventory", (req, res) => {
     res.json([{ sku: "a" }, { sku: "b" }]);
   }
 });
+// Phase 1B verification fixture: a 500 used by correlation-fixture.html to
+// prove one user action's network failure + stuck spinner + console error
+// (the master prompt's own §17 worked example) collapse into one
+// correlation_group_id instead of three unrelated findings.
+app.post("/demo/api/order-fail", (_req, res) => {
+  res.status(500).json({ error: "insufficient stock" });
+});
 // FR-1.1: serve uploaded screenshots so the client can render real thumbnails
 app.use("/uploads", express.static(uploadDir));
 

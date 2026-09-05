@@ -29,6 +29,9 @@ import { runDomChecks, getDomCheckIgnoreSelectors } from "./domChecksService.js"
 import { checkUiApiConsistency } from "./uiApiConsistencyService.js";
 import { getVisualDiffThresholdPercent, getMaxDuplicateRequests } from "./adminService.js";
 import { runResponsiveBugScan } from "./responsiveService.js";
+import { computeFingerprint } from "./bugFingerprintService.js";
+import { correlateFindings } from "./bugCorrelationService.js";
+import { scoreConfidence, derivePriority, type BugPriority } from "./bugConfidenceService.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const UPLOAD_DIR = path.join(__dirname, "..", "uploads");
@@ -91,11 +94,68 @@ export interface BugFindingRow {
   filed_external_id: string | null;
   created_at: string;
   updated_at: string;
+  // Phase 1B: correlation/dedup/confidence skeleton -- see bugFingerprintService.ts,
+  // bugCorrelationService.ts, bugConfidenceService.ts.
+  fingerprint: string | null;
+  correlation_group_id: string | null;
+  confidence_score: number | null;
+  priority: BugPriority | null;
+  reproducibility_attempts: number;
+  reproducibility_successes: number;
+  root_cause_narrative: string | null;
+  root_cause_is_inferred: number;
+  environment_info_json: string | null;
+}
+
+// Every scan that hits the same underlying defect (the same screen +
+// category + endpoint + normalized message -- see bugFingerprintService)
+// bumps this existing row's reproducibility counters instead of inserting a
+// new row, so a repeat scan of the same page doesn't multiply bug_findings
+// rows for one recurring bug. A 'resolved' finding that recurs is reopened
+// (it came back); an 'ignored' finding stays ignored (the human explicitly
+// suppressed it) but its reproducibility counters still advance, so the
+// suppression decision remains visible as informed rather than stale.
+function bumpReproducibility(existing: BugFindingRow): BugFindingRow {
+  const now = new Date().toISOString();
+  const attempts = (existing.reproducibility_attempts ?? 1) + 1;
+  const successes = (existing.reproducibility_successes ?? 1) + 1;
+  const nextStatus = existing.status === "resolved" ? "open" : existing.status;
+  const confidenceScore = scoreConfidence({
+    category: existing.category,
+    severity: existing.severity,
+    evidence: existing.evidence,
+    reproducibility_attempts: attempts,
+    reproducibility_successes: successes,
+  });
+  const priority = derivePriority(existing.severity, confidenceScore);
+  db.prepare(
+    "UPDATE bug_findings SET reproducibility_attempts = ?, reproducibility_successes = ?, status = ?, confidence_score = ?, priority = ?, updated_at = ? WHERE id = ?"
+  ).run(attempts, successes, nextStatus, confidenceScore, priority, now, existing.id);
+  return getBugFinding(existing.id)!;
 }
 
 export function recordBugFinding(input: BugFindingInput): BugFindingRow {
+  const fingerprint = computeFingerprint({
+    screenId: input.screenId,
+    category: input.category,
+    title: input.title,
+    detail: input.detail,
+    evidence: input.evidence,
+  });
+
+  const existing = db.prepare("SELECT * FROM bug_findings WHERE fingerprint = ? ORDER BY created_at DESC LIMIT 1").get(fingerprint) as BugFindingRow | undefined;
+  if (existing) return bumpReproducibility(existing);
+
   const id = nanoid(10);
   const now = new Date().toISOString();
+  const evidenceJson = JSON.stringify(input.evidence ?? {});
+  const confidenceScore = scoreConfidence({
+    category: input.category ?? null,
+    severity: input.severity,
+    evidence: evidenceJson,
+    reproducibility_attempts: 1,
+    reproducibility_successes: 1,
+  });
   const row: BugFindingRow = {
     id,
     source: input.source,
@@ -106,7 +166,7 @@ export function recordBugFinding(input: BugFindingInput): BugFindingRow {
     screen_id: input.screenId ?? null,
     run_id: input.runId ?? null,
     viewport: input.viewport ?? null,
-    evidence: JSON.stringify(input.evidence ?? {}),
+    evidence: evidenceJson,
     steps_to_reproduce: JSON.stringify(input.stepsToReproduce ?? []),
     screenshot_url: input.screenshotUrl ?? null,
     video_url: input.videoUrl ?? null,
@@ -115,10 +175,29 @@ export function recordBugFinding(input: BugFindingInput): BugFindingRow {
     filed_external_id: null,
     created_at: now,
     updated_at: now,
+    fingerprint,
+    correlation_group_id: null,
+    confidence_score: confidenceScore,
+    priority: derivePriority(input.severity, confidenceScore),
+    reproducibility_attempts: 1,
+    reproducibility_successes: 1,
+    root_cause_narrative: null,
+    root_cause_is_inferred: 0,
+    environment_info_json: null,
   };
   db.prepare(`
-    INSERT INTO bug_findings (id, source, category, severity, title, detail, screen_id, run_id, viewport, evidence, steps_to_reproduce, screenshot_url, video_url, status, created_at, updated_at)
-    VALUES (@id, @source, @category, @severity, @title, @detail, @screen_id, @run_id, @viewport, @evidence, @steps_to_reproduce, @screenshot_url, @video_url, @status, @created_at, @updated_at)
+    INSERT INTO bug_findings (
+      id, source, category, severity, title, detail, screen_id, run_id, viewport, evidence, steps_to_reproduce,
+      screenshot_url, video_url, status, created_at, updated_at, fingerprint, correlation_group_id,
+      confidence_score, priority, reproducibility_attempts, reproducibility_successes,
+      root_cause_narrative, root_cause_is_inferred, environment_info_json
+    )
+    VALUES (
+      @id, @source, @category, @severity, @title, @detail, @screen_id, @run_id, @viewport, @evidence, @steps_to_reproduce,
+      @screenshot_url, @video_url, @status, @created_at, @updated_at, @fingerprint, @correlation_group_id,
+      @confidence_score, @priority, @reproducibility_attempts, @reproducibility_successes,
+      @root_cause_narrative, @root_cause_is_inferred, @environment_info_json
+    )
   `).run(row);
   return row;
 }
@@ -928,6 +1007,31 @@ ${Object.entries(grouped)
         }
       } catch {
         // Visual diff is supplementary evidence -- never fail the scan over it.
+      }
+    }
+
+    // Phase 1B: correlate this scan's findings (rule-based grouping -- see
+    // bugCorrelationService.correlateFindings's own false-positive-risk doc),
+    // then re-score confidence for anything that got grouped, since
+    // corroboration by an independent signal in the same scan is itself a
+    // confidence-raising fact the initial per-finding score above couldn't
+    // know at insert time (each finding was scored in isolation as it was recorded).
+    if (findings.length > 1) {
+      correlateFindings(findings);
+      const now = new Date().toISOString();
+      for (const finding of findings) {
+        const refreshed = getBugFinding(finding.id);
+        if (!refreshed || !refreshed.correlation_group_id) continue;
+        const confidenceScore = scoreConfidence(
+          { category: refreshed.category, severity: refreshed.severity, evidence: refreshed.evidence, reproducibility_attempts: refreshed.reproducibility_attempts, reproducibility_successes: refreshed.reproducibility_successes },
+          { isCorrelated: true }
+        );
+        const priority = derivePriority(refreshed.severity, confidenceScore);
+        db.prepare("UPDATE bug_findings SET confidence_score = ?, priority = ?, updated_at = ? WHERE id = ?").run(confidenceScore, priority, now, refreshed.id);
+        finding.correlation_group_id = refreshed.correlation_group_id;
+        finding.confidence_score = confidenceScore;
+        finding.priority = priority;
+        finding.updated_at = now;
       }
     }
   } finally {

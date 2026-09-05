@@ -861,6 +861,21 @@ ensureColumn("org_settings", "responsive_viewports_json", `TEXT NOT NULL DEFAULT
 // re-render-loop bug, rather than a hardcoded inline number.
 ensureColumn("org_settings", "max_duplicate_requests", "INTEGER NOT NULL DEFAULT 5");
 
+// Phase 1B: correlation, deduplication, confidence skeleton (see
+// bugFingerprintService.ts / bugCorrelationService.ts / bugConfidenceService.ts).
+// All additive -- no existing finding-producing code path is required to set
+// any of these, and every read of them must tolerate NULL (a finding from
+// before this migration, or a check that predates confidence scoring).
+ensureColumn("bug_findings", "fingerprint", "TEXT"); // deterministic hash: screen+category+endpoint+normalized_message -- see bugFingerprintService.computeFingerprint
+ensureColumn("bug_findings", "correlation_group_id", "TEXT"); // findings sharing this value are believed to be one underlying defect
+ensureColumn("bug_findings", "confidence_score", "REAL"); // 0.0-1.0, deterministic signal-weighted score -- see bugConfidenceService.scoreConfidence
+ensureColumn("bug_findings", "priority", "TEXT"); // 'P0'|'P1'|'P2'|'P3', derived from severity x confidence
+ensureColumn("bug_findings", "reproducibility_attempts", "INTEGER NOT NULL DEFAULT 1"); // how many scans have hit this same fingerprint
+ensureColumn("bug_findings", "reproducibility_successes", "INTEGER NOT NULL DEFAULT 1"); // how many of those scans reproduced it (currently always == attempts -- every hit here is itself a reproduction; a future non-reproducing re-check would increment attempts only)
+ensureColumn("bug_findings", "root_cause_narrative", "TEXT"); // AI-generated prose -- always an inference, never presented as observed fact
+ensureColumn("bug_findings", "root_cause_is_inferred", "INTEGER NOT NULL DEFAULT 0"); // 1 whenever root_cause_narrative is set; distinguishes AI inference from the deterministically-observed evidence/detail fields
+ensureColumn("bug_findings", "environment_info_json", "TEXT"); // browser/OS/viewport at capture time, for the bug-report template
+
 db.exec(`
 -- API response schema capture/validation: one row per distinct "METHOD path"
 -- endpoint seen during a crawl/execution. First sighting stores the inferred
