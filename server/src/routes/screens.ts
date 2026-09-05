@@ -3,11 +3,14 @@ import { db } from "../db.js";
 import {
   diffAgainstVisualBaseline,
   getScreenChangeSummary,
+  getVisualIgnoreSelectors,
   listScreensWithCounts,
   resolveTestCaseIdsForScreens,
   saveVisualBaseline,
+  setVisualIgnoreSelectors,
 } from "../services/screensService.js";
 import { queueExecution } from "../services/executionService.js";
+import { getVisualDiffThresholdPercent } from "../services/adminService.js";
 import { errBody } from "../errorCodes.js";
 
 export const screensRouter = Router();
@@ -46,11 +49,29 @@ screensRouter.post("/:id/visual-baseline", async (req, res) => {
   }
 });
 
+// Deeper Bug Detection #3: known-noisy regions to mask (visibility: hidden)
+// before every screenshot for this screen -- a timestamp, an ad slot, a live
+// counter. Empty by default; add your own site's dynamic regions here rather
+// than us guessing them.
+screensRouter.get("/:id/visual-ignore-selectors", (req, res) => {
+  res.json({ selectors: getVisualIgnoreSelectors(req.params.id) });
+});
+
+screensRouter.put("/:id/visual-ignore-selectors", (req, res) => {
+  const { selectors } = req.body as { selectors?: string[] };
+  try {
+    setVisualIgnoreSelectors(req.params.id, selectors ?? []);
+    res.json({ selectors: getVisualIgnoreSelectors(req.params.id) });
+  } catch (err: any) {
+    res.status(400).json(errBody(400, err.message));
+  }
+});
+
 screensRouter.post("/:id/visual-diff", async (req, res) => {
   const { content, url } = req.body as { content?: string; url?: string };
   if (!content && !url) return res.status(400).json(errBody(400, "content or url is required to diff against the baseline"));
   try {
-    res.json(await diffAgainstVisualBaseline(req.params.id, { content, url }));
+    res.json(await diffAgainstVisualBaseline(req.params.id, { content, url, thresholdPercent: getVisualDiffThresholdPercent() }));
   } catch (err: any) {
     res.status(404).json({ error: err.message });
   }

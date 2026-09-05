@@ -834,6 +834,15 @@ ensureColumn("org_settings", "visual_diff_threshold_percent", "REAL NOT NULL DEF
 ensureColumn("org_settings", "api_schema_default_mode", "TEXT NOT NULL DEFAULT 'baseline'"); // 'baseline' (accept current shape as the new normal) | 'strict' (fail on any drift)
 ensureColumn("org_settings", "responsive_scan_enabled", "INTEGER NOT NULL DEFAULT 1"); // #5: mobile/tablet re-scan on top of the existing desktop scan
 
+// #3 visual regression: per-screen CSS selectors to mask out (visibility:
+// hidden, so layout position is preserved) before every screenshot -- known
+// dynamic regions (a timestamp, an ad slot, a live counter) that would
+// otherwise pixel-diff on every single run regardless of a real bug. Empty
+// by default and per-screen (not a single global list) since dynamic regions
+// are inherently screen-specific and we have no way to guess them for your
+// app -- see screensService.ts's VISUAL_DIFF_CONFIG doc comment.
+ensureColumn("screens", "visual_ignore_selectors_json", "TEXT NOT NULL DEFAULT '[]'");
+
 db.exec(`
 -- API response schema capture/validation: one row per distinct "METHOD path"
 -- endpoint seen during a crawl/execution. First sighting stores the inferred

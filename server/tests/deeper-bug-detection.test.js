@@ -21,7 +21,7 @@ import {
   getApiSchemaDefaultMode,
   setApiSchemaDefaultMode,
 } from '../src/services/adminService.ts';
-import { compareScreenshotToBaseline } from '../src/services/screensService.ts';
+import { compareScreenshotToBaseline, getVisualIgnoreSelectors, setVisualIgnoreSelectors, VISUAL_DIFF_CONFIG } from '../src/services/screensService.ts';
 import { isResponsiveScanEnabled, setResponsiveScanEnabled, RESPONSIVE_VIEWPORTS } from '../src/services/responsiveService.ts';
 
 function resetData() {
@@ -271,4 +271,26 @@ test('compareScreenshotToBaseline reports no baseline when none has been saved',
   const result = compareScreenshotToBaseline('screen-with-no-baseline', Buffer.from([]));
   assert.equal(result.hasBaseline, false);
   assert.equal(result.visualChangeDetected, false);
+});
+
+// ---- Phase 3: visual-diff noise handling config ----
+
+test('visual-diff noise handling defaults: animations disabled by default, no app-specific ignore-selectors guessed', () => {
+  assert.equal(VISUAL_DIFF_CONFIG.disableAnimations, true);
+  assert.deepEqual(VISUAL_DIFF_CONFIG.defaultIgnoreSelectors, []);
+});
+
+test('per-screen visual ignore-selectors are stored and round-trip, with validation', () => {
+  const now = new Date().toISOString();
+  db.prepare(`
+    INSERT INTO screens (id, name, module_name, source_input_id, url_or_path, last_captured_state_hash, change_status, last_compared_at, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, 'new', ?, ?, ?)
+  `).run('screen-visual-ignore', 'Visual ignore fixture', 'fixture', 'input-x', null, 'x', now, now, now);
+
+  assert.deepEqual(getVisualIgnoreSelectors('screen-visual-ignore'), []);
+  setVisualIgnoreSelectors('screen-visual-ignore', ['.timestamp', '.ad-slot']);
+  assert.deepEqual(getVisualIgnoreSelectors('screen-visual-ignore'), ['.timestamp', '.ad-slot']);
+  assert.throws(() => setVisualIgnoreSelectors('screen-visual-ignore', 'not-an-array'));
+
+  db.prepare('DELETE FROM screens WHERE id = ?').run('screen-visual-ignore');
 });

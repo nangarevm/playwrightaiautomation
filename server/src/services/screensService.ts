@@ -24,16 +24,92 @@ function ensureVisualBaselineDir() {
   if (!fs.existsSync(VISUAL_BASELINE_DIR)) fs.mkdirSync(VISUAL_BASELINE_DIR, { recursive: true });
 }
 
+// Phase 3 config: known-noisy-element handling. `disableAnimations` is a
+// universal, safe default (freezing CSS animations/transitions before a
+// screenshot never changes what the page actually does, only when the
+// snapshot is taken -- the same technique tools like Percy/BackstopJS use) --
+// it stays on unless you have a reason to see mid-animation frames.
+// `defaultIgnoreSelectors` is deliberately empty: we have no way to guess
+// which regions of YOUR pages are dynamic (a "Last updated 2 min ago"
+// timestamp, a rotating ad slot, a live viewer count). Add per-screen
+// selectors via setVisualIgnoreSelectors() / PUT /api/screens/:id/visual-ignore-selectors
+// instead -- masked elements get `visibility: hidden` (keeps their layout
+// box so nothing shifts) applied identically to both the baseline capture
+// and every later comparison capture, so they never contribute pixels to
+// the diff. Note this doesn't help if the masked element's background isn't
+// opaque (whatever's behind it still shows) -- a known limitation, not
+// silently hidden from you.
+export const VISUAL_DIFF_CONFIG = {
+  disableAnimations: true,
+  defaultIgnoreSelectors: [] as string[],
+  // pixelmatch's own per-pixel color-distance sensitivity (0-1, lower = more
+  // sensitive to color differences). Distinct from the percentage-of-pixels
+  // threshold (org_settings.visual_diff_threshold_percent) that decides
+  // whether a diff counts as a bug -- this one only affects whether an
+  // individual pixel is counted as "different" at all.
+  pixelmatchColorThreshold: 0.1,
+};
+
+export function getVisualIgnoreSelectors(screenId: string): string[] {
+  const row = db.prepare("SELECT visual_ignore_selectors_json FROM screens WHERE id = ?").get(screenId) as { visual_ignore_selectors_json: string } | undefined;
+  if (!row) return VISUAL_DIFF_CONFIG.defaultIgnoreSelectors;
+  try {
+    return JSON.parse(row.visual_ignore_selectors_json);
+  } catch {
+    return VISUAL_DIFF_CONFIG.defaultIgnoreSelectors;
+  }
+}
+
+export function setVisualIgnoreSelectors(screenId: string, selectors: string[]): void {
+  if (!Array.isArray(selectors) || !selectors.every((s) => typeof s === "string")) {
+    throw new Error("selectors must be an array of CSS selector strings");
+  }
+  db.prepare("UPDATE screens SET visual_ignore_selectors_json = ?, updated_at = ? WHERE id = ?").run(JSON.stringify(selectors), new Date().toISOString(), screenId);
+}
+
+/**
+ * Applied right before every visual-diff screenshot (baseline capture AND
+ * every later comparison capture) so known-noisy content is handled
+ * identically on both sides of the diff. Exported so bugDetectionService.ts's
+ * scanScreenForUiBugs -- which already has the page open mid-scan -- can
+ * apply the exact same masking to its own screenshot, instead of duplicating
+ * this logic.
+ */
+export async function prepareForVisualCapture(page: import("playwright").Page, ignoreSelectors: string[]): Promise<void> {
+  if (VISUAL_DIFF_CONFIG.disableAnimations) {
+    await page
+      .addStyleTag({ content: "*, *::before, *::after { animation-duration: 0s !important; animation-delay: 0s !important; transition-duration: 0s !important; transition-delay: 0s !important; scroll-behavior: auto !important; }" })
+      .catch(() => undefined);
+  }
+  for (const selector of ignoreSelectors) {
+    await page
+      .evaluate((sel) => {
+        document.querySelectorAll(sel).forEach((el) => {
+          (el as HTMLElement).style.visibility = "hidden";
+        });
+      }, selector)
+      .catch(() => undefined); // an invalid/no-match selector should never fail the capture
+  }
+}
+
 // FR-5.9: capture a real screenshot via Playwright headless Chromium against a screen's URL.
 // Genuine rendering, not a stand-in -- verified in this dev environment (chromium launches and
 // page.screenshot() returns real PNG bytes). Viewport is parameterized (Deeper Bug Detection #5)
 // so the same capture path serves desktop and the responsive mobile/tablet scans, defaulting to
 // the original 1280x800 desktop size so existing (pre-#5) baselines/callers are unaffected.
-async function captureScreenshot(url: string, viewport: { width: number; height: number } = { width: 1280, height: 800 }): Promise<Buffer> {
-  const browser = await chromium.launch({ headless: true });
+async function captureScreenshot(
+  url: string,
+  viewport: { width: number; height: number } = { width: 1280, height: 800 },
+  ignoreSelectors: string[] = []
+): Promise<Buffer> {
+  // SCAN_CHROMIUM_PATH is an optional escape hatch for a Chromium binary at a
+  // non-standard path -- undefined by default, zero behavior change unless set
+  // (same env var bugDetectionService.ts's scan uses, for consistency).
+  const browser = await chromium.launch({ headless: true, executablePath: process.env.SCAN_CHROMIUM_PATH || undefined });
   try {
     const page = await browser.newPage({ viewport });
     await page.goto(url, { waitUntil: "load", timeout: 15000 });
+    await prepareForVisualCapture(page, ignoreSelectors);
     return await page.screenshot({ fullPage: true });
   } finally {
     await browser.close();
@@ -63,7 +139,7 @@ function comparePngBuffers(beforePng: Buffer, afterPng: Buffer): { diffPercentag
   const a = normalize(before);
   const b = normalize(after);
   const diff = new PNG({ width, height });
-  const mismatched = pixelmatch(a.data, b.data, diff.data, width, height, { threshold: 0.1 });
+  const mismatched = pixelmatch(a.data, b.data, diff.data, width, height, { threshold: VISUAL_DIFF_CONFIG.pixelmatchColorThreshold });
   const totalPixels = width * height;
   return {
     diffPercentage: totalPixels === 0 ? 0 : parseFloat(((mismatched / totalPixels) * 100).toFixed(2)),
@@ -228,7 +304,7 @@ export async function saveVisualBaseline(screenId: string, params: { content?: s
   const now = new Date().toISOString();
   if (params.url) {
     ensureVisualBaselineDir();
-    const screenshot = await captureScreenshot(params.url, params.viewport);
+    const screenshot = await captureScreenshot(params.url, params.viewport, getVisualIgnoreSelectors(screenId));
     const filePath = baselineFilePath(screenId, params.viewport?.name);
     fs.writeFileSync(filePath, screenshot);
     const ref = JSON.stringify({ type: "screenshot", path: filePath, capturedAt: now, viewport: params.viewport?.name ?? "desktop" });
@@ -282,7 +358,7 @@ export async function diffAgainstVisualBaseline(
   if (!params.url) {
     throw new Error("This screen's baseline is a real screenshot -- a url is required to diff against it");
   }
-  const currentScreenshot = await captureScreenshot(params.url, params.viewport);
+  const currentScreenshot = await captureScreenshot(params.url, params.viewport, getVisualIgnoreSelectors(screenId));
   const beforePng = fs.readFileSync(filePath);
   const { diffPercentage, width, height, diffImage } = comparePngBuffers(beforePng, currentScreenshot);
   const threshold = params.thresholdPercent ?? 1.0;

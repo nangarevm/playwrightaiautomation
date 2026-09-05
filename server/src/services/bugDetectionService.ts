@@ -16,7 +16,7 @@ import { fileURLToPath } from "url";
 import { chromium } from "playwright";
 import { nanoid } from "nanoid";
 import { db } from "../db.js";
-import { getScreen, compareScreenshotToBaseline } from "./screensService.js";
+import { getScreen, compareScreenshotToBaseline, prepareForVisualCapture, getVisualIgnoreSelectors } from "./screensService.js";
 import { fileGenericBug } from "./integrationsService.js";
 import type { SpellingIssue } from "../crawler/types.js";
 import { originOf, normalizeUrl } from "../crawler/urlUtils.js";
@@ -746,6 +746,11 @@ ${Object.entries(grouped)
     // No baseline yet -- nothing to compare against, not itself a finding.
     if (screenId) {
       try {
+        // Same masking as the baseline capture (screensService.saveVisualBaseline)
+        // -- disable animations/transitions and hide any screen-specific
+        // known-dynamic regions -- applied to THIS screenshot too, so both
+        // sides of the diff treat known noise identically.
+        await prepareForVisualCapture(page, getVisualIgnoreSelectors(screenId));
         const currentScreenshot = await page.screenshot({ fullPage: true });
         const diff = compareScreenshotToBaseline(screenId, currentScreenshot, {
           viewportName: viewport.name,

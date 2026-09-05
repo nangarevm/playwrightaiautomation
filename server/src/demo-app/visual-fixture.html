@@ -1,0 +1,23 @@
+<!doctype html>
+<html>
+<head><title>Visual Regression Test Fixture</title>
+<style>
+  body { margin: 0; font-family: sans-serif; }
+  .box { width: 300px; height: 200px; background: steelblue; }
+  .box.changed { background: crimson; }
+  .timestamp { padding: 8px; font-size: 14px; }
+  .spinner { width: 20px; height: 20px; border: 3px solid #ccc; border-top-color: #333; border-radius: 50%; animation: spin 0.6s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+  <div class="timestamp" id="ts"></div>
+  <div class="spinner"></div>
+  <div class="box" id="box"></div>
+  <script>
+    document.getElementById('ts').textContent = 'Last updated: ' + new Date().toISOString();
+    const variant = new URLSearchParams(location.search).get('variant') || '1';
+    if (variant === '2') document.getElementById('box').classList.add('changed');
+  </script>
+</body>
+</html>
