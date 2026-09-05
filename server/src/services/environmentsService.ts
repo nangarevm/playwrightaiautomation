@@ -10,8 +10,8 @@ import { encryptSecret, decryptSecret, maskSecret } from "./secretsService.js";
 
 function maskEnvironment(row: any) {
   if (!row) return row;
-  const { credentials_encrypted, credentials_iv, credentials_tag, ...rest } = row;
-  return { ...rest, has_credentials: Boolean(credentials_encrypted) };
+  const { credentials_encrypted, credentials_iv, credentials_tag, secondary_credentials_encrypted, secondary_credentials_iv, secondary_credentials_tag, ...rest } = row;
+  return { ...rest, has_credentials: Boolean(credentials_encrypted), has_secondary_credentials: Boolean(secondary_credentials_encrypted) };
 }
 
 export function listEnvironments() {
@@ -93,6 +93,47 @@ export function getDecryptedCredentials(id: string): { username: string; passwor
 
 export function deleteEnvironment(id: string) {
   db.prepare("DELETE FROM environments WHERE id = ?").run(id);
+}
+
+// Phase 4a: a second, deliberately lower-privilege identity for this
+// environment, used only by authzTestingService.ts's IDOR/vertical-
+// escalation probes -- never set implicitly, and (per authzTestingService's
+// own enforcement) inert unless org_settings.authz_testing_enabled is also on.
+export function setSecondaryCredentials(id: string, username: string, password: string) {
+  const env = getEnvironment(id);
+  if (!env) throw new Error("Environment not found");
+  const enc = encryptSecret(JSON.stringify({ username, password }));
+  db.prepare(
+    "UPDATE environments SET secondary_credentials_encrypted = ?, secondary_credentials_iv = ?, secondary_credentials_tag = ?, updated_at = ? WHERE id = ?"
+  ).run(enc.encrypted, enc.iv, enc.tag, new Date().toISOString(), id);
+  return maskEnvironment(getEnvironment(id));
+}
+
+export function revokeSecondaryCredentials(id: string) {
+  const env = getEnvironment(id);
+  if (!env) throw new Error("Environment not found");
+  db.prepare(
+    "UPDATE environments SET secondary_credentials_encrypted = NULL, secondary_credentials_iv = NULL, secondary_credentials_tag = NULL, updated_at = ? WHERE id = ?"
+  ).run(new Date().toISOString(), id);
+  return maskEnvironment(getEnvironment(id));
+}
+
+export function hasSecondaryCredentials(id: string): boolean {
+  const env = getEnvironment(id) as any;
+  return Boolean(env?.secondary_credentials_encrypted);
+}
+
+// Decrypts the secondary identity for internal use only (authzTestingService.ts) --
+// never returned directly from an API response (see maskEnvironment).
+export function getDecryptedSecondaryCredentials(id: string): { username: string; password: string } | null {
+  const env = getEnvironment(id) as any;
+  if (!env?.secondary_credentials_encrypted) return null;
+  try {
+    const decrypted = decryptSecret({ encrypted: env.secondary_credentials_encrypted, iv: env.secondary_credentials_iv, tag: env.secondary_credentials_tag });
+    return JSON.parse(decrypted);
+  } catch {
+    return null;
+  }
 }
 
 // FR-4.20: pre-flight health check -- target URL reachable, auth succeeds --

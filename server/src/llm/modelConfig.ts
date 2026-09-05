@@ -14,19 +14,29 @@ export function getModelForTier(tier: ModelTier): string {
   return process.env.LLM_MODEL_PRIMARY?.trim() || DEFAULT_PRIMARY;
 }
 
-export function getMaxTokensForTier(tier: ModelTier, callType: "test_case_generation" | "script_generation"): number {
+export type LlmProviderCallType = "test_case_generation" | "script_generation" | "exploratory_decision";
+
+export function getMaxTokensForTier(tier: ModelTier, callType: LlmProviderCallType): number {
   const defaults =
     callType === "test_case_generation"
       ? { primary: 2000, economy: 1500 }
-      : { primary: 1500, economy: 1200 };
+      : callType === "script_generation"
+        ? { primary: 1500, economy: 1200 }
+        // Phase 4c: the exploratory decision response is a tiny structured
+        // {actionId, rationale} object, not prose/code -- a much smaller budget suffices.
+        : { primary: 400, economy: 300 };
   const envKey =
     callType === "test_case_generation"
       ? tier === "primary"
         ? "LLM_MAX_TOKENS_TEST_PRIMARY"
         : "LLM_MAX_TOKENS_TEST_ECONOMY"
-      : tier === "primary"
-        ? "LLM_MAX_TOKENS_SCRIPT_PRIMARY"
-        : "LLM_MAX_TOKENS_SCRIPT_ECONOMY";
+      : callType === "script_generation"
+        ? tier === "primary"
+          ? "LLM_MAX_TOKENS_SCRIPT_PRIMARY"
+          : "LLM_MAX_TOKENS_SCRIPT_ECONOMY"
+        : tier === "primary"
+          ? "LLM_MAX_TOKENS_EXPLORE_PRIMARY"
+          : "LLM_MAX_TOKENS_EXPLORE_ECONOMY";
   const fromEnv = process.env[envKey];
   if (fromEnv && Number.isFinite(Number(fromEnv))) return Number(fromEnv);
   return defaults[tier];

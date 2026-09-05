@@ -38,6 +38,8 @@ export const CONFIDENCE_CONFIG = {
     "ui-visual": 0.02, // pixel-diff is the noisiest signal in this codebase (animations, timestamps)
     functional: 0.1,
     accessibility: 0.14, // axe-core is a maintained rule engine, not a hand-rolled heuristic -- more precise than most checks here
+    performance: 0.06, // a real measured duration/count against a configurable threshold -- an unambiguous fact, but "slow" is inherently a judgment call on where the threshold sits
+    security: 0.2, // an authz probe replaying the identical request as a second identity and getting 200 where a denial was expected is about as unambiguous as this engine's signals get
   } as Record<BugCategory, number>,
   reproducedBonus: 0.15, // reproducibility_successes > 1 (seen again on a later scan, not a one-off)
   correlatedBonus: 0.1, // corroborated by an independent signal in the same scan (bugCorrelationService)

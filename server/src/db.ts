@@ -917,6 +917,57 @@ CREATE TABLE IF NOT EXISTS state_transition_runs (
 );
 `);
 
+// Phase 4b: performance thresholds (master prompt #14) -- extends the
+// existing network/console capture in bugDetectionService.ts (it already
+// sees every response and, via requestfinished, each request's own
+// timing()) rather than a new service. All three configurable, not
+// hardcoded, same pattern as every other threshold this session.
+ensureColumn("org_settings", "slow_api_threshold_ms", "INTEGER NOT NULL DEFAULT 3000");
+ensureColumn("org_settings", "slow_page_threshold_ms", "INTEGER NOT NULL DEFAULT 5000");
+ensureColumn("org_settings", "max_requests_per_page", "INTEGER NOT NULL DEFAULT 100");
+
+// Phase 4a: authorization testing (master prompt #11) -- OFF by default and
+// requires BOTH this org-wide opt-in AND the specific target environment to
+// have a second, lower-privilege identity configured (secondary_credentials_*
+// below) before authzTestingService.ts will run anything against it. This is
+// qualitatively different from every other check added this session (all
+// single-identity, read-only observation) -- per the master prompt's own
+// instruction to "never perform destructive/security testing outside
+// explicitly authorized test environments," it must never run against an
+// environment nobody has deliberately opted in.
+ensureColumn("org_settings", "authz_testing_enabled", "INTEGER NOT NULL DEFAULT 0");
+ensureColumn("environments", "secondary_credentials_encrypted", "TEXT");
+ensureColumn("environments", "secondary_credentials_iv", "TEXT");
+ensureColumn("environments", "secondary_credentials_tag", "TEXT");
+
+// Phase 4c: exploratory AI agent (master prompt #16) -- the one component
+// that takes autonomous actions beyond the existing deterministic crawl.
+// max_actions/max_depth are captured on the session row itself (not just
+// read live from org_settings) so a session's budget can't silently change
+// mid-run if the org default is edited while it's active; actions_taken is
+// the hard, deterministic counter that gates every step regardless of what
+// the LLM decision call suggests (see exploratoryAgentService.ts).
+db.exec(`
+CREATE TABLE IF NOT EXISTS exploration_sessions (
+  id TEXT PRIMARY KEY,
+  site_id TEXT,
+  start_url TEXT NOT NULL,
+  status TEXT NOT NULL, -- running/completed/budget_exhausted/stopped
+  actions_taken INTEGER NOT NULL DEFAULT 0,
+  max_actions INTEGER NOT NULL,
+  max_depth INTEGER NOT NULL,
+  visited_states_json TEXT NOT NULL DEFAULT '[]',
+  action_history_json TEXT NOT NULL DEFAULT '[]',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+`);
+// Conservative defaults per the master prompt's own recommendation for this
+// component specifically (it's the first one taking autonomous actions) --
+// 20 actions / depth 3, not whatever felt generous.
+ensureColumn("org_settings", "exploration_default_max_actions", "INTEGER NOT NULL DEFAULT 20");
+ensureColumn("org_settings", "exploration_default_max_depth", "INTEGER NOT NULL DEFAULT 3");
+
 db.exec(`
 -- API response schema capture/validation: one row per distinct "METHOD path"
 -- endpoint seen during a crawl/execution. First sighting stores the inferred

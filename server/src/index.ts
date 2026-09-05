@@ -26,6 +26,8 @@ import { allureRouter } from "./routes/allure.js";
 import { bugsRouter } from "./routes/bugs.js";
 import { apiSchemasRouter } from "./routes/apiSchemas.js";
 import { stateTransitionFlowsRouter } from "./routes/stateTransitionFlows.js";
+import { authzTestingRouter } from "./routes/authzTesting.js";
+import { exploratoryAgentRouter } from "./routes/exploratoryAgent.js";
 import { attachUser, enforceReadOnlyRoles } from "./services/adminService.js";
 import { cleanupExpiredArtifacts, runScheduledProfiles } from "./services/executionService.js";
 import { runScheduledCrawlsAndDiffs } from "./services/changeSchedulerService.js";
@@ -146,6 +148,21 @@ app.get("/demo/api/inventory", (req, res) => {
 app.post("/demo/api/order-fail", (_req, res) => {
   res.status(500).json({ error: "insufficient stock" });
 });
+// Phase 4b verification fixture: an artificially slow endpoint used by
+// performance-fixture.html to prove the slow-API-call threshold check
+// against a real measured response time, not a hand-constructed number.
+app.get("/demo/api/slow", (_req, res) => {
+  setTimeout(() => res.json({ ok: true }), 80);
+});
+// Phase 4a verification fixture: a deliberately buggy "owner-only" resource --
+// it checks only that SOME valid credential was supplied, never that the
+// requester actually owns order #1 (the real IDOR bug this probe should
+// catch). Any authenticated user, including a second, unrelated identity,
+// gets the same 200.
+app.get("/demo/api/secure-resource/:id", (req, res) => {
+  if (!req.headers.authorization) return res.status(401).json({ error: "unauthenticated" });
+  res.json({ id: req.params.id, owner: "user-1", secret: "classified" });
+});
 // FR-1.1: serve uploaded screenshots so the client can render real thumbnails
 app.use("/uploads", express.static(uploadDir));
 
@@ -255,6 +272,8 @@ app.use("/api/allure", allureRouter);
 app.use("/api/bugs", bugsRouter);
 app.use("/api/api-schemas", apiSchemasRouter);
 app.use("/api/state-transition-flows", stateTransitionFlowsRouter);
+app.use("/api/authz-testing", authzTestingRouter);
+app.use("/api/exploratory-agent", exploratoryAgentRouter);
 // Embedded Allure report viewer (Phase 8 step 5): served statically so the
 // client can open it in an <iframe> instead of requiring download/unzip/open.
 app.use("/allure-report", express.static(path.join(__dirname, "..", "allure-report")));

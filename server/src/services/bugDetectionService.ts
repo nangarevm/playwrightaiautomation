@@ -26,7 +26,7 @@ import { validateInteraction, validateInteractionSequence, detectInteractionPatt
 import { checkAndRecordApiResponse } from "./apiSchemaService.js";
 import { runDomChecks, getDomCheckIgnoreSelectors } from "./domChecksService.js";
 import { checkUiApiConsistency } from "./uiApiConsistencyService.js";
-import { getVisualDiffThresholdPercent, getMaxDuplicateRequests, getAccessibilityEnabled } from "./adminService.js";
+import { getVisualDiffThresholdPercent, getMaxDuplicateRequests, getAccessibilityEnabled, getSlowApiThresholdMs, getSlowPageThresholdMs, getMaxRequestsPerPage } from "./adminService.js";
 import { runResponsiveBugScan } from "./responsiveService.js";
 import { runAccessibilityChecks, getAccessibilityIgnoreRules } from "./accessibilityService.js";
 import { computeFingerprint } from "./bugFingerprintService.js";
@@ -59,7 +59,12 @@ export type BugSource = "ui_exploratory" | "api_fuzz" | "regression";
 //   ui-api-mismatch     <- a declared UI-count-vs-API-count rule disagreed
 //                          (uiApiConsistencyService.ts)
 //   accessibility         <- an axe-core WCAG rule violation (accessibilityService.ts)
-export type BugCategory = "console-error" | "api-status" | "api-schema" | "ui-visual" | "ui-dom" | "ui-api-mismatch" | "functional" | "accessibility";
+//   performance            <- a slow API/page-load or excessive-request-count
+//                          signal against a configurable threshold (Phase 4b)
+//   security               <- an authz probe (IDOR / vertical escalation)
+//                          found a request that should have been denied but
+//                          wasn't (authzTestingService.ts, Phase 4a)
+export type BugCategory = "console-error" | "api-status" | "api-schema" | "ui-visual" | "ui-dom" | "ui-api-mismatch" | "functional" | "accessibility" | "performance" | "security";
 
 export interface BugFindingInput {
   source: BugSource;
@@ -475,6 +480,33 @@ export async function scanScreenForUiBugs(
     // during this one page visit, to flag a likely polling-storm/re-render-
     // loop bug (see the duplicate-request check after the page settles below).
     const apiCallCounts = new Map<string, number>();
+    // Phase 4b: performance signals -- total request count for this page
+    // visit (every resource type, not just XHR/fetch), and each XHR/fetch
+    // call's own measured duration once it finishes (requestfinished, not
+    // response, so timing().responseEnd is guaranteed populated -- see
+    // Playwright's Request.timing() doc: responseEnd needs the full body
+    // received, which 'response' alone doesn't guarantee).
+    let totalRequestCount = 0;
+    const slowApiCalls: Array<{ url: string; durationMs: number }> = [];
+    page.on("request", () => {
+      totalRequestCount++;
+    });
+    page.on("requestfinished", (req) => {
+      const resourceType = req.resourceType();
+      if (resourceType !== "xhr" && resourceType !== "fetch") return;
+      if (isIgnoredUrl(req.url())) return;
+      try {
+        const timing = req.timing();
+        if (timing.responseEnd >= 0) {
+          const thresholdMs = getSlowApiThresholdMs();
+          if (timing.responseEnd > thresholdMs) {
+            slowApiCalls.push({ url: req.url(), durationMs: Math.round(timing.responseEnd) });
+          }
+        }
+      } catch {
+        /* timing unavailable for this request -- not itself a finding */
+      }
+    });
 
     await page.exposeFunction("__reportUnhandledRejection", (message: string) => {
       unhandledRejections.push(String(message).slice(0, 300));
@@ -551,6 +583,7 @@ export async function scanScreenForUiBugs(
     ];
 
     let mainResponse: import("playwright").Response | null = null;
+    const pageLoadStart = Date.now(); // Phase 4b: page-load duration for the slow-page-threshold check below
     try {
       mainResponse = await page.goto(screen.url_or_path, { waitUntil: "domcontentloaded", timeout: SCAN_NAV_TIMEOUT_MS });
     } catch (navErr: any) {
@@ -572,6 +605,7 @@ export async function scanScreenForUiBugs(
       autoFileIfSevere(finding);
       return findings;
     }
+    const pageLoadDurationMs = Date.now() - pageLoadStart;
 
     if (mainResponse && mainResponse.status() >= 400) {
       const screenshotUrl = await screenshotNow();
@@ -1041,6 +1075,62 @@ ${Object.entries(grouped)
       } catch {
         // Visual diff is supplementary evidence -- never fail the scan over it.
       }
+    }
+
+    // Phase 4b: performance thresholds. False-positive risk: "slow" and "too
+    // many requests" are both threshold judgment calls, not unambiguous
+    // defects the way a 500 status is -- a data-heavy dashboard legitimately
+    // makes more calls than a landing page, and a first-load-with-cold-cache
+    // run can look slower than a warm one. Raise org_settings.
+    // slow_api_threshold_ms / slow_page_threshold_ms / max_requests_per_page
+    // for a screen that's intentionally heavier than the defaults.
+    if (pageLoadDurationMs > getSlowPageThresholdMs()) {
+      findings.push(
+        recordBugFinding({
+          source: "ui_exploratory",
+          category: "performance",
+          severity: "medium",
+          title: `Slow page load on ${screen.name}`,
+          detail: `${screen.name} took ${pageLoadDurationMs}ms to reach domcontentloaded, above the configured threshold of ${getSlowPageThresholdMs()}ms.`,
+          screenId,
+          runId,
+          viewport: viewport.name,
+          evidence: { pageLoadDurationMs, thresholdMs: getSlowPageThresholdMs() },
+          stepsToReproduce: [...baseSteps, `Observe: the page took ${pageLoadDurationMs}ms to load (threshold: ${getSlowPageThresholdMs()}ms).`],
+        })
+      );
+    }
+    if (slowApiCalls.length > 0) {
+      findings.push(
+        recordBugFinding({
+          source: "ui_exploratory",
+          category: "performance",
+          severity: "low",
+          title: `Slow API call(s) on ${screen.name}`,
+          detail: slowApiCalls.slice(0, 8).map((c) => `${c.durationMs}ms — ${c.url}`).join("\n"),
+          screenId,
+          runId,
+          viewport: viewport.name,
+          evidence: { slowApiCalls: slowApiCalls.slice(0, 8), thresholdMs: getSlowApiThresholdMs() },
+          stepsToReproduce: [...baseSteps, `Open DevTools Network tab.`, `Observe: ${slowApiCalls.length} XHR/fetch call(s) exceeded ${getSlowApiThresholdMs()}ms.`],
+        })
+      );
+    }
+    if (totalRequestCount > getMaxRequestsPerPage()) {
+      findings.push(
+        recordBugFinding({
+          source: "ui_exploratory",
+          category: "performance",
+          severity: "low",
+          title: `Excessive request count on ${screen.name}`,
+          detail: `${screen.name} made ${totalRequestCount} network requests in one page visit, above the configured threshold of ${getMaxRequestsPerPage()}.`,
+          screenId,
+          runId,
+          viewport: viewport.name,
+          evidence: { totalRequestCount, thresholdCount: getMaxRequestsPerPage() },
+          stepsToReproduce: [...baseSteps, `Open DevTools Network tab.`, `Observe: ${totalRequestCount} total requests (threshold: ${getMaxRequestsPerPage()}).`],
+        })
+      );
     }
 
     // Phase 1B: correlate this scan's findings (rule-based grouping -- see

@@ -1,6 +1,6 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { GeneratedTestCase, LlmProvider } from "./types.js";
-import type { ModelTier } from "./modelConfig.js";
+import type { ModelTier, LlmProviderCallType } from "./modelConfig.js";
 import { getMaxTokensForTier, getModelForTier } from "./modelConfig.js";
 
 // Real LLM-backed provider. Only used when ANTHROPIC_API_KEY is set and
@@ -53,7 +53,7 @@ function stripCodeFences(text: string, language: string): string {
 export function makeAnthropicProvider(apiKey: string): LlmProvider {
   const client = new Anthropic({ apiKey });
 
-  async function createMessage(tier: ModelTier, callType: "test_case_generation" | "script_generation", system: string, userContent: string) {
+  async function createMessage(tier: ModelTier, callType: LlmProviderCallType, system: string, userContent: string) {
     const model = getModelForTier(tier);
     const max_tokens = getMaxTokensForTier(tier, callType);
     return client.messages.create({
@@ -100,6 +100,40 @@ export function makeAnthropicProvider(apiKey: string): LlmProvider {
           fileName: `script.${scriptFileExtension(language, framework)}`,
         },
       ];
+    },
+
+    // Phase 4c: the one place in this platform an LLM call picks an ACTION
+    // rather than generating text/code. Output is constrained to a tiny JSON
+    // object naming ONE of the caller-supplied candidate ids -- the caller
+    // (exploratoryAgentService.ts) never trusts this alone: it validates the
+    // id is actually in availableActions and enforces its own hard budget
+    // regardless of what comes back here.
+    async decideNextExploratoryAction(input, options): Promise<{ actionId: string; rationale: string }> {
+      const tier: ModelTier = options?.tier ?? "economy"; // a small routing decision -- economy tier by default, per FR-9.7's own cost-aware-routing intent
+      const system =
+        "You are choosing the single highest-value next exploratory action on a web page under test, to surface real bugs. " +
+        'Output ONLY a JSON object: {"actionId": "<id from the list, or the literal string \\"stop\\">", "rationale": "<one sentence>"}. ' +
+        "No prose, no code fences. Prefer actions not already tried. Prefer actions plausibly related to areas where bugs were already found nearby (a broken flow often has more than one issue), " +
+        'but do not repeat an identical prior action. If every listed action has already been tried, or none seem worth pursuing, respond with actionId "stop".';
+      const userContent = [
+        `Current URL: ${input.currentUrl}`,
+        `Actions remaining in budget: ${input.actionsRemaining}`,
+        `Already-tried action ids this session: ${input.alreadyTriedActionIds.join(", ") || "(none yet)"}`,
+        `Bugs already found this session: ${input.priorBugsSummary.join("; ") || "(none yet)"}`,
+        `Available actions:\n${input.availableActions.map((a) => `- id="${a.id}": ${a.description}`).join("\n")}`,
+      ].join("\n");
+      const msg = await createMessage(tier, "exploratory_decision", system, userContent);
+      const text = msg.content.map((b) => (b.type === "text" ? b.text : "")).join("\n");
+      const jsonStr = text.replace(/```json|```/g, "").trim();
+      try {
+        const parsed = JSON.parse(jsonStr);
+        return { actionId: String(parsed.actionId ?? "stop"), rationale: String(parsed.rationale ?? "") };
+      } catch {
+        // Malformed/unparseable response -- the caller's own validation
+        // (actionId must be in availableActions) will treat this as "stop"
+        // just as safely as an explicit stop would.
+        return { actionId: "stop", rationale: "Could not parse the model's response." };
+      }
     },
   };
 }

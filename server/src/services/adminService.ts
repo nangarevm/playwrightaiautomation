@@ -365,6 +365,93 @@ export function setAccessibilityWcagLevel(level: string, updatedBy: CurrentUser 
   return { accessibility_wcag_level: getAccessibilityWcagLevel() };
 }
 
+// Phase 4b: performance thresholds. All three configurable rather than
+// hardcoded -- what counts as "slow" or "too many requests" varies wildly
+// by app (a data-heavy dashboard legitimately makes more calls than a
+// landing page), so there's no honest universal default beyond a sensible
+// starting point.
+function positiveIntSetting(column: string, auditAction: string, value: number, updatedBy: CurrentUser | undefined, label: string) {
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 1) {
+    throw new Error(`${label} must be a positive integer`);
+  }
+  const now = new Date().toISOString();
+  db.prepare(`UPDATE org_settings SET ${column} = ?, updated_by = ?, updated_at = ? WHERE id = 1`).run(value, updatedBy?.id ?? null, now);
+  logAudit(updatedBy, auditAction, "org_settings", "1", { [column]: value });
+}
+
+export function getSlowApiThresholdMs(): number {
+  const row = db.prepare("SELECT slow_api_threshold_ms FROM org_settings WHERE id = 1").get() as { slow_api_threshold_ms: number };
+  return row.slow_api_threshold_ms;
+}
+
+export function setSlowApiThresholdMs(ms: number, updatedBy: CurrentUser | undefined) {
+  positiveIntSetting("slow_api_threshold_ms", "org_slow_api_threshold_changed", ms, updatedBy, "ms");
+  return { slow_api_threshold_ms: getSlowApiThresholdMs() };
+}
+
+export function getSlowPageThresholdMs(): number {
+  const row = db.prepare("SELECT slow_page_threshold_ms FROM org_settings WHERE id = 1").get() as { slow_page_threshold_ms: number };
+  return row.slow_page_threshold_ms;
+}
+
+export function setSlowPageThresholdMs(ms: number, updatedBy: CurrentUser | undefined) {
+  positiveIntSetting("slow_page_threshold_ms", "org_slow_page_threshold_changed", ms, updatedBy, "ms");
+  return { slow_page_threshold_ms: getSlowPageThresholdMs() };
+}
+
+export function getMaxRequestsPerPage(): number {
+  const row = db.prepare("SELECT max_requests_per_page FROM org_settings WHERE id = 1").get() as { max_requests_per_page: number };
+  return row.max_requests_per_page;
+}
+
+export function setMaxRequestsPerPage(count: number, updatedBy: CurrentUser | undefined) {
+  positiveIntSetting("max_requests_per_page", "org_max_requests_per_page_changed", count, updatedBy, "count");
+  return { max_requests_per_page: getMaxRequestsPerPage() };
+}
+
+// Phase 4a: authorization testing org-wide opt-in. Defaults OFF -- this is
+// the one check in the whole engine that sends requests as a second identity
+// against a real target, and per the master prompt's own instruction it must
+// never run unless a human has explicitly turned it on for this org AND
+// configured a secondary identity on the specific target environment (see
+// authzTestingService.ts's own enforcement, which checks both independently
+// of whatever the UI happens to show).
+export function getAuthzTestingEnabled(): boolean {
+  const row = db.prepare("SELECT authz_testing_enabled FROM org_settings WHERE id = 1").get() as { authz_testing_enabled: number };
+  return !!row.authz_testing_enabled;
+}
+
+export function setAuthzTestingEnabled(enabled: boolean, updatedBy: CurrentUser | undefined) {
+  const now = new Date().toISOString();
+  db.prepare("UPDATE org_settings SET authz_testing_enabled = ?, updated_by = ?, updated_at = ? WHERE id = 1").run(enabled ? 1 : 0, updatedBy?.id ?? null, now);
+  logAudit(updatedBy, "org_authz_testing_enabled_changed", "org_settings", "1", { enabled });
+  return { authz_testing_enabled: getAuthzTestingEnabled() };
+}
+
+// Phase 4c: exploratory agent default budget -- conservative defaults
+// (20 actions, depth 3) per the master prompt's own recommendation for the
+// one component that takes autonomous actions; QA-Lead editable, same as
+// every other threshold.
+export function getExplorationDefaultMaxActions(): number {
+  const row = db.prepare("SELECT exploration_default_max_actions FROM org_settings WHERE id = 1").get() as { exploration_default_max_actions: number };
+  return row.exploration_default_max_actions;
+}
+
+export function setExplorationDefaultMaxActions(value: number, updatedBy: CurrentUser | undefined) {
+  positiveIntSetting("exploration_default_max_actions", "org_exploration_default_max_actions_changed", value, updatedBy, "value");
+  return { exploration_default_max_actions: getExplorationDefaultMaxActions() };
+}
+
+export function getExplorationDefaultMaxDepth(): number {
+  const row = db.prepare("SELECT exploration_default_max_depth FROM org_settings WHERE id = 1").get() as { exploration_default_max_depth: number };
+  return row.exploration_default_max_depth;
+}
+
+export function setExplorationDefaultMaxDepth(value: number, updatedBy: CurrentUser | undefined) {
+  positiveIntSetting("exploration_default_max_depth", "org_exploration_default_max_depth_changed", value, updatedBy, "value");
+  return { exploration_default_max_depth: getExplorationDefaultMaxDepth() };
+}
+
 // FR-2.11: QA-Lead-managed domain/business rules, persisted as a real entity
 // (previously a free-text string re-typed per generation call) so generation
 // can pull the active set automatically and a threshold demonstrably shows up

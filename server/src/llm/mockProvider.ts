@@ -255,6 +255,20 @@ export const mockProvider: LlmProvider = {
 
     return artifacts;
   },
+
+  // Phase 4c: deterministic stand-in -- picks the first available action not
+  // already tried this session, preferring one whose description doesn't
+  // resemble a prior bug's title (mild novelty bias, no semantic reasoning
+  // needed for a mock). Stops once nothing untried remains.
+  async decideNextExploratoryAction(input): Promise<{ actionId: string; rationale: string }> {
+    const untried = input.availableActions.filter((a) => !input.alreadyTriedActionIds.includes(a.id));
+    if (untried.length === 0) {
+      return { actionId: "stop", rationale: "No untried actions remain on this page." };
+    }
+    const novel = untried.find((a) => !input.priorBugsSummary.some((b) => b.toLowerCase().includes(a.description.toLowerCase())));
+    const chosen = novel ?? untried[0];
+    return { actionId: chosen.id, rationale: `Trying an untried action: ${chosen.description}` };
+  },
 };
 
 // FR-3.5: generates a Playwright API-request test rather than a UI browser

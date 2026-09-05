@@ -1,5 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { db } from '../src/db.ts';
 import { recordBugFinding, getBugFinding, listBugFindings, BUG_SCAN_CONFIG } from '../src/services/bugDetectionService.ts';
 import {
@@ -719,4 +721,102 @@ test('named template builders produce a valid {steps, invariants} pair matching 
   const t5 = buildSessionExpiryMidFlowTemplate({ url: 'http://x', triggerSelector: '#action', loginIndicatorSelector: '#login-form' });
   assert.ok(t5.steps.some((s) => s.action === 'clear_cookies'));
   assert.equal(t5.invariants[0].type, 'visible');
+});
+
+// ---- Phase 4b: performance thresholds config ----
+
+import { getSlowApiThresholdMs, setSlowApiThresholdMs, getSlowPageThresholdMs, setSlowPageThresholdMs, getMaxRequestsPerPage, setMaxRequestsPerPage } from '../src/services/adminService.ts';
+
+test('performance thresholds default sensibly and are QA-Lead editable, with validation', () => {
+  assert.equal(getSlowApiThresholdMs(), 3000);
+  assert.equal(getSlowPageThresholdMs(), 5000);
+  assert.equal(getMaxRequestsPerPage(), 100);
+
+  setSlowApiThresholdMs(1500, undefined);
+  assert.equal(getSlowApiThresholdMs(), 1500);
+  setSlowPageThresholdMs(9000, undefined);
+  assert.equal(getSlowPageThresholdMs(), 9000);
+  setMaxRequestsPerPage(50, undefined);
+  assert.equal(getMaxRequestsPerPage(), 50);
+
+  assert.throws(() => setSlowApiThresholdMs(0, undefined));
+  assert.throws(() => setSlowApiThresholdMs(-1, undefined));
+  assert.throws(() => setMaxRequestsPerPage(1.5, undefined));
+
+  // restore defaults for other tests
+  setSlowApiThresholdMs(3000, undefined);
+  setSlowPageThresholdMs(5000, undefined);
+  setMaxRequestsPerPage(100, undefined);
+});
+
+// ---- Phase 4a: authz testing enforcement (the actual probe needs a real
+// browser-adjacent fetch against a real target -- verified live via a
+// scratch script against a demo fixture; the enforcement gate itself is
+// pure logic and is fully covered here) ----
+
+import { getAuthzTestingEnabled, setAuthzTestingEnabled } from '../src/services/adminService.ts';
+import { createEnvironment, setSecondaryCredentials, hasSecondaryCredentials, deleteEnvironment } from '../src/services/environmentsService.ts';
+import { runIdorProbe, runVerticalEscalationProbe, isAuthzTestingConfigured, AuthzTestingNotAuthorizedError } from '../src/services/authzTestingService.ts';
+
+test('authz_testing_enabled defaults to false (opt-in only)', () => {
+  assert.equal(getAuthzTestingEnabled(), false);
+});
+
+test('authz probes refuse to run unless BOTH the org toggle and the environment secondary identity are configured', async () => {
+  const env = createEnvironment({ name: 'Authz Test Env', target_url: 'http://localhost:1' });
+  try {
+    assert.equal(hasSecondaryCredentials(env.id), false);
+    assert.deepEqual(isAuthzTestingConfigured(env.id), { orgEnabled: false, environmentConfigured: false, allowed: false });
+
+    await assert.rejects(() => runIdorProbe(env.id, ['http://localhost:1/x']), AuthzTestingNotAuthorizedError);
+    await assert.rejects(() => runVerticalEscalationProbe(env.id, ['http://localhost:1/x']), AuthzTestingNotAuthorizedError);
+
+    setAuthzTestingEnabled(true, undefined);
+    await assert.rejects(() => runIdorProbe(env.id, ['http://localhost:1/x']), AuthzTestingNotAuthorizedError, 'org on but environment not configured must still refuse');
+
+    setAuthzTestingEnabled(false, undefined);
+    setSecondaryCredentials(env.id, 'secondary', 'pass');
+    await assert.rejects(() => runIdorProbe(env.id, ['http://localhost:1/x']), AuthzTestingNotAuthorizedError, 'environment configured but org off must still refuse');
+
+    setAuthzTestingEnabled(true, undefined);
+    assert.deepEqual(isAuthzTestingConfigured(env.id), { orgEnabled: true, environmentConfigured: true, allowed: true });
+  } finally {
+    setAuthzTestingEnabled(false, undefined);
+    deleteEnvironment(env.id);
+  }
+});
+
+test('authz probes never issue anything but a GET (no code path accepts a mutating method)', () => {
+  const source = readFileSync(join(process.cwd(), 'src/services/authzTestingService.ts'), 'utf8');
+  const fetchCalls = source.match(/fetch\([^)]*\)/gs) || [];
+  assert.ok(fetchCalls.length > 0);
+  for (const call of fetchCalls) {
+    assert.match(call, /method:\s*"GET"/, `every fetch call in authzTestingService.ts must hardcode GET: ${call}`);
+  }
+});
+
+// ---- Phase 4c: exploratory agent config (the actual session run needs a
+// real browser -- verified live against a 3-page demo-app fixture, not
+// repeated here) ----
+
+import { getExplorationDefaultMaxActions, setExplorationDefaultMaxActions, getExplorationDefaultMaxDepth, setExplorationDefaultMaxDepth } from '../src/services/adminService.ts';
+import { listExplorationSessions, getExplorationSession, stopExplorationSession, EXPLORATION_CONFIG } from '../src/services/exploratoryAgentService.ts';
+
+test('exploration defaults are conservative (20 actions, depth 3) and QA-Lead editable', () => {
+  assert.equal(getExplorationDefaultMaxActions(), 20);
+  assert.equal(getExplorationDefaultMaxDepth(), 3);
+  setExplorationDefaultMaxActions(5, undefined);
+  assert.equal(getExplorationDefaultMaxActions(), 5);
+  setExplorationDefaultMaxDepth(2, undefined);
+  assert.equal(getExplorationDefaultMaxDepth(), 2);
+  assert.throws(() => setExplorationDefaultMaxActions(0, undefined));
+  setExplorationDefaultMaxActions(20, undefined); // restore defaults
+  setExplorationDefaultMaxDepth(3, undefined);
+});
+
+test('getExplorationSession/listExplorationSessions/stopExplorationSession handle a missing session without throwing', () => {
+  assert.equal(getExplorationSession('does-not-exist'), undefined);
+  assert.equal(stopExplorationSession('does-not-exist'), undefined);
+  assert.ok(Array.isArray(listExplorationSessions()));
+  assert.ok(EXPLORATION_CONFIG.maxCandidateActionsPerStep > 0);
 });

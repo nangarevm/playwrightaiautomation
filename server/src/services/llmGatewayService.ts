@@ -21,7 +21,7 @@ import type { ModelTier } from "../llm/modelConfig.js";
 import { getMaxInputChars } from "../llm/modelConfig.js";
 
 export type { ModelTier } from "../llm/modelConfig.js";
-export type LlmCallType = "test_case_generation" | "script_generation";
+export type LlmCallType = "test_case_generation" | "script_generation" | "exploratory_decision";
 
 // $/MTok, matching the SRS 13.5 worked example (Claude Sonnet 5 introductory
 // pricing) for the primary tier; the economy tier models a materially cheaper
@@ -48,6 +48,13 @@ const PRICING_USD_PER_MTOK: Record<ModelTier, { input: number; output: number }>
 const CACHE_SIMILARITY_THRESHOLD: Record<LlmCallType, number> = {
   test_case_generation: 0.82,
   script_generation: 1,
+  // Phase 4c: exact match only, same reasoning as script_generation -- a
+  // fuzzy-matched cache hit could return a decision naming an actionId that
+  // doesn't exist in THIS call's actual availableActions list (each state's
+  // candidate actions are effectively unique), which the caller would then
+  // have to fall back from anyway. An exact match is still a real savings
+  // for a genuinely repeated state (e.g. re-visiting the same page shape).
+  exploratory_decision: 1,
 };
 const CACHE_MAX_ENTRIES = 200;
 const COMPRESSION_TRIGGER_CHARS = 1200; // only compress inputs large enough for it to matter (FR-9.6: "large inputs")

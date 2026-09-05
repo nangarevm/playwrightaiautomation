@@ -8,9 +8,15 @@ import {
   getAuditRetentionPolicy,
   getAccessibilityEnabled,
   getAccessibilityWcagLevel,
+  getAuthzTestingEnabled,
   getCostSavingSetting,
+  getExplorationDefaultMaxActions,
+  getExplorationDefaultMaxDepth,
   getMaxDuplicateRequests,
+  getMaxRequestsPerPage,
   getOrgRedactionSetting,
+  getSlowApiThresholdMs,
+  getSlowPageThresholdMs,
   getSsoConfig,
   getVisualDiffThresholdPercent,
   importProject,
@@ -25,11 +31,17 @@ import {
   setAccessibilityEnabled,
   setAccessibilityWcagLevel,
   setApiSchemaDefaultMode,
+  setAuthzTestingEnabled,
+  setExplorationDefaultMaxActions,
+  setExplorationDefaultMaxDepth,
   setBusinessRuleActive,
   setCriticalPath,
   setCostSavingMode,
   setMaxDuplicateRequests,
+  setMaxRequestsPerPage,
   setOrgRedactionSetting,
+  setSlowApiThresholdMs,
+  setSlowPageThresholdMs,
   setVisualDiffThresholdPercent,
   ssoCallback,
   submitSecondReviewerSignOff,
@@ -191,6 +203,64 @@ adminRouter.put("/org-settings/accessibility-wcag-level", requireRole("QA Lead")
   const { level } = req.body as { level?: string };
   try {
     res.json(setAccessibilityWcagLevel(String(level), req.user));
+  } catch (err: any) {
+    res.status(400).json(errBody(400, err.message));
+  }
+});
+
+// Phase 4b: performance thresholds.
+adminRouter.get("/org-settings/slow-api-threshold-ms", (_req, res) => {
+  res.json({ slow_api_threshold_ms: getSlowApiThresholdMs() });
+});
+adminRouter.put("/org-settings/slow-api-threshold-ms", requireRole("QA Lead"), (req, res) => {
+  try {
+    res.json(setSlowApiThresholdMs(Number(req.body?.ms), req.user));
+  } catch (err: any) {
+    res.status(400).json(errBody(400, err.message));
+  }
+});
+
+adminRouter.get("/org-settings/slow-page-threshold-ms", (_req, res) => {
+  res.json({ slow_page_threshold_ms: getSlowPageThresholdMs() });
+});
+adminRouter.put("/org-settings/slow-page-threshold-ms", requireRole("QA Lead"), (req, res) => {
+  try {
+    res.json(setSlowPageThresholdMs(Number(req.body?.ms), req.user));
+  } catch (err: any) {
+    res.status(400).json(errBody(400, err.message));
+  }
+});
+
+adminRouter.get("/org-settings/max-requests-per-page", (_req, res) => {
+  res.json({ max_requests_per_page: getMaxRequestsPerPage() });
+});
+adminRouter.put("/org-settings/max-requests-per-page", requireRole("QA Lead"), (req, res) => {
+  try {
+    res.json(setMaxRequestsPerPage(Number(req.body?.count), req.user));
+  } catch (err: any) {
+    res.status(400).json(errBody(400, err.message));
+  }
+});
+
+// Phase 4a: authz testing org-wide opt-in. Defaults off -- see
+// authzTestingService.ts's own doc comment for why this alone doesn't make
+// probes runnable (the target environment also needs a secondary identity).
+adminRouter.get("/org-settings/authz-testing-enabled", (_req, res) => {
+  res.json({ authz_testing_enabled: getAuthzTestingEnabled() });
+});
+adminRouter.put("/org-settings/authz-testing-enabled", requireRole("QA Lead"), (req, res) => {
+  res.json(setAuthzTestingEnabled(!!req.body?.enabled, req.user));
+});
+
+// Phase 4c: exploratory agent default budget.
+adminRouter.get("/org-settings/exploration-defaults", (_req, res) => {
+  res.json({ max_actions: getExplorationDefaultMaxActions(), max_depth: getExplorationDefaultMaxDepth() });
+});
+adminRouter.put("/org-settings/exploration-defaults", requireRole("QA Lead"), (req, res) => {
+  try {
+    if (req.body?.maxActions !== undefined) setExplorationDefaultMaxActions(Number(req.body.maxActions), req.user);
+    if (req.body?.maxDepth !== undefined) setExplorationDefaultMaxDepth(Number(req.body.maxDepth), req.user);
+    res.json({ max_actions: getExplorationDefaultMaxActions(), max_depth: getExplorationDefaultMaxDepth() });
   } catch (err: any) {
     res.status(400).json(errBody(400, err.message));
   }

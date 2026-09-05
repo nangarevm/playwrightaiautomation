@@ -1,0 +1,13 @@
+<!doctype html>
+<html>
+<head><title>Performance Fixture</title></head>
+<body>
+  <h1>Performance Fixture</h1>
+  <script>
+    // A slow API call (80ms, real server delay) -- for the slow-api-call threshold check.
+    fetch('/demo/api/slow').catch(() => {});
+    // Several extra requests -- for the excessive-request-count check.
+    for (let i = 0; i < 4; i++) fetch('/demo/api/products').catch(() => {});
+  </script>
+</body>
+</html>
