@@ -9,6 +9,10 @@
     fetch('/api/does-not-exist').catch(() => {});
     // Phase 1: an uncaught JS exception
     setTimeout(() => { undefinedFunctionThatDoesNotExist(); }, 50);
+    // Phase 2: a togglable API response (?variant=1|2 on THIS page's URL)
+    // for baseline-capture-then-drift-detection verification.
+    const variant = new URLSearchParams(location.search).get('variant') || '1';
+    fetch('/demo/api/orders?variant=' + variant).catch(() => {});
   </script>
 </body>
 </html>

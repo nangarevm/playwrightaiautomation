@@ -4,6 +4,7 @@ import { db } from '../src/db.ts';
 import { recordBugFinding, getBugFinding, listBugFindings, BUG_SCAN_CONFIG } from '../src/services/bugDetectionService.ts';
 import {
   inferShape,
+  mergeShape,
   diffShape,
   looksLikeErrorBody,
   checkAndRecordApiResponse,
@@ -75,19 +76,31 @@ test('recordBugFinding persists and round-trips the new category/viewport column
 
 // ---- apiSchemaService: shape inference + diff ----
 
-test('inferShape builds a recursive shape for nested objects/arrays', () => {
+test('inferShape builds a recursive shape for nested objects/arrays from a single sample', () => {
   const shape = inferShape({ id: 1, name: 'a', tags: ['x', 'y'], address: { city: 'Pune', zip: null } });
   assert.equal(shape.kind, 'object');
   assert.equal(shape.fields.id.kind, 'primitive');
-  assert.equal(shape.fields.id.type, 'number');
+  assert.deepEqual(shape.fields.id.types, ['number']);
   assert.equal(shape.fields.tags.kind, 'array');
-  assert.equal(shape.fields.tags.item.type, 'string');
+  assert.deepEqual(shape.fields.tags.item.types, ['string']);
   assert.equal(shape.fields.address.kind, 'object');
   assert.equal(shape.fields.address.fields.zip.kind, 'null');
+  assert.deepEqual(shape.optionalFields, []); // a single sample has no known-optional fields yet
 });
 
-test('diffShape flags missing fields, type mismatches, and unexpected nulls/fields', () => {
+test('mergeShape widens a type union and marks inconsistently-present fields optional', () => {
+  let acc = inferShape({ id: 1, total: 42.5, items: ['a'] });
+  acc = mergeShape(acc, inferShape({ id: 2, total: '42.5', items: ['a', 'b'] })); // total varies number/string
+  acc = mergeShape(acc, inferShape({ id: 3, items: [] })); // total absent this time
+
+  assert.deepEqual(new Set(acc.fields.total.types), new Set(['number', 'string']));
+  assert.ok(acc.optionalFields.includes('total'), 'total was absent in at least one sample, so it must be tracked as optional');
+  assert.ok(!acc.optionalFields.includes('id'), 'id was present in every sample, so it must NOT be optional');
+});
+
+test('diffShape flags missing fields, type mismatches, and unexpected nulls/fields -- but not variation already seen during baseline merging', () => {
   const baseline = inferShape({ id: 1, name: 'Alice', price: 9.99 });
+
   const actualMissing = inferShape({ id: 1, price: 9.99 });
   const missingIssues = diffShape(baseline, actualMissing);
   assert.ok(missingIssues.some((i) => i.kind === 'missing_field' && i.path === '$.name'));
@@ -108,6 +121,16 @@ test('diffShape flags missing fields, type mismatches, and unexpected nulls/fiel
   const nullableBaseline = inferShape({ id: 1, name: null });
   const stillNull = inferShape({ id: 1, name: null });
   assert.equal(diffShape(nullableBaseline, stillNull).length, 0);
+
+  // False-positive fix: a type merged in during baseline (e.g. price seen as
+  // both a number and a string across baseline samples) must NOT be flagged
+  // once strict, and a field baseline ever saw absent must NOT be flagged
+  // missing when it's absent again.
+  let widenedBaseline = inferShape({ id: 1, name: 'Alice', price: 9.99 });
+  widenedBaseline = mergeShape(widenedBaseline, inferShape({ id: 2, name: 'Bob', price: '9.99' }));
+  widenedBaseline = mergeShape(widenedBaseline, inferShape({ id: 3, price: 9.99 })); // name absent this time
+  assert.equal(diffShape(widenedBaseline, inferShape({ id: 4, name: 'Carol', price: '9.99' })).length, 0);
+  assert.equal(diffShape(widenedBaseline, inferShape({ id: 5, price: 9.99 })).length, 0); // name absent again -- known-optional
 });
 
 test('looksLikeErrorBody recognizes common error-shaped payloads', () => {
@@ -122,7 +145,7 @@ test('looksLikeErrorBody recognizes common error-shaped payloads', () => {
 
 // ---- apiSchemaService: end-to-end baseline capture + drift detection ----
 
-test('checkAndRecordApiResponse establishes a baseline on first sighting, then flags drift in strict mode', () => {
+test('checkAndRecordApiResponse establishes a baseline on first sighting, widens it across baseline sightings, then flags genuinely new drift once strict', () => {
   const endpoint = { method: 'GET', path: '/api/orders/123' };
   const first = checkAndRecordApiResponse({ ...endpoint, status: 200, body: { id: 1, total: 42.5, items: ['a'] } });
   assert.equal(first.length, 0); // nothing to compare against yet
@@ -131,15 +154,26 @@ test('checkAndRecordApiResponse establishes a baseline on first sighting, then f
   assert.ok(stored);
   assert.equal(stored.mode, 'baseline'); // org default
 
-  // baseline mode: drift is silently accepted, no findings
+  // baseline mode: a type variance (total as a string) is silently accepted
+  // AND absorbed into the stored shape -- not just silently ignored.
   const stillBaseline = checkAndRecordApiResponse({ ...endpoint, status: 200, body: { id: 1, total: '42.5', items: ['a'] } });
   assert.equal(stillBaseline.length, 0);
+  const widened = JSON.parse(getApiSchemaByKey('GET /api/orders/123').schema_json);
+  assert.deepEqual(new Set(widened.fields.total.types), new Set(['number', 'string']));
 
   updateApiSchemaMode(stored.id, 'strict');
-  const drifted = checkAndRecordApiResponse({ ...endpoint, status: 200, body: { id: 1, total: '42.5', items: ['a'] } });
+
+  // Re-sending a variant already observed during baseline must NOT flag --
+  // baseline mode already accepted this shape as correct.
+  const alreadySeen = checkAndRecordApiResponse({ ...endpoint, status: 200, body: { id: 1, total: '42.5', items: ['a'] } });
+  assert.equal(alreadySeen.length, 0);
+
+  // A genuinely new type (never observed during baseline) DOES flag.
+  const drifted = checkAndRecordApiResponse({ ...endpoint, status: 200, body: { id: 1, total: true, items: ['a'] } });
   assert.ok(drifted.some((f) => f.category === 'api-schema'));
   assert.equal(drifted[0].source, 'api_fuzz');
 
+  // total was present in EVERY baseline sample -- now genuinely missing.
   const missingField = checkAndRecordApiResponse({ ...endpoint, status: 200, body: { id: 1, items: ['a'] } });
   assert.ok(missingField.some((f) => f.detail.includes('total')));
 });

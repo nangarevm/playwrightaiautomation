@@ -103,6 +103,19 @@ app.use(idempotencyMiddleware); // SR-FR-0.4: replay the stored response for a r
 
 // Bundled demo app-under-test, so generated scripts have something real to run against
 app.use("/demo", express.static(path.join(__dirname, "demo-app")));
+// Deeper Bug Detection Phase 2 verification fixture: a togglable mock API
+// response (?variant=1|2) used by server/src/demo-app/buggy-fixture.html to
+// prove baseline-capture-then-drift-detection against a real endpoint, not a
+// hand-constructed body. Lives under /demo/ alongside the other demo-app
+// fixtures -- not part of the real API surface.
+app.get("/demo/api/orders", (req, res) => {
+  if (req.query.variant === "2") {
+    // Phase 2 demo: dropped `total`, changed `id` from number to string.
+    res.json({ id: "ord_1", items: ["a"] });
+  } else {
+    res.json({ id: 1, total: 42.5, items: ["a"] });
+  }
+});
 // FR-1.1: serve uploaded screenshots so the client can render real thumbnails
 app.use("/uploads", express.static(uploadDir));
 

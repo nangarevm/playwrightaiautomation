@@ -21,11 +21,28 @@ import { getApiSchemaDefaultMode } from "./adminService.js";
 
 export type SchemaMode = "baseline" | "strict";
 
+// Phase 2 config: the one tunable this check has, kept alongside the type
+// definitions rather than buried inline in diffShape.
+export const API_SCHEMA_CONFIG = {
+  // Caps the finding list for one comparison so a wildly different payload
+  // can't produce an unbounded number of bug_findings rows in one pass.
+  maxDiffIssuesPerResponse: 25,
+};
+
+// `types`/`optionalFields` (plural) rather than a single value is what makes
+// baseline mode genuinely mean "accept the current shape as correct" instead
+// of "freeze on whichever sample happened to arrive first": mergeShape below
+// widens both across every sample seen while an endpoint is in baseline mode,
+// so a field that's legitimately sometimes-a-different-type (an id that's a
+// number in one record, a string in another) or sometimes-absent (present
+// only when a promo/flag applies) is recorded as such -- and diffShape then
+// only flags a *genuinely new* type or a field that was *always* present
+// before, not variation baseline mode already observed and accepted.
 export type ShapeNode =
-  | { kind: "primitive"; type: "string" | "number" | "boolean"; nullable: boolean }
+  | { kind: "primitive"; types: Array<"string" | "number" | "boolean">; nullable: boolean }
   | { kind: "null" }
   | { kind: "array"; item: ShapeNode | null } // null item = empty array sample, shape unknown
-  | { kind: "object"; fields: Record<string, ShapeNode> };
+  | { kind: "object"; fields: Record<string, ShapeNode>; optionalFields: string[] }; // optionalFields: keys not present in every sample merged so far
 
 export interface ApiSchemaRow {
   id: string;
@@ -49,7 +66,7 @@ export interface SchemaDiffIssue {
   severity: BugSeverity;
 }
 
-/** Infer a structural shape from a parsed JSON value. Pure, no I/O. */
+/** Infer a structural shape from a single parsed JSON value/sample. Pure, no I/O. */
 export function inferShape(value: unknown): ShapeNode {
   if (value === null) return { kind: "null" };
   if (Array.isArray(value)) {
@@ -58,42 +75,83 @@ export function inferShape(value: unknown): ShapeNode {
   if (typeof value === "object") {
     const fields: Record<string, ShapeNode> = {};
     for (const [key, v] of Object.entries(value as Record<string, unknown>)) fields[key] = inferShape(v);
-    return { kind: "object", fields };
+    return { kind: "object", fields, optionalFields: [] };
   }
   if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
-    return { kind: "primitive", type: typeof value as "string" | "number" | "boolean", nullable: false };
+    return { kind: "primitive", types: [typeof value as "string" | "number" | "boolean"], nullable: false };
   }
   // undefined or an unsupported type (function/symbol/bigint) -- treat as an
   // opaque primitive so a diff against it never crashes, just reads oddly.
-  return { kind: "primitive", type: "string", nullable: false };
+  return { kind: "primitive", types: ["string"], nullable: false };
 }
 
 function shapeKindLabel(shape: ShapeNode | undefined): string {
   if (!shape) return "absent";
-  if (shape.kind === "primitive") return shape.type;
+  if (shape.kind === "primitive") return shape.types.join("|");
   return shape.kind;
 }
 
-/** Merge an actual-value's nullability into a stored primitive shape (baseline mode uses this to widen in place, see recordApiSchemaSighting). */
-function widenNullable(shape: ShapeNode): ShapeNode {
-  if (shape.kind === "primitive") return { ...shape, nullable: true };
-  return shape;
+/**
+ * Widen an accumulated (stored) shape with one more observed sample's shape.
+ * Called on every sighting while an endpoint is in 'baseline' mode, so the
+ * stored schema reflects everything actually seen (every type a field has
+ * taken, whether it's ever been absent) rather than just the first sample --
+ * see the ShapeNode doc comment above for why this matters.
+ */
+export function mergeShape(accumulated: ShapeNode, sample: ShapeNode): ShapeNode {
+  if (sample.kind === "null") {
+    return accumulated.kind === "primitive" ? { ...accumulated, nullable: true } : accumulated;
+  }
+  if (accumulated.kind === "null") {
+    return sample.kind === "primitive" ? { ...sample, nullable: true } : sample;
+  }
+  if (accumulated.kind === "primitive" && sample.kind === "primitive") {
+    return {
+      kind: "primitive",
+      types: Array.from(new Set([...accumulated.types, ...sample.types])),
+      nullable: accumulated.nullable || sample.nullable,
+    };
+  }
+  if (accumulated.kind === "object" && sample.kind === "object") {
+    const fields: Record<string, ShapeNode> = { ...accumulated.fields };
+    const optional = new Set(accumulated.optionalFields);
+    for (const key of Object.keys(sample.fields)) {
+      fields[key] = key in fields ? mergeShape(fields[key], sample.fields[key]) : sample.fields[key];
+      if (!(key in accumulated.fields)) optional.add(key); // wasn't in earlier samples -- optional
+    }
+    for (const key of Object.keys(accumulated.fields)) {
+      if (!(key in sample.fields)) optional.add(key); // was in earlier samples but missing from this one -- optional
+    }
+    return { kind: "object", fields, optionalFields: Array.from(optional) };
+  }
+  if (accumulated.kind === "array" && sample.kind === "array") {
+    if (!accumulated.item) return sample.item ? sample : accumulated;
+    if (!sample.item) return accumulated;
+    return { kind: "array", item: mergeShape(accumulated.item, sample.item) };
+  }
+  // A genuine kind mismatch (object vs array, etc.) while still in baseline
+  // mode -- there's no sensible way to merge these into one shape. Keep the
+  // accumulated shape; if this endpoint's responses are genuinely this
+  // unstable, switching it to strict mode will honestly surface that.
+  return accumulated;
 }
 
 /**
- * Diff an actual shape against a stored baseline shape. Recurses into nested
- * objects/arrays. Capped depth/breadth (MAX_ISSUES) so a wildly different
- * payload can't produce an unbounded finding list.
+ * Diff an actual shape against a stored (possibly baseline-widened) shape.
+ * Recurses into nested objects/arrays. Capped (API_SCHEMA_CONFIG.
+ * maxDiffIssuesPerResponse) so a wildly different payload can't produce an
+ * unbounded finding list.
  */
 export function diffShape(baseline: ShapeNode, actual: ShapeNode, path = "$"): SchemaDiffIssue[] {
   const issues: SchemaDiffIssue[] = [];
-  const MAX_ISSUES = 25;
+  const maxIssues = API_SCHEMA_CONFIG.maxDiffIssuesPerResponse;
 
   function walk(b: ShapeNode, a: ShapeNode, p: string) {
-    if (issues.length >= MAX_ISSUES) return;
+    if (issues.length >= maxIssues) return;
 
-    // Unexpected null: baseline never observed null here, actual is null.
-    if (a.kind === "null" && b.kind !== "null") {
+    // Unexpected null: baseline never observed null here (in any merged
+    // sample), actual is null.
+    if (a.kind === "null" && b.kind !== "null" && !(b.kind === "primitive" && b.nullable)) {
       issues.push({ path: p, kind: "unexpected_null", message: `${p} is null, but the baseline never observed a null value here (expected ${shapeKindLabel(b)})`, severity: "medium" });
       return;
     }
@@ -103,18 +161,22 @@ export function diffShape(baseline: ShapeNode, actual: ShapeNode, path = "$"): S
 
     if (b.kind === "object" && a.kind === "object") {
       for (const [key, bShape] of Object.entries(b.fields)) {
-        if (issues.length >= MAX_ISSUES) break;
+        if (issues.length >= maxIssues) break;
         const aShape = a.fields[key];
         if (aShape === undefined) {
-          issues.push({ path: `${p}.${key}`, kind: "missing_field", message: `${p}.${key} was present in the baseline response but is missing from this one`, severity: "high" });
+          // A field baseline saw only inconsistently (sometimes present,
+          // sometimes not) is known-optional, not a defect -- only flag a
+          // field that was present in EVERY merged baseline sample.
+          if (b.optionalFields.includes(key)) continue;
+          issues.push({ path: `${p}.${key}`, kind: "missing_field", message: `${p}.${key} was present in every baseline sample but is missing from this one`, severity: "high" });
           continue;
         }
         walk(bShape, aShape, `${p}.${key}`);
       }
       for (const key of Object.keys(a.fields)) {
-        if (issues.length >= MAX_ISSUES) break;
+        if (issues.length >= maxIssues) break;
         if (!(key in b.fields)) {
-          issues.push({ path: `${p}.${key}`, kind: "unexpected_field", message: `${p}.${key} is new -- not present in the baseline response`, severity: "low" });
+          issues.push({ path: `${p}.${key}`, kind: "unexpected_field", message: `${p}.${key} is new -- not present in any baseline sample`, severity: "low" });
         }
       }
       return;
@@ -125,8 +187,18 @@ export function diffShape(baseline: ShapeNode, actual: ShapeNode, path = "$"): S
       return;
     }
 
-    // Anything else reaching here is a genuine shape mismatch (object vs array,
-    // array vs primitive, string vs number, etc.).
+    if (b.kind === "primitive" && a.kind === "primitive") {
+      // A type the baseline has ever observed for this field (across every
+      // merged sample) is known-good, not drift -- e.g. an id that's a
+      // number in one record and a string in another.
+      if (!b.types.includes(a.types[0])) {
+        issues.push({ path: p, kind: "type_mismatch", message: `${p} was ${shapeKindLabel(b)} in the baseline, but is ${shapeKindLabel(a)} now`, severity: "high" });
+      }
+      return;
+    }
+
+    // Anything else reaching here is a genuine shape mismatch (object vs
+    // array, array vs primitive, etc.).
     const bLabel = shapeKindLabel(b);
     const aLabel = shapeKindLabel(a);
     if (bLabel !== aLabel) {
@@ -272,16 +344,31 @@ export function checkAndRecordApiResponse(input: ApiValidationInput): BugFinding
     return findings;
   }
 
-  db.prepare("UPDATE api_schemas SET seen_count = seen_count + 1, updated_at = ? WHERE id = ?").run(new Date().toISOString(), existing.id);
-  if (existing.mode === "baseline") return findings;
-
   let baselineShape: ShapeNode;
   try {
     baselineShape = JSON.parse(existing.schema_json);
   } catch {
+    db.prepare("UPDATE api_schemas SET seen_count = seen_count + 1, updated_at = ? WHERE id = ?").run(new Date().toISOString(), existing.id);
     return findings; // corrupted stored schema -- don't crash the scan over it
   }
 
+  if (existing.mode === "baseline") {
+    // Widen the stored shape with this sample rather than freezing on
+    // whichever sample happened to arrive first -- see mergeShape's doc
+    // comment. This is what makes "baseline: accept the current shape as
+    // correct" actually mean the shape observed across every sample, not
+    // just sample #1, so switching to strict mode later doesn't immediately
+    // false-positive on variation baseline mode already saw and accepted.
+    const widened = mergeShape(baselineShape, actualShape);
+    db.prepare("UPDATE api_schemas SET schema_json = ?, seen_count = seen_count + 1, updated_at = ? WHERE id = ?").run(
+      JSON.stringify(widened),
+      new Date().toISOString(),
+      existing.id
+    );
+    return findings;
+  }
+
+  db.prepare("UPDATE api_schemas SET seen_count = seen_count + 1, updated_at = ? WHERE id = ?").run(new Date().toISOString(), existing.id);
   const diffs = diffShape(baselineShape, actualShape);
   for (const d of diffs) {
     findings.push(
