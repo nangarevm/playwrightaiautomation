@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en">
+<head><title>Accessibility Fixture</title></head>
+<body>
+  <h1>Sign up</h1>
+
+  <!-- Missing alt text -->
+  <img src="/demo/logo-does-not-exist.png" width="80" height="80" />
+
+  <!-- Missing form label (input with no associated <label>, aria-label, or aria-labelledby) -->
+  <form>
+    <input type="text" id="email-field" name="email" />
+    <button type="submit">Submit</button>
+  </form>
+
+  <!-- Low-contrast text (light gray on white -- fails WCAG AA contrast ratio) -->
+  <p style="color: #eeeeee; background-color: #ffffff;">This text is very hard to read.</p>
+</body>
+</html>

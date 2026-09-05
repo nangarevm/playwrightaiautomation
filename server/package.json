@@ -13,6 +13,7 @@
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.32.1",
+    "@axe-core/playwright": "^4.13.0",
     "@playwright/test": "^1.47.0",
     "@types/nodemailer": "^8.0.1",
     "@types/pdfkit": "^0.17.6",

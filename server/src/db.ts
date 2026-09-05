@@ -876,6 +876,15 @@ ensureColumn("bug_findings", "root_cause_narrative", "TEXT"); // AI-generated pr
 ensureColumn("bug_findings", "root_cause_is_inferred", "INTEGER NOT NULL DEFAULT 0"); // 1 whenever root_cause_narrative is set; distinguishes AI inference from the deterministically-observed evidence/detail fields
 ensureColumn("bug_findings", "environment_info_json", "TEXT"); // browser/OS/viewport at capture time, for the bug-report template
 
+// Phase 2: accessibility testing (master prompt #12) -- axe-core injected
+// against the already-loaded page (accessibilityService.ts), same pattern as
+// every other check in scanScreenForUiBugs(). Enabled by default (unlike
+// visual/DOM ignore-lists) since axe-core's own rule engine has a much lower
+// false-positive rate than this codebase's hand-rolled heuristic checks.
+ensureColumn("screens", "accessibility_ignore_rules_json", "TEXT NOT NULL DEFAULT '[]'"); // axe rule IDs (e.g. "color-contrast") to suppress, per screen
+ensureColumn("org_settings", "accessibility_enabled", "INTEGER NOT NULL DEFAULT 1");
+ensureColumn("org_settings", "accessibility_wcag_level", "TEXT NOT NULL DEFAULT 'AA'"); // 'A' | 'AA' | 'AAA'
+
 db.exec(`
 -- API response schema capture/validation: one row per distinct "METHOD path"
 -- endpoint seen during a crawl/execution. First sighting stores the inferred

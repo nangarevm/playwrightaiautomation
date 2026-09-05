@@ -6,6 +6,8 @@ import {
   exportProject,
   getApiSchemaDefaultMode,
   getAuditRetentionPolicy,
+  getAccessibilityEnabled,
+  getAccessibilityWcagLevel,
   getCostSavingSetting,
   getMaxDuplicateRequests,
   getOrgRedactionSetting,
@@ -20,6 +22,8 @@ import {
   requireRole,
   routeTestCaseToOwner,
   sampleTestCasesForReReview,
+  setAccessibilityEnabled,
+  setAccessibilityWcagLevel,
   setApiSchemaDefaultMode,
   setBusinessRuleActive,
   setCriticalPath,
@@ -164,6 +168,29 @@ adminRouter.put("/org-settings/max-duplicate-requests", requireRole("QA Lead"), 
   const { count } = req.body as { count?: number };
   try {
     res.json(setMaxDuplicateRequests(Number(count), req.user));
+  } catch (err: any) {
+    res.status(400).json(errBody(400, err.message));
+  }
+});
+
+// Phase 2: accessibility (axe-core) on/off toggle and WCAG conformance level.
+adminRouter.get("/org-settings/accessibility-enabled", (_req, res) => {
+  res.json({ accessibility_enabled: getAccessibilityEnabled() });
+});
+
+adminRouter.put("/org-settings/accessibility-enabled", requireRole("QA Lead"), (req, res) => {
+  const { enabled } = req.body as { enabled?: boolean };
+  res.json(setAccessibilityEnabled(!!enabled, req.user));
+});
+
+adminRouter.get("/org-settings/accessibility-wcag-level", (_req, res) => {
+  res.json({ accessibility_wcag_level: getAccessibilityWcagLevel() });
+});
+
+adminRouter.put("/org-settings/accessibility-wcag-level", requireRole("QA Lead"), (req, res) => {
+  const { level } = req.body as { level?: string };
+  try {
+    res.json(setAccessibilityWcagLevel(String(level), req.user));
   } catch (err: any) {
     res.status(400).json(errBody(400, err.message));
   }

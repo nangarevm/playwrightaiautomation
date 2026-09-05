@@ -566,3 +566,39 @@ test('derivePriority never assigns P0/P1/P2 to a low-severity finding regardless
   assert.equal(derivePriority('high', 0.95), 'P1');
   assert.equal(derivePriority('medium', 0.95), 'P2');
 });
+
+// ---- Phase 2: accessibility config/CRUD (the actual axe-core call needs a
+// real browser -- verified live against server/src/demo-app/accessibility-fixture.html,
+// not repeated here, same pattern as the Phase 4 DOM-checks note above) ----
+
+import { getAccessibilityIgnoreRules, setAccessibilityIgnoreRules, ACCESSIBILITY_CONFIG } from '../src/services/accessibilityService.ts';
+import { getAccessibilityEnabled, setAccessibilityEnabled, getAccessibilityWcagLevel, setAccessibilityWcagLevel } from '../src/services/adminService.ts';
+
+test('accessibility_enabled defaults to true (unlike other ignore-lists) and is QA-Lead editable', () => {
+  assert.equal(getAccessibilityEnabled(), true);
+  setAccessibilityEnabled(false, undefined);
+  assert.equal(getAccessibilityEnabled(), false);
+  setAccessibilityEnabled(true, undefined); // restore default for other tests
+});
+
+test('accessibility_wcag_level defaults to AA and validates its allowed values', () => {
+  assert.equal(getAccessibilityWcagLevel(), 'AA');
+  setAccessibilityWcagLevel('AAA', undefined);
+  assert.equal(getAccessibilityWcagLevel(), 'AAA');
+  assert.throws(() => setAccessibilityWcagLevel('Z', undefined));
+  setAccessibilityWcagLevel('AA', undefined); // restore default for other tests
+});
+
+test('ACCESSIBILITY_CONFIG maps every axe impact level to a platform severity and caps findings per scan', () => {
+  assert.deepEqual(ACCESSIBILITY_CONFIG.impactSeverity, { critical: 'critical', serious: 'high', moderate: 'medium', minor: 'low' });
+  assert.ok(ACCESSIBILITY_CONFIG.maxIssuesPerScan > 0);
+  assert.deepEqual(ACCESSIBILITY_CONFIG.wcagTags.AA, ['wcag2a', 'wcag21a', 'wcag2aa', 'wcag21aa']);
+});
+
+test('per-screen accessibility ignore-rules round-trip, with validation', () => {
+  insertScreen('screen-a11y-ignore');
+  assert.deepEqual(getAccessibilityIgnoreRules('screen-a11y-ignore'), []);
+  setAccessibilityIgnoreRules('screen-a11y-ignore', ['color-contrast']);
+  assert.deepEqual(getAccessibilityIgnoreRules('screen-a11y-ignore'), ['color-contrast']);
+  assert.throws(() => setAccessibilityIgnoreRules('screen-a11y-ignore', 'not-an-array'));
+});

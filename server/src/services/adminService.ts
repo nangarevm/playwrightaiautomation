@@ -333,6 +333,38 @@ export function setMaxDuplicateRequests(count: number, updatedBy: CurrentUser | 
   return { max_duplicate_requests: getMaxDuplicateRequests() };
 }
 
+// Phase 2: accessibility testing on/off toggle. Defaults on, unlike the
+// visual/DOM ignore-lists -- axe-core's own rule engine has a much lower
+// false-positive rate than this codebase's hand-rolled heuristic checks, so
+// there's no comparable reason to default it off.
+export function getAccessibilityEnabled(): boolean {
+  const row = db.prepare("SELECT accessibility_enabled FROM org_settings WHERE id = 1").get() as { accessibility_enabled: number };
+  return !!row.accessibility_enabled;
+}
+
+export function setAccessibilityEnabled(enabled: boolean, updatedBy: CurrentUser | undefined) {
+  const now = new Date().toISOString();
+  db.prepare("UPDATE org_settings SET accessibility_enabled = ?, updated_by = ?, updated_at = ? WHERE id = 1").run(enabled ? 1 : 0, updatedBy?.id ?? null, now);
+  logAudit(updatedBy, "org_accessibility_enabled_changed", "org_settings", "1", { enabled });
+  return { accessibility_enabled: getAccessibilityEnabled() };
+}
+
+// Phase 2: which WCAG conformance level axe-core is run against.
+export function getAccessibilityWcagLevel(): "A" | "AA" | "AAA" {
+  const row = db.prepare("SELECT accessibility_wcag_level FROM org_settings WHERE id = 1").get() as { accessibility_wcag_level: "A" | "AA" | "AAA" };
+  return row.accessibility_wcag_level;
+}
+
+export function setAccessibilityWcagLevel(level: string, updatedBy: CurrentUser | undefined) {
+  if (level !== "A" && level !== "AA" && level !== "AAA") {
+    throw new Error("level must be 'A', 'AA', or 'AAA'");
+  }
+  const now = new Date().toISOString();
+  db.prepare("UPDATE org_settings SET accessibility_wcag_level = ?, updated_by = ?, updated_at = ? WHERE id = 1").run(level, updatedBy?.id ?? null, now);
+  logAudit(updatedBy, "org_accessibility_wcag_level_changed", "org_settings", "1", { level });
+  return { accessibility_wcag_level: getAccessibilityWcagLevel() };
+}
+
 // FR-2.11: QA-Lead-managed domain/business rules, persisted as a real entity
 // (previously a free-text string re-typed per generation call) so generation
 // can pull the active set automatically and a threshold demonstrably shows up

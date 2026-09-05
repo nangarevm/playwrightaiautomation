@@ -10,6 +10,7 @@ import {
   setVisualIgnoreSelectors,
 } from "../services/screensService.js";
 import { getDomCheckIgnoreSelectors, setDomCheckIgnoreSelectors } from "../services/domChecksService.js";
+import { getAccessibilityIgnoreRules, setAccessibilityIgnoreRules } from "../services/accessibilityService.js";
 import { queueExecution } from "../services/executionService.js";
 import { getVisualDiffThresholdPercent } from "../services/adminService.js";
 import { errBody } from "../errorCodes.js";
@@ -80,6 +81,23 @@ screensRouter.put("/:id/dom-check-ignore-selectors", (req, res) => {
   try {
     setDomCheckIgnoreSelectors(req.params.id, selectors ?? []);
     res.json({ selectors: getDomCheckIgnoreSelectors(req.params.id) });
+  } catch (err: any) {
+    res.status(400).json(errBody(400, err.message));
+  }
+});
+
+// Phase 2: per-screen axe-core rule IDs to suppress (e.g. a known,
+// reviewed-and-accepted "color-contrast" case on decorative text). Empty by
+// default; add your own rather than us guessing them.
+screensRouter.get("/:id/accessibility-ignore-rules", (req, res) => {
+  res.json({ rules: getAccessibilityIgnoreRules(req.params.id) });
+});
+
+screensRouter.put("/:id/accessibility-ignore-rules", (req, res) => {
+  const { rules } = req.body as { rules?: string[] };
+  try {
+    setAccessibilityIgnoreRules(req.params.id, rules ?? []);
+    res.json({ rules: getAccessibilityIgnoreRules(req.params.id) });
   } catch (err: any) {
     res.status(400).json(errBody(400, err.message));
   }

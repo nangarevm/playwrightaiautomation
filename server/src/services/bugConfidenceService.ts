@@ -37,6 +37,7 @@ export const CONFIDENCE_CONFIG = {
     "ui-dom": 0.05, // overlap/off-viewport heuristics carry real false-positive risk
     "ui-visual": 0.02, // pixel-diff is the noisiest signal in this codebase (animations, timestamps)
     functional: 0.1,
+    accessibility: 0.14, // axe-core is a maintained rule engine, not a hand-rolled heuristic -- more precise than most checks here
   } as Record<BugCategory, number>,
   reproducedBonus: 0.15, // reproducibility_successes > 1 (seen again on a later scan, not a one-off)
   correlatedBonus: 0.1, // corroborated by an independent signal in the same scan (bugCorrelationService)

@@ -21,14 +21,14 @@ import { fileGenericBug } from "./integrationsService.js";
 import type { SpellingIssue } from "../crawler/types.js";
 import { originOf, normalizeUrl } from "../crawler/urlUtils.js";
 import { isLikelyApiResponse } from "../crawler/network.js";
-import { analyzeVisualDifferences, detectImageLoadingIssues, detectTextRenderingIssues } from "./visualDetectionService.js";
 import { analyzeConsoleError, summarizeErrors, groupErrorsByCategory, detectRelatedErrors, type ConsoleError } from "./consoleErrorService.js";
 import { validateInteraction, validateInteractionSequence, detectInteractionPatterns, type InteractionEvent } from "./interactionValidationService.js";
 import { checkAndRecordApiResponse } from "./apiSchemaService.js";
 import { runDomChecks, getDomCheckIgnoreSelectors } from "./domChecksService.js";
 import { checkUiApiConsistency } from "./uiApiConsistencyService.js";
-import { getVisualDiffThresholdPercent, getMaxDuplicateRequests } from "./adminService.js";
+import { getVisualDiffThresholdPercent, getMaxDuplicateRequests, getAccessibilityEnabled } from "./adminService.js";
 import { runResponsiveBugScan } from "./responsiveService.js";
+import { runAccessibilityChecks, getAccessibilityIgnoreRules } from "./accessibilityService.js";
 import { computeFingerprint } from "./bugFingerprintService.js";
 import { correlateFindings } from "./bugCorrelationService.js";
 import { scoreConfidence, derivePriority, type BugPriority } from "./bugConfidenceService.js";
@@ -58,7 +58,8 @@ export type BugSource = "ui_exploratory" | "api_fuzz" | "regression";
 //                          overlap/text-overflow/off-viewport checks (domChecksService.ts)
 //   ui-api-mismatch     <- a declared UI-count-vs-API-count rule disagreed
 //                          (uiApiConsistencyService.ts)
-export type BugCategory = "console-error" | "api-status" | "api-schema" | "ui-visual" | "ui-dom" | "ui-api-mismatch" | "functional";
+//   accessibility         <- an axe-core WCAG rule violation (accessibilityService.ts)
+export type BugCategory = "console-error" | "api-status" | "api-schema" | "ui-visual" | "ui-dom" | "ui-api-mismatch" | "functional" | "accessibility";
 
 export interface BugFindingInput {
   source: BugSource;
@@ -904,6 +905,38 @@ ${Object.entries(grouped)
           screenshotUrl,
         })
       );
+    }
+
+    // Phase 2: accessibility (axe-core), on the already-loaded page -- same
+    // "no extra navigation" discipline as the DOM checks above. Enabled by
+    // default (org_settings.accessibility_enabled), unlike the ignore-lists
+    // above, since axe-core's own rule engine has a much lower false-
+    // positive rate than this codebase's hand-rolled heuristics.
+    if (getAccessibilityEnabled()) {
+      const a11yIssues = await runAccessibilityChecks(page, screenId ? getAccessibilityIgnoreRules(screenId) : []);
+      for (const issue of a11yIssues) {
+        const screenshotUrl = await screenshotNow();
+        findings.push(
+          recordBugFinding({
+            source: "ui_exploratory",
+            category: "accessibility",
+            severity: issue.severity,
+            title: `Accessibility: ${issue.description} on ${screen.name} (${viewport.name})`,
+            detail: `axe-core rule "${issue.ruleId}" (impact: ${issue.impact}) -- ${issue.nodeCount} element(s) affected. ${issue.helpUrl}`,
+            screenId,
+            runId,
+            viewport: viewport.name,
+            evidence: { ruleId: issue.ruleId, impact: issue.impact, helpUrl: issue.helpUrl, targets: issue.targets, nodeCount: issue.nodeCount },
+            stepsToReproduce: [
+              ...baseSteps,
+              `Run an axe-core (or equivalent) accessibility audit.`,
+              `Observe: rule "${issue.ruleId}" fails on ${issue.nodeCount} element(s), e.g. ${issue.targets[0] || "n/a"}.`,
+              `See: ${issue.helpUrl}`,
+            ],
+            screenshotUrl,
+          })
+        );
+      }
     }
 
     // Deeper Bug Detection #2: validate each captured API response's schema
