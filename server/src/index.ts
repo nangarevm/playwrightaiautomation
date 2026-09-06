@@ -35,6 +35,7 @@ import { metamorphicTestingRouter } from "./routes/metamorphicTesting.js";
 import { chaosExplorationRouter } from "./routes/chaosExploration.js";
 import { testPriorityRouter } from "./routes/testPriority.js";
 import { qualityIntelligenceRouter } from "./routes/qualityIntelligence.js";
+import { bugVerificationRouter } from "./routes/bugVerification.js";
 import { authzTestingRouter } from "./routes/authzTesting.js";
 import { exploratoryAgentRouter } from "./routes/exploratoryAgent.js";
 import { openApiContractsRouter } from "./routes/openApiContracts.js";
@@ -163,6 +164,17 @@ app.post("/demo/api/order-fail", (_req, res) => {
 // against a real measured response time, not a hand-constructed number.
 app.get("/demo/api/slow", (_req, res) => {
   setTimeout(() => res.json({ ok: true }), 80);
+});
+// §38/§39 Bug Verification Engine verification fixture: an in-memory,
+// server-side (NOT per-page-load) counter that alternates odd/even across
+// successive requests -- used by flaky-fixture.html to simulate a genuinely
+// intermittent client-side error, so verifyFinding's FLAKY classification
+// can be proven against a real, reproducible-on-demand alternating signal
+// rather than a hand-constructed one.
+let flakyCounterHits = 0;
+app.get("/demo/api/flaky-counter", (_req, res) => {
+  flakyCounterHits++;
+  res.json({ parity: flakyCounterHits % 2 === 1 ? "odd" : "even" });
 });
 // Phase 4a verification fixture: a deliberately buggy "owner-only" resource --
 // it checks only that SOME valid credential was supplied, never that the
@@ -332,6 +344,7 @@ app.use("/api/metamorphic-testing", metamorphicTestingRouter);
 app.use("/api/chaos-exploration", chaosExplorationRouter);
 app.use("/api/test-priority", testPriorityRouter);
 app.use("/api/quality-intelligence", qualityIntelligenceRouter);
+app.use("/api/bug-verification", bugVerificationRouter);
 // Embedded Allure report viewer (Phase 8 step 5): served statically so the
 // client can open it in an <iframe> instead of requiring download/unzip/open.
 app.use("/allure-report", express.static(path.join(__dirname, "..", "allure-report")));

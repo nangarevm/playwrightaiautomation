@@ -1,0 +1,22 @@
+<!doctype html>
+<html>
+<head><title>Flaky Fixture</title></head>
+<body>
+  <h1>Flaky Fixture</h1>
+  <script>
+    // Deliberately throws only when the server-side hit counter is odd --
+    // genuinely intermittent across successive page loads, simulating a
+    // real flaky client-side bug (e.g. a race condition that only loses
+    // sometimes) for verifyFinding's FLAKY classification to prove itself
+    // against, rather than a fixture that's either always-broken or
+    // always-clean.
+    fetch('/demo/api/flaky-counter')
+      .then((res) => res.json())
+      .then((data) => {
+        if (data.parity === 'odd') {
+          throw new Error('Intermittent failure: flaky-fixture odd-parity error');
+        }
+      });
+  </script>
+</body>
+</html>
