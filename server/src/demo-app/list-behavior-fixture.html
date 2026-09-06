@@ -1,0 +1,135 @@
+<!doctype html>
+<html>
+<head><title>List Behavior Fixture</title></head>
+<body>
+  <h1>List Behavior Fixture</h1>
+
+  <!-- §F Search section. ?searchBug=1 makes the search substring-match
+       ONLY the item name but ALSO always includes one hard-coded item
+       ("Zucchini") regardless of the query -- an irrelevant-result bug.
+       ?clearBug=1 makes "clearing" the search forget to restore the full
+       list (stuck-filter bug). -->
+  <input id="search-input" type="text" />
+  <div id="search-no-results" style="display:none">No results found.</div>
+  <ul id="search-list"></ul>
+
+  <!-- §G Filter section: two independent checkboxes ("In Stock", "On Sale").
+       ?filterBug=1 makes combining both checkboxes behave as OR instead of
+       AND (shows the union instead of the intersection). -->
+  <label><input type="checkbox" id="filter-in-stock" /> In Stock</label>
+  <label><input type="checkbox" id="filter-on-sale" /> On Sale</label>
+  <button id="clear-filters">Clear filters</button>
+  <ul id="filter-list"></ul>
+
+  <!-- §G Sort section. ?sortBug=1 makes the "Sort by price" button sort by
+       name instead of price (a wrong-column sort bug). -->
+  <button id="sort-by-price">Sort by price (ascending)</button>
+  <ul id="sort-list"></ul>
+
+  <!-- §H Pagination section: 12 items, page size 5. ?paginationBug=dup
+       makes page 2 accidentally repeat the last item of page 1 (an
+       off-by-one bug). ?paginationBug=stuck makes "Next" not actually
+       advance past page 1. -->
+  <ul id="page-list"></ul>
+  <button id="next-page">Next</button>
+
+  <script>
+    const params = new URLSearchParams(location.search);
+    const searchBug = params.get('searchBug') === '1';
+    const clearBug = params.get('clearBug') === '1';
+    const filterBug = params.get('filterBug') === '1';
+    const sortBug = params.get('sortBug') === '1';
+    const paginationBug = params.get('paginationBug'); // 'dup' | 'stuck' | null
+
+    // ---- Search ----
+    const produce = ['Apple', 'Banana', 'Cherry', 'Date', 'Zucchini'];
+    function renderSearch(query) {
+      let results = produce;
+      if (query) {
+        results = produce.filter((p) => p.toLowerCase().includes(query.toLowerCase()));
+        if (searchBug) results = [...new Set([...results, 'Zucchini'])]; // bug: always injects an irrelevant item
+      }
+      document.getElementById('search-list').innerHTML = results.map((p) => `<li class="search-item">${p}</li>`).join('');
+      document.getElementById('search-no-results').style.display = results.length === 0 ? 'block' : 'none';
+    }
+    document.getElementById('search-input').addEventListener('keydown', (e) => {
+      if (e.key !== 'Enter') return;
+      const query = e.target.value;
+      if (query === '' && clearBug) return; // bug: clearing the box does nothing, list stays filtered
+      renderSearch(query);
+    });
+    renderSearch('');
+
+    // ---- Filter ----
+    const catalog = [
+      { name: 'Widget A', inStock: true, onSale: true },
+      { name: 'Widget B', inStock: true, onSale: false },
+      { name: 'Widget C', inStock: false, onSale: true },
+      { name: 'Widget D', inStock: false, onSale: false },
+      { name: 'Widget E', inStock: true, onSale: true },
+    ];
+    function renderFilter() {
+      const inStock = document.getElementById('filter-in-stock').checked;
+      const onSale = document.getElementById('filter-on-sale').checked;
+      let results = catalog;
+      if (inStock && onSale) {
+        results = filterBug ? catalog.filter((c) => c.inStock || c.onSale) : catalog.filter((c) => c.inStock && c.onSale);
+      } else if (inStock) {
+        results = catalog.filter((c) => c.inStock);
+      } else if (onSale) {
+        results = catalog.filter((c) => c.onSale);
+      }
+      document.getElementById('filter-list').innerHTML = results.map((c) => `<li class="filter-item">${c.name}</li>`).join('');
+    }
+    document.getElementById('filter-in-stock').addEventListener('change', renderFilter);
+    document.getElementById('filter-on-sale').addEventListener('change', renderFilter);
+    document.getElementById('clear-filters').addEventListener('click', () => {
+      document.getElementById('filter-in-stock').checked = false;
+      document.getElementById('filter-on-sale').checked = false;
+      renderFilter();
+    });
+    renderFilter();
+
+    // ---- Sort ----
+    // Deliberately chosen so alphabetical name order is the REVERSE of price
+    // order -- sorting by name when price was requested must show up as a
+    // clear violation, not coincidentally look correct.
+    const priced = [
+      { name: 'Zeta', price: 10 },
+      { name: 'Mid', price: 20 },
+      { name: 'Alpha', price: 30 },
+    ];
+    function renderSort(sorted) {
+      document.getElementById('sort-list').innerHTML = sorted.map((p) => `<li class="sort-item"><span class="sort-value">${p.price}</span> ${p.name}</li>`).join('');
+    }
+    renderSort(priced);
+    document.getElementById('sort-by-price').addEventListener('click', () => {
+      const key = sortBug ? 'name' : 'price';
+      const sorted = [...priced].sort((a, b) => (a[key] > b[key] ? 1 : a[key] < b[key] ? -1 : 0));
+      renderSort(sorted);
+    });
+
+    // ---- Pagination ----
+    const allItems = Array.from({ length: 12 }, (_, i) => `Item ${i + 1}`);
+    const pageSize = 5;
+    let currentPage = 1;
+    function renderPage() {
+      let items;
+      if (paginationBug === 'stuck') {
+        items = allItems.slice(0, pageSize); // bug: always page 1's items regardless of currentPage
+      } else if (paginationBug === 'dup') {
+        const start = (currentPage - 1) * pageSize - (currentPage > 1 ? 1 : 0); // bug: off-by-one repeats the previous page's last item
+        items = allItems.slice(Math.max(0, start), Math.max(0, start) + pageSize);
+      } else {
+        items = allItems.slice((currentPage - 1) * pageSize, currentPage * pageSize);
+      }
+      document.getElementById('page-list').innerHTML = items.map((i) => `<li class="page-item">${i}</li>`).join('');
+    }
+    document.getElementById('next-page').addEventListener('click', () => {
+      currentPage++;
+      renderPage();
+    });
+    renderPage();
+  </script>
+</body>
+</html>

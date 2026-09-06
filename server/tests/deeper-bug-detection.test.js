@@ -1244,3 +1244,22 @@ test('classifyCrossBrowserFindings ignores a finding with no fingerprint rather 
   assert.equal(result.common.length, 0);
   assert.equal(result.browserSpecific.length, 0);
 });
+
+// ---- Playbook §F/§G/§H: Search, Filter/Sort, Pagination (config defaults
+// -- pure logic; runSearchScenario/runFilterScenario/runSortScenario/
+// runPaginationScenario themselves launch a real browser and were live-
+// verified separately against server/src/demo-app/list-behavior-fixture.html:
+// an irrelevant-result search bug, a stuck-filter-on-clear bug, an OR-
+// instead-of-AND combined-filter bug, a wrong-column sort bug, a duplicate-
+// item-across-pages pagination bug, and a stuck-"next"-button pagination bug
+// each produced exactly the expected finding, while the correct/well-behaved
+// counterpart of each produced ZERO findings -- confirming no false
+// positives across all four scenario types.) ----
+
+import { LIST_BEHAVIOR_CONFIG } from '../src/services/listBehaviorTestingService.ts';
+
+test('LIST_BEHAVIOR_CONFIG has sane defaults for grace period, nav timeout, and the pagination page cap', () => {
+  assert.ok(LIST_BEHAVIOR_CONFIG.graceMs > 0);
+  assert.ok(LIST_BEHAVIOR_CONFIG.navTimeoutMs > 0);
+  assert.ok(LIST_BEHAVIOR_CONFIG.maxPages > 1, 'maxPages must allow at least a next-page click, or pagination scenarios could never detect anything');
+});
