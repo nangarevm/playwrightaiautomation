@@ -1263,3 +1263,25 @@ test('LIST_BEHAVIOR_CONFIG has sane defaults for grace period, nav timeout, and 
   assert.ok(LIST_BEHAVIOR_CONFIG.navTimeoutMs > 0);
   assert.ok(LIST_BEHAVIOR_CONFIG.maxPages > 1, 'maxPages must allow at least a next-page click, or pagination scenarios could never detect anything');
 });
+
+// ---- Playbook §T/§U: File Upload/Download testing (config defaults --
+// pure logic; runFileUploadScenario/runFileDownloadScenario themselves
+// launch a real browser and were live-verified separately against
+// server/src/demo-app/file-transfer-fixture.html: a valid .txt upload and a
+// correctly-rejected invalid .exe upload against the correct app each
+// produced ZERO findings, while the same invalid .exe silently ACCEPTED by
+// a deliberately buggy app (client-side validation gap) produced a critical
+// finding; a correct CSV blob download with expected content produced ZERO
+// findings, while an emptied-out download and a broken download link
+// (removed href, never fires the browser's download event) each produced
+// the expected finding.) ----
+
+import { FILE_TRANSFER_CONFIG } from '../src/services/fileTransferTestingService.ts';
+
+test('FILE_TRANSFER_CONFIG has sane defaults for grace/nav/download timeouts and non-empty indicator selector lists', () => {
+  assert.ok(FILE_TRANSFER_CONFIG.graceMs > 0);
+  assert.ok(FILE_TRANSFER_CONFIG.navTimeoutMs > 0);
+  assert.ok(FILE_TRANSFER_CONFIG.downloadTimeoutMs > 0);
+  assert.ok(FILE_TRANSFER_CONFIG.successIndicatorSelectors.length > 0);
+  assert.ok(FILE_TRANSFER_CONFIG.errorIndicatorSelectors.length > 0);
+});

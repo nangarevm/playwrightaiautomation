@@ -1,0 +1,47 @@
+<!doctype html>
+<html>
+<head><title>File Transfer Fixture</title></head>
+<body>
+  <h1>File Transfer Fixture</h1>
+
+  <!-- §T Upload section. ?uploadBug=accept-invalid makes the "type check"
+       accept ANY file regardless of extension (a client-side validation
+       gap). Default behavior correctly rejects anything not ending in
+       .txt. -->
+  <input id="file-input" type="file" />
+  <button id="upload-submit">Upload</button>
+  <div id="upload-success" class="success" style="display:none">Upload successful.</div>
+  <div id="upload-error" role="alert" class="error" style="display:none">Only .txt files are allowed.</div>
+
+  <!-- §U Download section: a real Blob-based download (no server round
+       trip needed for the fixture). ?downloadBug=empty makes the exported
+       file empty content. ?downloadBug=none removes the download attribute
+       entirely, so clicking does nothing (broken-link simulation). -->
+  <a id="download-link" href="#" download="report.csv">Download report</a>
+
+  <script>
+    const params = new URLSearchParams(location.search);
+    const uploadBug = params.get('uploadBug'); // 'accept-invalid' | null
+    const downloadBug = params.get('downloadBug'); // 'empty' | 'none' | null
+
+    document.getElementById('upload-submit').addEventListener('click', () => {
+      const input = document.getElementById('file-input');
+      const file = input.files[0];
+      if (!file) return;
+      const isValid = uploadBug === 'accept-invalid' ? true : file.name.endsWith('.txt');
+      document.getElementById('upload-success').style.display = isValid ? 'block' : 'none';
+      document.getElementById('upload-error').style.display = isValid ? 'none' : 'block';
+    });
+
+    const csvContent = downloadBug === 'empty' ? '' : 'id,name,total\n1,Widget A,42.50\n2,Widget B,17.00\n';
+    const link = document.getElementById('download-link');
+    if (downloadBug === 'none') {
+      link.removeAttribute('download');
+      link.removeAttribute('href');
+    } else {
+      const blob = new Blob([csvContent], { type: 'text/csv' });
+      link.href = URL.createObjectURL(blob);
+    }
+  </script>
+</body>
+</html>
