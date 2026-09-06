@@ -33,6 +33,12 @@ export function attachUser(req: Request, res: Response, next: NextFunction) {
       if (row.sso_disabled_at) {
         return res.status(403).json(errBody(403, "This user's access has been disabled by the identity provider (FR-8.9)"));
       }
+      // User activity dashboard: stamp last_seen_at on every resolved request --
+      // "online" is derived from this at read time (getUserActivityDashboard),
+      // not tracked via a separate session/heartbeat mechanism (there is no
+      // real login/session system here, see this function's own header-based
+      // stand-in above).
+      db.prepare("UPDATE users SET last_seen_at = ? WHERE id = ?").run(new Date().toISOString(), row.id);
       req.user = { id: row.id, name: row.name, role: row.role };
       return next();
     }
@@ -129,6 +135,62 @@ export function listAuditLog(filters: { entityType?: string; entityId?: string; 
 
 export function listUsers() {
   return db.prepare("SELECT * FROM users ORDER BY created_at ASC").all();
+}
+
+// A user counts as "online" if attachUser stamped their last_seen_at within
+// this window -- there is no real session/heartbeat here (see attachUser's
+// own header-based-stand-in note), so "online" is necessarily an inference
+// from recent request activity, not a certainty that a browser tab is still
+// open. Configurable via env for anyone tuning it against their own request
+// cadence; the 5-minute default assumes a real user issues at least one
+// request that often while actively using the app.
+const USER_ONLINE_WINDOW_MS = (Number(process.env.USER_ONLINE_WINDOW_MINUTES) || 5) * 60 * 1000;
+
+export interface UserActivitySummary {
+  id: string;
+  name: string;
+  role: Role;
+  email: string | null;
+  disabled: boolean;
+  lastSeenAt: string | null;
+  isOnline: boolean;
+  totalActionCount: number;
+  lastAction: { action: string; entityType: string; createdAt: string } | null;
+}
+
+// FR-8.1/FR-8.3, combined: who's currently active, and what they've been
+// doing -- joins the users table's own last_seen_at (stamped by attachUser)
+// with a per-user rollup of their existing audit_log history, rather than
+// introducing a second, parallel activity-tracking mechanism.
+export function getUserActivityDashboard(): UserActivitySummary[] {
+  const users = db.prepare("SELECT * FROM users ORDER BY name ASC").all() as any[];
+  const now = Date.now();
+  const countStmt = db.prepare("SELECT COUNT(*) as c FROM audit_log WHERE actor_user_id = ?");
+  const lastActionStmt = db.prepare("SELECT action, entity_type, created_at FROM audit_log WHERE actor_user_id = ? ORDER BY created_at DESC LIMIT 1");
+
+  const summaries = users.map((u): UserActivitySummary => {
+    const isOnline = !!u.last_seen_at && now - new Date(u.last_seen_at).getTime() <= USER_ONLINE_WINDOW_MS;
+    const totalActionCount = (countStmt.get(u.id) as any).c as number;
+    const lastActionRow = lastActionStmt.get(u.id) as any;
+    return {
+      id: u.id,
+      name: u.name,
+      role: u.role,
+      email: u.email ?? null,
+      disabled: !!u.sso_disabled_at,
+      lastSeenAt: u.last_seen_at ?? null,
+      isOnline,
+      totalActionCount,
+      lastAction: lastActionRow ? { action: lastActionRow.action, entityType: lastActionRow.entity_type, createdAt: lastActionRow.created_at } : null,
+    };
+  });
+
+  // Online users first, then most-recently-seen -- the two things a QA Lead
+  // actually scanning this list cares about, in that order.
+  return summaries.sort((a, b) => {
+    if (a.isOnline !== b.isOnline) return a.isOnline ? -1 : 1;
+    return (b.lastSeenAt ?? "").localeCompare(a.lastSeenAt ?? "");
+  });
 }
 
 export function createUser(input: { name: string; role: Role; email?: string; owned_modules?: string }) {

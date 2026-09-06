@@ -2,7 +2,9 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { db } from '../src/db.ts';
 import {
+  attachUser,
   createUser,
+  getUserActivityDashboard,
   listAuditLog,
   listFlaggedForReReview,
   listUsers,
@@ -108,4 +110,81 @@ test('sampleTestCasesForReReview flags previously approved cases and listFlagged
   const flagged = listFlaggedForReReview();
   assert.equal(flagged.length, 2);
   assert.ok(flagged.every((row) => row.flagged_for_re_review === 1));
+});
+
+// -- User activity dashboard ("who's logged in / what are they doing") -----
+
+function fakeReq(headerId) {
+  return {
+    headers: { 'x-user-id': headerId },
+    header(name) {
+      return this.headers[name.toLowerCase()];
+    },
+  };
+}
+
+function fakeRes() {
+  return {
+    statusCode: 200,
+    body: undefined,
+    status(code) {
+      this.statusCode = code;
+      return this;
+    },
+    json(payload) {
+      this.body = payload;
+      return this;
+    },
+  };
+}
+
+test('attachUser stamps last_seen_at on the resolved user row', () => {
+  const before = db.prepare('SELECT last_seen_at FROM users WHERE id = ?').get('user-tester').last_seen_at;
+  const req = fakeReq('user-tester');
+  const res = fakeRes();
+  let calledNext = false;
+  attachUser(req, res, () => {
+    calledNext = true;
+  });
+  assert.ok(calledNext, 'attachUser must call next() for a valid, non-disabled user');
+  assert.equal(req.user.id, 'user-tester');
+  const after = db.prepare('SELECT last_seen_at FROM users WHERE id = ?').get('user-tester').last_seen_at;
+  assert.ok(after, 'last_seen_at must be set after attachUser resolves a real user');
+  assert.notEqual(after, before);
+});
+
+test('getUserActivityDashboard marks a just-stamped user online and a never-seen user offline, sorted online-first', () => {
+  attachUser(fakeReq('user-tester'), fakeRes(), () => {});
+
+  const activity = getUserActivityDashboard();
+  const tester = activity.find((u) => u.id === 'user-tester');
+  const developer = activity.find((u) => u.id === 'user-developer');
+
+  assert.ok(tester.isOnline, 'a user attachUser just stamped must read as online');
+  assert.ok(tester.lastSeenAt);
+  assert.ok(!developer.isOnline, 'a user with no last_seen_at must read as offline');
+  assert.equal(developer.lastSeenAt, null);
+
+  const testerIndex = activity.findIndex((u) => u.id === 'user-tester');
+  const developerIndex = activity.findIndex((u) => u.id === 'user-developer');
+  assert.ok(testerIndex < developerIndex, 'online users must sort before offline users');
+});
+
+test('getUserActivityDashboard rolls up audit_log into totalActionCount and lastAction', () => {
+  logAudit({ id: 'user-qa-lead', name: 'Priya', role: 'QA Lead' }, 'test_case_routed', 'test_case', 'tc-1', { note: 'x' });
+  logAudit({ id: 'user-qa-lead', name: 'Priya', role: 'QA Lead' }, 'critical_path_flagged', 'test_case', 'tc-1', { critical: true });
+
+  const activity = getUserActivityDashboard();
+  const qaLead = activity.find((u) => u.id === 'user-qa-lead');
+  assert.equal(qaLead.totalActionCount, 2);
+  assert.equal(qaLead.lastAction.action, 'critical_path_flagged');
+  assert.equal(qaLead.lastAction.entityType, 'test_case');
+});
+
+test('getUserActivityDashboard reports disabled: true once an SSO-disabled user is present', () => {
+  db.prepare('UPDATE users SET sso_disabled_at = ? WHERE id = ?').run(new Date().toISOString(), 'user-manager');
+  const activity = getUserActivityDashboard();
+  const manager = activity.find((u) => u.id === 'user-manager');
+  assert.equal(manager.disabled, true);
+  db.prepare('UPDATE users SET sso_disabled_at = NULL WHERE id = ?').run('user-manager'); // restore for other tests
 });

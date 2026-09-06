@@ -591,6 +591,12 @@ ensureColumn("users", "sso_subject_id", "TEXT");
 ensureColumn("users", "sso_provider", "TEXT");
 ensureColumn("users", "sso_disabled_at", "TEXT"); // set when the IdP disables the user; revokes platform access
 
+// User activity dashboard: stamped by attachUser (adminService.ts) on every
+// request resolved to a real user -- "online" is derived from this at read
+// time (see getUserActivityDashboard) rather than stored as its own flag, so
+// there's nothing to expire/clean up when a user simply stops making requests.
+ensureColumn("users", "last_seen_at", "TEXT");
+
 // FR-8.11: audit log retention window (immutability is enforced at the route layer -- no
 // UPDATE/DELETE route exists for audit_log at all, see routes/admin.ts)
 ensureColumn("audit_log", "retain_until", "TEXT");

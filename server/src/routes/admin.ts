@@ -12,6 +12,7 @@ import {
   getCostSavingSetting,
   getExplorationDefaultMaxActions,
   getExplorationDefaultMaxDepth,
+  getUserActivityDashboard,
   getVisualAiReasoningEnabled,
   getMaxDuplicateRequests,
   getMaxRequestsPerPage,
@@ -71,6 +72,13 @@ adminRouter.post("/users", requireRole("QA Lead"), (req, res) => {
 // FR-8.3: audit log across modules
 adminRouter.get("/audit-log", requireRole("QA Lead"), (req, res) => {
   res.json(listAuditLog({ entityType: req.query.entityType as string, entityId: req.query.entityId as string, limit: req.query.limit ? Number(req.query.limit) : undefined }));
+});
+
+// FR-8.1/FR-8.3: who's currently online (last_seen_at, stamped by attachUser
+// on every request) and their audit_log activity rollup -- the "which user
+// is logged in / what are they doing" dashboard.
+adminRouter.get("/user-activity", requireRole("QA Lead"), (_req, res) => {
+  res.json(getUserActivityDashboard());
 });
 
 // FR-8.5: route a test case to its owning tester/team

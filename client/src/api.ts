@@ -391,6 +391,7 @@ export const api = {
     req("/admin/users", { method: "POST", body: JSON.stringify(payload) }),
   listAuditLog: (params?: { entityType?: string; entityId?: string }) =>
     req(`/admin/audit-log${params ? `?${new URLSearchParams(params as Record<string, string>).toString()}` : ""}`),
+  getUserActivity: () => req("/admin/user-activity"),
   routeTestCaseToOwner: (testCaseId: string) => req(`/admin/test-cases/${testCaseId}/route-owner`, { method: "POST" }),
   setCriticalPath: (testCaseId: string, critical: boolean) =>
     req(`/admin/test-cases/${testCaseId}/critical-path`, { method: "POST", body: JSON.stringify({ critical }) }),
