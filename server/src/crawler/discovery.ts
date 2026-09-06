@@ -6,10 +6,10 @@
 // visited-URL set to avoid infinite loops on cyclic navigation graphs.
 
 import { chromium, type Browser, type BrowserContext } from "playwright";
-import { DESTRUCTIVE_ACTION_PATTERN, type ApiCallRecord, type ComponentInventoryItem, type CrawlOptions, type ElementRecord, type NavEdge } from "./types.js";
+import { DESTRUCTIVE_ACTION_PATTERN, type ApiCallRecord, type ComponentInventoryItem, type CrawlOptions, type ElementRecord, type NavEdge, type StorageSnapshot } from "./types.js";
 import { loginIfCredentialsProvided } from "./auth.js";
 import { discoverPageInteractions } from "./interaction.js";
-import { collectComponentInventory } from "./componentInventory.js";
+import { collectComponentInventory, discoverSameOriginFrameContent } from "./componentInventory.js";
 import { attachNetworkCapture } from "./network.js";
 import { dedupeKey, fetchSitemapUrls, normalizeUrl, sameOrigin } from "./urlUtils.js";
 import { structureMatches } from "./diff.js";
@@ -25,6 +25,38 @@ export interface DiscoveredPage {
   componentInventory: ComponentInventoryItem[];
   /** True when incremental mode reused the prior baseline without deep interaction. */
   reusedBaseline?: boolean;
+  /** Master-prompt #2: client-side storage state at this page (names/metadata only, never values). */
+  storageSnapshot: StorageSnapshot;
+}
+
+// Master-prompt #2 (Application Map): cookie metadata (never values) plus
+// localStorage/sessionStorage KEY names (never values) -- see db.ts's
+// storage_snapshot_json column comment for the privacy reasoning. Best-effort:
+// a page that blocks script evaluation (rare) just gets an empty snapshot,
+// never fails the crawl over it.
+async function captureStorageSnapshot(page: import("playwright").Page, context: BrowserContext): Promise<StorageSnapshot> {
+  const cookies = await context
+    .cookies(page.url())
+    .then((rows) => rows.map((c) => ({ name: c.name, domain: c.domain, path: c.path, httpOnly: c.httpOnly, secure: c.secure, sameSite: c.sameSite })))
+    .catch(() => []);
+  const storageKeys = await page
+    .evaluate(() => {
+      let localKeys: string[] = [];
+      let sessionKeys: string[] = [];
+      try {
+        localKeys = Object.keys(window.localStorage);
+      } catch {
+        /* storage blocked (privacy mode / cross-origin restriction) */
+      }
+      try {
+        sessionKeys = Object.keys(window.sessionStorage);
+      } catch {
+        /* storage blocked */
+      }
+      return { localKeys, sessionKeys };
+    })
+    .catch(() => ({ localKeys: [] as string[], sessionKeys: [] as string[] }));
+  return { cookies, localStorageKeys: storageKeys.localKeys, sessionStorageKeys: storageKeys.sessionKeys };
 }
 
 async function extractLinks(page: import("playwright").Page, baseUrl: string): Promise<ExtractedLink[]> {
@@ -120,7 +152,13 @@ export async function runDiscoveryCrawl(options: CrawlOptions): Promise<{ pages:
   let detectedPlatform = "custom";
   let platformTimeouts = { pageLoadTimeout: 20000, networkIdleTimeout: 5000 };
 
-  const browser: Browser = await chromium.launch({ headless: true });
+  // SCAN_CHROMIUM_PATH is an optional escape hatch for a Chromium binary at a
+  // non-standard path (e.g. this dev sandbox's Chromium/Playwright version
+  // mismatch) -- undefined by default, which preserves Playwright's normal
+  // auto-resolution for everyone who hasn't set it. Same pattern already
+  // used by every other browser-launching service (bugDetectionService.ts,
+  // screensService.ts, stateTransitionService.ts, exploratoryAgentService.ts).
+  const browser: Browser = await chromium.launch({ headless: true, executablePath: process.env.SCAN_CHROMIUM_PATH || undefined });
   const context: BrowserContext = await browser.newContext({ viewport: { width: 1280, height: 800 } });
 
   try {
@@ -242,6 +280,14 @@ export async function runDiscoveryCrawl(options: CrawlOptions): Promise<{ pages:
           // still seed link/button elements from the href inventory so scenarios aren't empty.
           elements = mergeLinkElements(elements, links);
 
+          // Master-prompt #2: same-origin iframe content presence (payment
+          // widgets, rich-text editors, embedded third-party forms) and
+          // client-side storage snapshot -- both best-effort, never block
+          // the crawl if either fails.
+          const frameContent = await discoverSameOriginFrameContent(page).catch(() => []);
+          if (frameContent.length) componentInventory = [...componentInventory, ...frameContent];
+          const storageSnapshot = await captureStorageSnapshot(page, context);
+
           formsDiscoveredTotal += formCount;
 
           const currentUrl = page.url();
@@ -261,9 +307,18 @@ export async function runDiscoveryCrawl(options: CrawlOptions): Promise<{ pages:
             formCount,
             componentInventory,
             reusedBaseline,
+            storageSnapshot,
           });
         } catch (err: any) {
-          results.push({ url: targetUrl, title: `(failed to load: ${err.message})`, elements: [], apis: [], formCount: 0, componentInventory: [] });
+          results.push({
+            url: targetUrl,
+            title: `(failed to load: ${err.message})`,
+            elements: [],
+            apis: [],
+            formCount: 0,
+            componentInventory: [],
+            storageSnapshot: { cookies: [], localStorageKeys: [], sessionStorageKeys: [] },
+          });
         } finally {
           await page.close().catch(() => undefined);
         }

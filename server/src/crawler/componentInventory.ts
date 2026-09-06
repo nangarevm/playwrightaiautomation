@@ -12,6 +12,8 @@
 // crawler's best-effort approach (see interaction.ts, spellcheck.ts).
 
 import type { Page } from "playwright";
+import { INTERACTIVE_SELECTOR } from "./locators.js";
+import { sameOrigin } from "./urlUtils.js";
 
 export interface ComponentInventoryItem {
   kind: string; // stable machine key, e.g. "forms"
@@ -79,6 +81,14 @@ export async function collectComponentInventory(page: Page): Promise<ComponentIn
           els: Array.from(document.querySelectorAll('article, [role="article"]')).concat(cardClassEls),
         },
         { kind: "footer", label: "Footer", els: Array.from(document.querySelectorAll('footer, [role="contentinfo"]')) },
+        // Master-prompt #2 (Application Map): surface iframe PRESENCE on the
+        // page (a payment widget, a rich-text editor, a third-party embed).
+        // Interactive elements INSIDE same-origin iframes are separately
+        // counted in discovery.ts's discoverSameOriginFrameContent -- this
+        // bucket only reports that the iframes exist, since a generated
+        // Playwright locator string for cross-frame content needs a
+        // frameLocator(...) qualifier this page-level scan can't safely infer.
+        { kind: "iframes", label: "Iframes", els: Array.from(document.querySelectorAll("iframe")) },
       ];
 
       const out: Array<{ kind: string; label: string; count: number; samples: string[] }> = [];
@@ -93,7 +103,10 @@ export async function collectComponentInventory(page: Page): Promise<ComponentIn
         if (visible.length === 0) continue;
         const samples: string[] = [];
         for (const el of visible) {
-          const t = (el.getAttribute("aria-label") || el.textContent || "").replace(/\s+/g, " ").trim().slice(0, 40);
+          // An <iframe> rarely has meaningful text content/aria-label -- its
+          // title or src attribute is the only identifying label available.
+          const iframeLabel = b.kind === "iframes" ? el.getAttribute("title") || el.getAttribute("src") || "" : "";
+          const t = (iframeLabel || el.getAttribute("aria-label") || el.textContent || "").replace(/\s+/g, " ").trim().slice(0, 60);
           if (t.length > 0) samples.push(t);
           if (samples.length >= 3) break;
         }
@@ -104,4 +117,34 @@ export async function collectComponentInventory(page: Page): Promise<ComponentIn
     .catch(() => [] as ComponentInventoryItem[]);
 
   return raw;
+}
+
+// Master-prompt #2 (Application Map): counts interactive elements found
+// inside same-origin iframes -- deliberately a COUNT, not full ElementRecord
+// locator generation, because a locator string usable by generated Playwright
+// code needs a `page.frameLocator(iframeSelector).locator(...)` qualifier
+// this page-level scan has no safe way to infer per-element (an iframe can
+// be nested, re-ordered, or have no stable selector at all). Reporting
+// presence/count honestly is better than shipping a locator string that
+// looks valid but silently never matches anything when a generated test
+// tries to use it. Cross-origin iframes (payment/ad/analytics widgets) are
+// skipped entirely -- Playwright cannot inspect their content, and even if
+// it could, it isn't this site's own code to test.
+export async function discoverSameOriginFrameContent(page: Page): Promise<ComponentInventoryItem[]> {
+  const items: ComponentInventoryItem[] = [];
+  const mainFrame = page.mainFrame();
+  for (const frame of page.frames()) {
+    if (frame === mainFrame) continue;
+    let frameUrl: string;
+    try {
+      frameUrl = frame.url();
+      if (!frameUrl || !sameOrigin(frameUrl, page.url())) continue;
+    } catch {
+      continue;
+    }
+    const count = await frame.locator(INTERACTIVE_SELECTOR).count().catch(() => 0);
+    if (count === 0) continue;
+    items.push({ kind: "iframe-content", label: `Iframe content: ${frameUrl}`, count, samples: [frameUrl] });
+  }
+  return items;
 }

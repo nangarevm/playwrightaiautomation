@@ -98,6 +98,16 @@ export interface NavEdge {
   via: string;
 }
 
+// Master-prompt #2 (Application Map): client-side storage state captured per
+// page -- names/metadata only, never values (see db.ts's storage_snapshot_json
+// column comment for why). Lets a reviewer see "this page depends on
+// client-side state" without the crawl database ever holding a real token/PII value.
+export interface StorageSnapshot {
+  cookies: Array<{ name: string; domain: string; path: string; httpOnly: boolean; secure: boolean; sameSite?: string }>;
+  localStorageKeys: string[];
+  sessionStorageKeys: string[];
+}
+
 export interface SpellingIssue {
   word: string;
   suggestions: string[];

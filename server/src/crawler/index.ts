@@ -11,7 +11,7 @@ import { classifyChange, diffElements, hashElements, type ChangeStatus } from ".
 import { collectPageSpellingIssues } from "./spellcheck.js";
 import { dedupeScenariosFuzzy, scenarioFingerprint } from "./scenarioDedup.js";
 import { normalizeUrl } from "./urlUtils.js";
-import type { ApiCallRecord, ComponentInventoryItem, CrawlOptions, ElementRecord, PageDiff, ScenarioRecord, SpellingIssue } from "./types.js";
+import type { ApiCallRecord, ComponentInventoryItem, CrawlOptions, ElementRecord, NavEdge, PageDiff, ScenarioRecord, SpellingIssue, StorageSnapshot } from "./types.js";
 
 export interface CrawledPageOutput {
   url: string;
@@ -24,6 +24,7 @@ export interface CrawledPageOutput {
   diff: PageDiff | null;
   spellingIssues: SpellingIssue[];
   componentInventory: ComponentInventoryItem[];
+  storageSnapshot: StorageSnapshot;
 }
 
 export interface CrawlRunOutput {
@@ -33,6 +34,8 @@ export interface CrawlRunOutput {
   authenticated: boolean;
   authMessage: string;
   pages: CrawledPageOutput[];
+  /** Master-prompt #2 (Application Map): the page-to-page navigation graph -- see crawlerService.getApplicationMap. */
+  edges: NavEdge[];
   /** Re-crawl summary: how many pages were new/changed/unchanged this run. */
   summary: {
     mode: "incremental" | "full";
@@ -96,6 +99,7 @@ export async function runCrawl(options: CrawlOptions, getBaseline: BaselineLooku
       diff,
       spellingIssues: changeStatus === "unchanged" ? [] : collectPageSpellingIssues(discovered.title, discovered.elements),
       componentInventory: discovered.componentInventory,
+      storageSnapshot: discovered.storageSnapshot,
     };
   });
 
@@ -156,6 +160,7 @@ export async function runCrawl(options: CrawlOptions, getBaseline: BaselineLooku
     authenticated,
     authMessage,
     pages: output,
+    edges,
     summary: {
       mode,
       newPages: output.filter((p) => p.changeStatus === "new").length,

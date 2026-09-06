@@ -251,11 +251,11 @@ function persistCrawlResult(siteId: string, result: CrawlRunOutput, isRerun: boo
         // Unchanged pages: refresh last_seen/change_status but keep elements/apis/spelling unless we have fresher data.
         if (page.changeStatus === "unchanged") {
           db.prepare(
-            `UPDATE crawl_pages SET title = ?, change_status = 'unchanged', last_seen_at = ?, updated_at = ? WHERE id = ?`
-          ).run(page.title, now, now, pageId);
+            `UPDATE crawl_pages SET title = ?, change_status = 'unchanged', storage_snapshot_json = ?, last_seen_at = ?, updated_at = ? WHERE id = ?`
+          ).run(page.title, JSON.stringify(page.storageSnapshot), now, now, pageId);
         } else {
           db.prepare(
-            `UPDATE crawl_pages SET title = ?, dom_hash = ?, elements_json = ?, apis_json = ?, change_status = ?, diff_json = ?, spelling_issues_json = ?, component_inventory_json = ?, last_seen_at = ?, updated_at = ? WHERE id = ?`
+            `UPDATE crawl_pages SET title = ?, dom_hash = ?, elements_json = ?, apis_json = ?, change_status = ?, diff_json = ?, spelling_issues_json = ?, component_inventory_json = ?, storage_snapshot_json = ?, last_seen_at = ?, updated_at = ? WHERE id = ?`
           ).run(
             page.title,
             page.hash,
@@ -265,6 +265,7 @@ function persistCrawlResult(siteId: string, result: CrawlRunOutput, isRerun: boo
             page.diff ? JSON.stringify(page.diff) : null,
             JSON.stringify(page.spellingIssues),
             JSON.stringify(page.componentInventory),
+            JSON.stringify(page.storageSnapshot),
             now,
             now,
             pageId
@@ -272,8 +273,8 @@ function persistCrawlResult(siteId: string, result: CrawlRunOutput, isRerun: boo
         }
       } else {
         db.prepare(
-          `INSERT INTO crawl_pages (id, site_id, url, title, dom_hash, screenshot_hash, elements_json, apis_json, change_status, diff_json, spelling_issues_json, component_inventory_json, last_seen_at, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+          `INSERT INTO crawl_pages (id, site_id, url, title, dom_hash, screenshot_hash, elements_json, apis_json, change_status, diff_json, spelling_issues_json, component_inventory_json, storage_snapshot_json, last_seen_at, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
         ).run(
           pageId,
           siteId,
@@ -286,6 +287,7 @@ function persistCrawlResult(siteId: string, result: CrawlRunOutput, isRerun: boo
           page.diff ? JSON.stringify(page.diff) : null,
           JSON.stringify(page.spellingIssues),
           JSON.stringify(page.componentInventory),
+          JSON.stringify(page.storageSnapshot),
           now,
           now,
           now
@@ -319,6 +321,17 @@ function persistCrawlResult(siteId: string, result: CrawlRunOutput, isRerun: boo
           "UPDATE crawl_scenarios SET status = 'soft_deleted', deleted_at = ?, updated_at = ? WHERE page_id = ? AND status = 'active' AND generated_test_case_id IS NULL"
         ).run(now, now, prior.id);
       }
+    }
+
+    // Master-prompt #2 (Application Map): replace this site's graph edges
+    // wholesale with the fresh set from this run -- simplest way to avoid
+    // accumulating stale edges across re-crawls (a removed link shouldn't
+    // linger in the graph forever), matching how transient per-crawl data
+    // is already handled elsewhere in this function.
+    db.prepare("DELETE FROM crawl_graph_edges WHERE site_id = ?").run(siteId);
+    if (result.edges?.length) {
+      const insertEdge = db.prepare("INSERT INTO crawl_graph_edges (id, site_id, from_url, to_url, via, created_at) VALUES (?, ?, ?, ?, ?, ?)");
+      for (const edge of result.edges) insertEdge.run(nanoid(10), siteId, edge.from, edge.to, edge.via, now);
     }
 
     const summary = {
@@ -394,6 +407,79 @@ export function getSiteDetail(siteId: string, opts?: { includeRemoved?: boolean 
 
 function parseScenarioRow(row: any) {
   return { ...row, steps: JSON.parse(row.steps_json), locators: JSON.parse(row.locators_json) };
+}
+
+export interface ApplicationMapNode {
+  url: string;
+  title: string;
+  formCount: number;
+  componentInventory: unknown[];
+  storageSnapshot: unknown;
+}
+export interface ApplicationMapNavEdge {
+  from: string;
+  to: string;
+  via: string;
+}
+export interface ApplicationMapApiEdge {
+  pageUrl: string;
+  trigger: string;
+  method: string;
+  endpoint: string;
+  host?: string;
+}
+
+// Master-prompt #2: assembles the Application Map -- page nodes, the
+// persisted page-to-page navigation graph, and (from each page's already-
+// captured apis_json) the Button/Form -> API association that closes the
+// "Page -> Button -> API -> Page" picture the master prompt describes.
+// Nothing new is captured here; this reads back what discovery.ts /
+// network.ts already recorded per page and per navigation, assembled into
+// one queryable graph instead of being implicitly reconstructable only by
+// re-reading every page row + every scenario by hand.
+export function getApplicationMap(siteId: string): { site: any; nodes: ApplicationMapNode[]; navEdges: ApplicationMapNavEdge[]; apiEdges: ApplicationMapApiEdge[] } {
+  const site = getSite(siteId);
+  if (!site) throw new Error("Site not found.");
+
+  const pageRows = db.prepare("SELECT url, title, elements_json, apis_json, component_inventory_json, storage_snapshot_json FROM crawl_pages WHERE site_id = ? AND change_status != 'removed'").all(siteId) as Array<{
+    url: string;
+    title: string;
+    elements_json: string;
+    apis_json: string;
+    component_inventory_json: string;
+    storage_snapshot_json: string;
+  }>;
+
+  const nodes: ApplicationMapNode[] = [];
+  const apiEdges: ApplicationMapApiEdge[] = [];
+  for (const row of pageRows) {
+    let elements: any[] = [];
+    let apis: Array<{ trigger: string; method: string; endpoint: string; host?: string }> = [];
+    try {
+      elements = JSON.parse(row.elements_json || "[]");
+    } catch {
+      /* corrupted row -- treat as no elements rather than fail the whole map */
+    }
+    try {
+      apis = JSON.parse(row.apis_json || "[]");
+    } catch {
+      /* corrupted row -- treat as no APIs rather than fail the whole map */
+    }
+    nodes.push({
+      url: row.url,
+      title: row.title,
+      formCount: elements.filter((e) => ["input", "textarea", "dropdown"].includes(e.type)).length > 0 ? 1 : 0,
+      componentInventory: JSON.parse(row.component_inventory_json || "[]"),
+      storageSnapshot: JSON.parse(row.storage_snapshot_json || "{}"),
+    });
+    for (const api of apis) {
+      apiEdges.push({ pageUrl: row.url, trigger: api.trigger, method: api.method, endpoint: api.endpoint, host: api.host });
+    }
+  }
+
+  const navEdges = db.prepare("SELECT from_url as [from], to_url as [to], via FROM crawl_graph_edges WHERE site_id = ? ORDER BY created_at ASC").all(siteId) as ApplicationMapNavEdge[];
+
+  return { site, nodes, navEdges, apiEdges };
 }
 
 export function listScenariosForSite(siteId: string, includeDeleted = false) {

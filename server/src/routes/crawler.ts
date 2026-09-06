@@ -5,6 +5,7 @@ import {
   deleteScenario,
   findSiteByUrl,
   generateTestsFromScenarios,
+  getApplicationMap,
   getSite,
   getSiteDetail,
   listScenariosForSite,
@@ -82,6 +83,17 @@ crawlerRouter.get("/sites/:id/detail", (req, res) => {
 
 crawlerRouter.get("/sites/:id/scenarios", (req, res) => {
   res.json(listScenariosForSite(req.params.id, req.query.includeDeleted === "true"));
+});
+
+// Master-prompt #2: the assembled Application Map -- page nodes (with their
+// component inventory and storage snapshot), the persisted page-to-page nav
+// graph, and the Button/Form -> API associations captured during the crawl.
+crawlerRouter.get("/sites/:id/application-map", (req, res) => {
+  try {
+    res.json(getApplicationMap(req.params.id));
+  } catch (err: any) {
+    res.status(404).json(errBody(404, err.message));
+  }
 });
 
 // Phase 7: single-scenario delete (soft-delete + cascade of any already-generated test/script).

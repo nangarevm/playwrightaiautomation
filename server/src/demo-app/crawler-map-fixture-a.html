@@ -1,0 +1,17 @@
+<!doctype html>
+<html>
+<head><title>Application Map Fixture A</title></head>
+<body>
+  <h1>Page A</h1>
+  <a href="/demo/crawler-map-fixture-b.html">Go to page B</a>
+  <button id="load-orders">Load orders</button>
+  <iframe title="Embedded widget" src="/demo/crawler-map-fixture-iframe.html" width="300" height="200"></iframe>
+  <script>
+    localStorage.setItem('authToken', 'demo-token-value');
+    sessionStorage.setItem('sessionFlag', '1');
+    document.getElementById('load-orders').addEventListener('click', () => {
+      fetch('/demo/api/products').catch(() => {});
+    });
+  </script>
+</body>
+</html>

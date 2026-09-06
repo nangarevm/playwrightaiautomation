@@ -406,6 +406,20 @@ CREATE TABLE IF NOT EXISTS crawl_pages (
   FOREIGN KEY (site_id) REFERENCES crawl_sites(id)
 );
 
+-- Master-prompt #2 (Application Map): the page-to-page navigation graph,
+-- persisted so it survives past the single crawl run that computed it
+-- in-memory (previously discarded once buildFlowScenariosForSite consumed
+-- it) -- see crawler/discovery.ts's NavEdge and crawlerService.getApplicationMap.
+CREATE TABLE IF NOT EXISTS crawl_graph_edges (
+  id TEXT PRIMARY KEY,
+  site_id TEXT NOT NULL,
+  from_url TEXT NOT NULL,
+  to_url TEXT NOT NULL,
+  via TEXT NOT NULL, -- the clicked link/button label, or 'navigation' for an SPA route change with no single attributable link
+  created_at TEXT NOT NULL,
+  FOREIGN KEY (site_id) REFERENCES crawl_sites(id)
+);
+
 -- Phase 3/Phase 7: one row per generated scenario, with a stable id independent
 -- of list position/index so deletion still targets the right item after re-runs
 -- or re-ordering. status supports a session-scoped soft-delete/undo (Phase 7).
@@ -1031,6 +1045,15 @@ if (userCount === 0) {
   );
   for (const u of seedUsers) insertUser.run({ ...u, created_at: now });
 }
+
+// Master-prompt #2 (Application Map): a best-effort snapshot of client-side
+// storage per crawled page -- cookie NAMES/metadata and localStorage/
+// sessionStorage KEYS only, deliberately never values, matching this
+// codebase's existing privacy-conscious pattern (network.ts's inferSchema
+// never captures actual body values either). Enough to reveal "this page
+// depends on client-side state" (a token, a cart, a feature flag) without
+// risking capturing a real secret/PII value into the crawl database.
+ensureColumn("crawl_pages", "storage_snapshot_json", "TEXT NOT NULL DEFAULT '{}'");
 
 // FR-1.8: seed the single org_settings row so the redaction toggle always has a value
 const orgSettingsExist = (db.prepare("SELECT COUNT(*) as count FROM org_settings").get() as any).count as number;
