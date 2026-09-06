@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { db } from '../src/db.ts';
-import { recordBugFinding, getBugFinding, listBugFindings, BUG_SCAN_CONFIG } from '../src/services/bugDetectionService.ts';
+import { recordBugFinding, getBugFinding, listBugFindings, updateBugFindingStatus, BUG_SCAN_CONFIG } from '../src/services/bugDetectionService.ts';
 import {
   inferShape,
   mergeShape,
@@ -1465,4 +1465,96 @@ test('computeTestPriorities scores a changed, business-critical screen with open
   for (const p of priorities) {
     assert.ok(p.score >= TEST_PRIORITY_CONFIG.min && p.score <= TEST_PRIORITY_CONFIG.max);
   }
+});
+
+// ---- Playbook §37/§43/§44/§45: Coverage Model, Quality Score, Heatmap,
+// Regression Intelligence (pure DB-aggregation logic -- no browser launch,
+// live-verified separately with synthetic screens/findings covering all
+// four: a screen with a linked test case counted as covered vs. one
+// without; a screen with an open critical finding scoring below the
+// perfect-100 baseline and the app-wide score reflecting the worst screen;
+// a heatmap correctly bucketing findings into (screen, category) cells
+// sorted hottest-first; and a finding marked resolved then recurring
+// correctly incrementing regression_count/last_regressed_at and being
+// reopened, while a finding that was NEVER resolved recurring again does
+// NOT count as a regression.) ----
+
+import { computeCoverageModel } from '../src/services/coverageModelService.ts';
+import { computeAppWideQualityScore, computeQualityScoresByScreen, QUALITY_SCORE_CONFIG } from '../src/services/qualityScoreService.ts';
+import { computeBugHeatmap } from '../src/services/bugHeatmapService.ts';
+import { listRegressions, summarizeRegressions, hasRegressed } from '../src/services/regressionIntelligenceService.ts';
+
+function makeTestScreenForQuality(id, name) {
+  const now = new Date().toISOString();
+  db.prepare(
+    "INSERT INTO screens (id, name, module_name, source_input_id, url_or_path, last_captured_state_hash, change_status, last_compared_at, created_at, updated_at) VALUES (?, ?, NULL, 'test-src-qi', ?, 'hash', 'new', ?, ?, ?)"
+  ).run(id, name, `http://x/${name}`, now, now, now);
+}
+
+test('computeCoverageModel counts screens with linked test cases as covered, and classifies every known category as detected or never-detected', () => {
+  db.prepare("INSERT OR IGNORE INTO inputs (id, type, content, created_at) VALUES ('test-src-qi', 'text', 'x', ?)").run(new Date().toISOString());
+  makeTestScreenForQuality('cov-covered', 'Covered Screen');
+  makeTestScreenForQuality('cov-uncovered', 'Uncovered Screen');
+  db.prepare(
+    "INSERT INTO test_cases (id, input_id, title, category, steps, expected_result, confidence_score, created_at, updated_at, screen_id) VALUES ('tc-cov-1', 'test-src-qi', 'a test', 'functional', '[]', 'x', 0.9, ?, ?, 'cov-covered')"
+  ).run(new Date().toISOString(), new Date().toISOString());
+
+  const coverage = computeCoverageModel();
+  assert.ok(coverage.totalScreens >= 2);
+  assert.ok(coverage.screensWithTestCaseCoverage >= 1);
+  assert.ok(coverage.testCaseCoveragePercent > 0 && coverage.testCaseCoveragePercent <= 100);
+  assert.equal(coverage.categoriesEverDetected.length + coverage.categoriesNeverDetected.length, 11);
+});
+
+test('computeQualityScoresByScreen scores a screen with no open findings at a perfect 100, below 100 with an open critical finding, and sorts worst-first', () => {
+  makeTestScreenForQuality('qs-clean', 'Clean Screen');
+  makeTestScreenForQuality('qs-buggy', 'Buggy Screen');
+  recordBugFinding({ source: 'ui_exploratory', category: 'functional', severity: 'critical', title: 'Critical bug', detail: 'd', screenId: 'qs-buggy', evidence: {} });
+
+  const byScreen = computeQualityScoresByScreen();
+  const clean = byScreen.find((s) => s.screenId === 'qs-clean');
+  const buggy = byScreen.find((s) => s.screenId === 'qs-buggy');
+  assert.equal(clean.score, 100);
+  assert.ok(buggy.score < 100);
+  for (let i = 1; i < byScreen.length; i++) assert.ok(byScreen[i - 1].score <= byScreen[i].score);
+
+  const appWide = computeAppWideQualityScore();
+  assert.ok(appWide.score >= QUALITY_SCORE_CONFIG.min && appWide.score <= QUALITY_SCORE_CONFIG.max);
+});
+
+test('computeBugHeatmap buckets open findings into (screen, category) cells and sorts hottest-first', () => {
+  makeTestScreenForQuality('hm-scr', 'Heatmap Screen');
+  recordBugFinding({ source: 'ui_exploratory', category: 'functional', severity: 'critical', title: 'Heatmap critical', detail: 'd', screenId: 'hm-scr', evidence: {} });
+  recordBugFinding({ source: 'ui_exploratory', category: 'console-error', severity: 'low', title: 'Heatmap low', detail: 'd2', screenId: 'hm-scr', evidence: {} });
+
+  const heatmap = computeBugHeatmap();
+  const functionalCell = heatmap.find((c) => c.screenId === 'hm-scr' && c.category === 'functional');
+  const consoleCell = heatmap.find((c) => c.screenId === 'hm-scr' && c.category === 'console-error');
+  assert.ok(functionalCell && consoleCell);
+  assert.equal(functionalCell.count, 1);
+  assert.ok(functionalCell.severityWeightedScore > consoleCell.severityWeightedScore, 'a critical finding must weigh more than a low one');
+  for (let i = 1; i < heatmap.length; i++) assert.ok(heatmap[i - 1].severityWeightedScore >= heatmap[i].severityWeightedScore);
+});
+
+test('a resolved finding that recurs is reopened and counted as a regression; a never-resolved finding recurring again is not', () => {
+  makeTestScreenForQuality('reg-scr', 'Regression Screen');
+  const original = recordBugFinding({ source: 'ui_exploratory', category: 'security', severity: 'critical', title: 'Regressable bug', detail: 'd', screenId: 'reg-scr', evidence: { endpointKey: '/reg/x' } });
+  updateBugFindingStatus(original.id, 'resolved');
+  const recurred = recordBugFinding({ source: 'ui_exploratory', category: 'security', severity: 'critical', title: 'Regressable bug', detail: 'd', screenId: 'reg-scr', evidence: { endpointKey: '/reg/x' } });
+
+  assert.equal(recurred.status, 'open');
+  assert.equal(recurred.regression_count, 1);
+  assert.ok(recurred.last_regressed_at);
+  assert.ok(hasRegressed(recurred));
+
+  const regressions = listRegressions();
+  assert.ok(regressions.some((r) => r.findingId === original.id));
+  const summary = summarizeRegressions();
+  assert.ok(summary.totalRegressedFindings >= 1);
+  assert.ok(summary.totalRegressionEvents >= 1);
+
+  const neverResolved = recordBugFinding({ source: 'ui_exploratory', category: 'performance', severity: 'low', title: 'Slow page', detail: 'slow', screenId: 'reg-scr', evidence: { endpointKey: '/reg/slow' } });
+  const neverResolvedAgain = recordBugFinding({ source: 'ui_exploratory', category: 'performance', severity: 'low', title: 'Slow page', detail: 'slow', screenId: 'reg-scr', evidence: { endpointKey: '/reg/slow' } });
+  assert.equal(neverResolvedAgain.regression_count, 0);
+  assert.ok(!hasRegressed(neverResolvedAgain));
 });

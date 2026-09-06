@@ -1083,6 +1083,17 @@ if (userCount === 0) {
 // risking capturing a real secret/PII value into the crawl database.
 ensureColumn("crawl_pages", "storage_snapshot_json", "TEXT NOT NULL DEFAULT '{}'");
 
+// Playbook §45 (Regression Intelligence): a finding that recurs AFTER having
+// been marked 'resolved' is a materially different, more concerning event
+// than a plain new bug -- it means a fix regressed. bumpReproducibility
+// (bugDetectionService.ts) already reopens a resolved finding on recurrence,
+// but that state transition itself is the only moment this fact is knowable
+// -- once status flips back to 'open' there's no way to later tell "this
+// was always open" apart from "this was fixed, then broke again" just by
+// looking at the current row. These two columns capture that moment.
+ensureColumn("bug_findings", "regression_count", "INTEGER NOT NULL DEFAULT 0"); // incremented each time a 'resolved' finding recurs
+ensureColumn("bug_findings", "last_regressed_at", "TEXT"); // ISO timestamp of the most recent resolved->recurred transition; null if never regressed
+
 // FR-1.8: seed the single org_settings row so the redaction toggle always has a value
 const orgSettingsExist = (db.prepare("SELECT COUNT(*) as count FROM org_settings").get() as any).count as number;
 if (orgSettingsExist === 0) {

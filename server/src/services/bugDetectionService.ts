@@ -119,6 +119,9 @@ export interface BugFindingRow {
   root_cause_narrative: string | null;
   root_cause_is_inferred: number;
   environment_info_json: string | null;
+  // Playbook §45: Regression Intelligence -- see regressionIntelligenceService.ts.
+  regression_count: number;
+  last_regressed_at: string | null;
 }
 
 // Every scan that hits the same underlying defect (the same screen +
@@ -133,7 +136,10 @@ function bumpReproducibility(existing: BugFindingRow): BugFindingRow {
   const now = new Date().toISOString();
   const attempts = (existing.reproducibility_attempts ?? 1) + 1;
   const successes = (existing.reproducibility_successes ?? 1) + 1;
-  const nextStatus = existing.status === "resolved" ? "open" : existing.status;
+  const isRegression = existing.status === "resolved"; // recurring AFTER being marked fixed -- see regressionIntelligenceService.ts
+  const nextStatus = isRegression ? "open" : existing.status;
+  const regressionCount = (existing.regression_count ?? 0) + (isRegression ? 1 : 0);
+  const lastRegressedAt = isRegression ? now : existing.last_regressed_at;
   const confidenceScore = scoreConfidence({
     category: existing.category,
     severity: existing.severity,
@@ -143,8 +149,8 @@ function bumpReproducibility(existing: BugFindingRow): BugFindingRow {
   });
   const priority = derivePriority(existing.severity, confidenceScore);
   db.prepare(
-    "UPDATE bug_findings SET reproducibility_attempts = ?, reproducibility_successes = ?, status = ?, confidence_score = ?, priority = ?, updated_at = ? WHERE id = ?"
-  ).run(attempts, successes, nextStatus, confidenceScore, priority, now, existing.id);
+    "UPDATE bug_findings SET reproducibility_attempts = ?, reproducibility_successes = ?, status = ?, confidence_score = ?, priority = ?, regression_count = ?, last_regressed_at = ?, updated_at = ? WHERE id = ?"
+  ).run(attempts, successes, nextStatus, confidenceScore, priority, regressionCount, lastRegressedAt, now, existing.id);
   return getBugFinding(existing.id)!;
 }
 
@@ -198,6 +204,8 @@ export function recordBugFinding(input: BugFindingInput): BugFindingRow {
     root_cause_narrative: null,
     root_cause_is_inferred: 0,
     environment_info_json: null,
+    regression_count: 0,
+    last_regressed_at: null,
   };
   db.prepare(`
     INSERT INTO bug_findings (
