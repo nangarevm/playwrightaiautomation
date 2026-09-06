@@ -908,3 +908,137 @@ test('recordReproductionAttempt bumps attempts always, but successes only when r
 test('BUG_REPORTING_CONFIG has a sensible re-verification confidence bar', () => {
   assert.ok(BUG_REPORTING_CONFIG.reverifyConfidenceThreshold > 0 && BUG_REPORTING_CONFIG.reverifyConfidenceThreshold < 1);
 });
+
+// ---- Master-prompt §5: OpenAPI/Swagger contract intelligence (parsing/
+// matching/caching are pure logic; live discovery+diff against a real
+// endpoint is verified live above against openapi-contract-fixture.html,
+// not repeated here) ----
+
+import { parseOpenApiContractSchemas, checkAgainstOpenApiContract, getOpenApiSpecForOrigin, deleteOpenApiSpec, OPENAPI_CONTRACT_CONFIG } from '../src/services/openApiContractService.ts';
+
+function resetOpenApiSpecs() {
+  db.prepare('DELETE FROM openapi_specs').run();
+}
+
+test.beforeEach(() => {
+  resetOpenApiSpecs();
+});
+
+test('parseOpenApiContractSchemas converts an OpenAPI 3.x object/array/primitive schema, honoring required vs optional fields', () => {
+  const spec = JSON.stringify({
+    openapi: '3.0.0',
+    info: { title: 'Test API', version: '2.0' },
+    paths: {
+      '/users/{id}': {
+        get: {
+          responses: {
+            '200': {
+              content: {
+                'application/json': {
+                  schema: {
+                    type: 'object',
+                    properties: {
+                      id: { type: 'number' },
+                      name: { type: 'string' },
+                      tags: { type: 'array', items: { type: 'string' } },
+                      nickname: { type: 'string', nullable: true },
+                    },
+                    required: ['id', 'name'],
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
+    },
+  });
+  const { title, version, schemas } = parseOpenApiContractSchemas(spec);
+  assert.equal(title, 'Test API');
+  assert.equal(version, '2.0');
+  const shape = schemas['GET /users/{id}'];
+  assert.ok(shape);
+  assert.equal(shape.kind, 'object');
+  assert.deepEqual(new Set(shape.optionalFields), new Set(['tags', 'nickname']));
+  assert.equal(shape.fields.tags.kind, 'array');
+  assert.equal(shape.fields.tags.item.kind, 'primitive');
+  assert.equal(shape.fields.nickname.nullable, true);
+});
+
+test('parseOpenApiContractSchemas resolves a $ref to components.schemas and a Swagger 2.0 top-level response.schema', () => {
+  const oas3 = JSON.stringify({
+    openapi: '3.0.0',
+    info: { title: 'Ref API', version: '1.0' },
+    components: { schemas: { Order: { type: 'object', properties: { total: { type: 'number' } }, required: ['total'] } } },
+    paths: { '/orders': { get: { responses: { '200': { content: { 'application/json': { schema: { $ref: '#/components/schemas/Order' } } } } } } } },
+  });
+  const { schemas: oas3Schemas } = parseOpenApiContractSchemas(oas3);
+  assert.equal(oas3Schemas['GET /orders'].fields.total.kind, 'primitive');
+
+  const swagger2 = JSON.stringify({
+    swagger: '2.0',
+    info: { title: 'Swagger API', version: '1.0' },
+    definitions: { Order: { type: 'object', properties: { total: { type: 'number' } }, required: ['total'] } },
+    paths: { '/orders': { get: { responses: { '200': { schema: { $ref: '#/definitions/Order' } } } } } },
+  });
+  const { schemas: swagger2Schemas } = parseOpenApiContractSchemas(swagger2);
+  assert.equal(swagger2Schemas['GET /orders'].fields.total.kind, 'primitive');
+});
+
+test('parseOpenApiContractSchemas throws on a document with no paths, and skips operations with an unmodelable schema rather than guessing', () => {
+  assert.throws(() => parseOpenApiContractSchemas(JSON.stringify({ info: {} })));
+
+  const oneOfSpec = JSON.stringify({
+    openapi: '3.0.0',
+    info: { title: 'x', version: '1' },
+    paths: { '/x': { get: { responses: { '200': { content: { 'application/json': { schema: { oneOf: [{ type: 'object' }, { type: 'array' }] } } } } } } } },
+  });
+  const { schemas } = parseOpenApiContractSchemas(oneOfSpec);
+  assert.equal(schemas['GET /x'], undefined, 'oneOf is not modeled -- must be skipped, not guessed at');
+});
+
+test('checkAgainstOpenApiContract matches a path TEMPLATE against a concrete request path and flags a real violation, tagged contractSource: openapi', () => {
+  db.prepare(
+    "INSERT INTO openapi_specs (id, base_url, found, spec_url, title, version, schemas_json, discovered_at, updated_at) VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?)"
+  ).run(
+    'spec-1',
+    'http://localhost:9999',
+    'http://localhost:9999/openapi.json',
+    'Test',
+    '1.0',
+    JSON.stringify({ 'GET /orders/{id}': { kind: 'object', fields: { id: { kind: 'primitive', types: ['number'], nullable: false }, total: { kind: 'primitive', types: ['number'], nullable: false } }, optionalFields: [] } }),
+    new Date().toISOString(),
+    new Date().toISOString()
+  );
+
+  const findings = checkAgainstOpenApiContract({ baseUrl: 'http://localhost:9999', method: 'GET', path: '/orders/42', body: { id: 42 } });
+  assert.equal(findings.length, 1, 'missing "total" must be flagged');
+  const evidence = JSON.parse(findings[0].evidence);
+  assert.equal(evidence.contractSource, 'openapi');
+  assert.equal(findings[0].category, 'api-schema');
+
+  // No spec cached for this origin at all -- must return no findings, not throw.
+  assert.deepEqual(checkAgainstOpenApiContract({ baseUrl: 'http://unknown-origin.test', method: 'GET', path: '/x', body: {} }), []);
+
+  // A path with no matching template in the spec -- no findings.
+  assert.deepEqual(checkAgainstOpenApiContract({ baseUrl: 'http://localhost:9999', method: 'GET', path: '/nonexistent', body: {} }), []);
+});
+
+test('getOpenApiSpecForOrigin/deleteOpenApiSpec round-trip by origin, ignoring path/query differences in the probed baseUrl', () => {
+  db.prepare(
+    "INSERT INTO openapi_specs (id, base_url, found, spec_url, title, version, schemas_json, discovered_at, updated_at) VALUES (?, ?, 0, NULL, NULL, NULL, '{}', ?, ?)"
+  ).run('spec-2', 'http://example.test', new Date().toISOString(), new Date().toISOString());
+
+  const found = getOpenApiSpecForOrigin('http://example.test/some/deep/page?x=1');
+  assert.ok(found, 'lookup must normalize to origin, ignoring path/query');
+  assert.equal(found.base_url, 'http://example.test');
+
+  deleteOpenApiSpec('http://example.test/another/page');
+  assert.equal(getOpenApiSpecForOrigin('http://example.test'), undefined);
+});
+
+test('OPENAPI_CONTRACT_CONFIG has a non-empty well-known path list and sane bounds', () => {
+  assert.ok(OPENAPI_CONTRACT_CONFIG.wellKnownSpecPaths.length > 0);
+  assert.ok(OPENAPI_CONTRACT_CONFIG.maxDiffIssuesPerResponse > 0);
+  assert.ok(OPENAPI_CONTRACT_CONFIG.maxRefDepth > 0);
+});

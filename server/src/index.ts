@@ -28,6 +28,7 @@ import { apiSchemasRouter } from "./routes/apiSchemas.js";
 import { stateTransitionFlowsRouter } from "./routes/stateTransitionFlows.js";
 import { authzTestingRouter } from "./routes/authzTesting.js";
 import { exploratoryAgentRouter } from "./routes/exploratoryAgent.js";
+import { openApiContractsRouter } from "./routes/openApiContracts.js";
 import { attachUser, enforceReadOnlyRoles } from "./services/adminService.js";
 import { cleanupExpiredArtifacts, runScheduledProfiles } from "./services/executionService.js";
 import { runScheduledCrawlsAndDiffs } from "./services/changeSchedulerService.js";
@@ -163,6 +164,44 @@ app.get("/demo/api/secure-resource/:id", (req, res) => {
   if (!req.headers.authorization) return res.status(401).json({ error: "unauthenticated" });
   res.json({ id: req.params.id, owner: "user-1", secret: "classified" });
 });
+// Master-prompt #5 verification fixtures: a minimal published OpenAPI
+// contract plus an endpoint that (on ?variant=2) violates it -- proves
+// openApiContractService catches the violation on the FIRST observed
+// request, unlike apiSchemaService's self-inferred baseline (which needs a
+// prior sample before it can flag drift).
+app.get("/openapi.json", (_req, res) => {
+  res.json({
+    openapi: "3.0.0",
+    info: { title: "Demo Contract API", version: "1.0.0" },
+    paths: {
+      "/demo/api/contract-orders/{id}": {
+        get: {
+          responses: {
+            "200": {
+              content: {
+                "application/json": {
+                  schema: {
+                    type: "object",
+                    properties: { id: { type: "number" }, total: { type: "number" }, status: { type: "string" } },
+                    required: ["id", "total", "status"],
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
+    },
+  });
+});
+app.get("/demo/api/contract-orders/:id", (req, res) => {
+  if (req.query.variant === "2") {
+    // Violates the contract: missing required "total", and "id" is a string not a number.
+    res.json({ id: String(req.params.id), status: "ok" });
+  } else {
+    res.json({ id: Number(req.params.id), total: 42, status: "ok" });
+  }
+});
 // FR-1.1: serve uploaded screenshots so the client can render real thumbnails
 app.use("/uploads", express.static(uploadDir));
 
@@ -274,6 +313,7 @@ app.use("/api/api-schemas", apiSchemasRouter);
 app.use("/api/state-transition-flows", stateTransitionFlowsRouter);
 app.use("/api/authz-testing", authzTestingRouter);
 app.use("/api/exploratory-agent", exploratoryAgentRouter);
+app.use("/api/openapi-contracts", openApiContractsRouter);
 // Embedded Allure report viewer (Phase 8 step 5): served statically so the
 // client can open it in an <iframe> instead of requiring download/unzip/open.
 app.use("/allure-report", express.static(path.join(__dirname, "..", "allure-report")));

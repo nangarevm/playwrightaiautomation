@@ -1003,6 +1003,25 @@ CREATE TABLE IF NOT EXISTS api_schemas (
   updated_at TEXT NOT NULL
 );
 
+-- Master-prompt #5 (API Contract Intelligence): a cache of the OpenAPI/
+-- Swagger spec discovered (or confirmed absent) for a given origin, so
+-- discovery only probes the well-known spec paths once per origin instead
+-- of on every single captured API response. found = 0 is itself a real,
+-- meaningful cached result (this origin has no discoverable spec) -- not a
+-- placeholder -- so the probe isn't repeated every scan against a site that
+-- simply doesn't publish one. See openApiContractService.ts.
+CREATE TABLE IF NOT EXISTS openapi_specs (
+  id TEXT PRIMARY KEY,
+  base_url TEXT NOT NULL UNIQUE,
+  found INTEGER NOT NULL DEFAULT 0,
+  spec_url TEXT,
+  title TEXT,
+  version TEXT,
+  schemas_json TEXT NOT NULL DEFAULT '{}', -- Record<"METHOD /path/template", ShapeNode> -- see apiSchemaService.ShapeNode
+  discovered_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
 -- Declarative UI-vs-API consistency rules (#6): "the element count matched by
 -- this selector on this screen should equal the count found at this JSON path
 -- in this endpoint's response". Kept as data (not inferred) because reliably

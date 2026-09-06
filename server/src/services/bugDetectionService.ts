@@ -24,6 +24,7 @@ import { isLikelyApiResponse } from "../crawler/network.js";
 import { analyzeConsoleError, summarizeErrors, groupErrorsByCategory, detectRelatedErrors, type ConsoleError } from "./consoleErrorService.js";
 import { validateInteraction, validateInteractionSequence, detectInteractionPatterns, type InteractionEvent } from "./interactionValidationService.js";
 import { checkAndRecordApiResponse } from "./apiSchemaService.js";
+import { discoverAndCacheOpenApiSpec, checkAgainstOpenApiContract } from "./openApiContractService.js";
 import { runDomChecks, getDomCheckIgnoreSelectors } from "./domChecksService.js";
 import { checkUiApiConsistency } from "./uiApiConsistencyService.js";
 import { getVisualDiffThresholdPercent, getMaxDuplicateRequests, getAccessibilityEnabled, getSlowApiThresholdMs, getSlowPageThresholdMs, getMaxRequestsPerPage } from "./adminService.js";
@@ -1002,6 +1003,12 @@ ${Object.entries(grouped)
       }
     }
 
+    // Master-prompt #5: discover (or reuse the cached result for) this
+    // origin's published OpenAPI/Swagger contract ONCE per scan, not once
+    // per captured response -- see openApiContractService's own doc comment
+    // for why a cached "no spec here" result is itself meaningful.
+    const openApiSpec = await discoverAndCacheOpenApiSpec(screen.url_or_path).catch(() => null);
+
     // Deeper Bug Detection #2: validate each captured API response's schema
     // against its stored baseline and flag a 2xx-with-error-shaped-body
     // anomaly regardless of mode. Bodies captured here also feed the
@@ -1056,6 +1063,22 @@ ${Object.entries(grouped)
           runId,
         })
       );
+      // Master-prompt #5: also check against the published OpenAPI/Swagger
+      // contract, if one was discovered for this origin -- a stronger,
+      // more actionable signal than self-inferred baseline drift (evidence.
+      // contractSource distinguishes the two in a report).
+      if (openApiSpec?.found) {
+        findings.push(
+          ...checkAgainstOpenApiContract({
+            baseUrl: screen.url_or_path,
+            method: candidate.method,
+            path: pathname,
+            body,
+            screenId,
+            runId,
+          })
+        );
+      }
     }
 
     // Deeper Bug Detection #6: declarative UI-count-vs-API-count rules, checked

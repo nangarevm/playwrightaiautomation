@@ -469,7 +469,7 @@ export function checkAndRecordApiResponse(input: ApiValidationInput): BugFinding
         detail: d.message,
         screenId: input.screenId ?? null,
         runId: input.runId ?? null,
-        evidence: { endpointKey, ...d, status: input.status },
+        evidence: { endpointKey, contractSource: "self-inferred-baseline", ...d, status: input.status },
         stepsToReproduce: [
           `Call ${endpointKey}`,
           `Inspect the response body at ${d.path}`,

@@ -1,0 +1,11 @@
+<!doctype html>
+<html>
+<head><title>OpenAPI Contract Fixture</title></head>
+<body>
+  <h1>OpenAPI Contract Fixture</h1>
+  <script>
+    const variant = new URLSearchParams(location.search).get('variant') || '1';
+    fetch('/demo/api/contract-orders/1?variant=' + variant).catch(() => {});
+  </script>
+</body>
+</html>
