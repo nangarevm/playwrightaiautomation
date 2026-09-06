@@ -1419,3 +1419,50 @@ test('CHAOS_CONFIG has sane defaults for action budget, delay, nav timeout, and 
   assert.ok(CHAOS_CONFIG.chaosTextValues.length > 0);
   assert.ok(CHAOS_CONFIG.chaosTextValues.includes(''), 'the chaos value pool should include an empty string (a very common edge case)');
 });
+
+// ---- Playbook §3: Test Priority (pure DB-aggregation logic -- no browser
+// launch, live-verified separately with synthetic screens/findings: a
+// recently-changed, business-critical-named screen with open critical/high
+// findings scored highest and landed in P0, a stable screen with no risk
+// signals scored lowest, and computeTestPriorities() returned results
+// sorted highest-risk-first with human-readable reasons citing the specific
+// factors that contributed.) ----
+
+import { computeTestPriorities, deriveTestPriorityBand, TEST_PRIORITY_CONFIG } from '../src/services/testPriorityService.ts';
+
+function makeTestScreenForPriority(id, name, moduleName, changeStatus) {
+  const now = new Date().toISOString();
+  db.prepare(
+    "INSERT INTO screens (id, name, module_name, source_input_id, url_or_path, last_captured_state_hash, change_status, last_compared_at, created_at, updated_at) VALUES (?, ?, ?, 'test-src', ?, 'hash', ?, ?, ?, ?)"
+  ).run(id, name, moduleName, `http://x/${name}`, changeStatus, now, now, now);
+}
+
+test('deriveTestPriorityBand maps score thresholds to P0-P3 consistently', () => {
+  assert.equal(deriveTestPriorityBand(70), 'P0');
+  assert.equal(deriveTestPriorityBand(100), 'P0');
+  assert.equal(deriveTestPriorityBand(45), 'P1');
+  assert.equal(deriveTestPriorityBand(69), 'P1');
+  assert.equal(deriveTestPriorityBand(20), 'P2');
+  assert.equal(deriveTestPriorityBand(44), 'P2');
+  assert.equal(deriveTestPriorityBand(0), 'P3');
+  assert.equal(deriveTestPriorityBand(19), 'P3');
+});
+
+test('computeTestPriorities scores a changed, business-critical screen with open critical/high findings above a stable screen with no risk signals, sorted highest-risk-first', () => {
+  makeTestScreenForPriority('tp-stable', 'Stable About Page', 'marketing', 'unchanged');
+  makeTestScreenForPriority('tp-risky', 'Checkout Screen', 'commerce', 'changed');
+  recordBugFinding({ source: 'ui_exploratory', category: 'functional', severity: 'critical', title: 'Checkout crash', detail: 'd', screenId: 'tp-risky', evidence: {} });
+
+  const priorities = computeTestPriorities();
+  const stable = priorities.find((p) => p.screenId === 'tp-stable');
+  const risky = priorities.find((p) => p.screenId === 'tp-risky');
+
+  assert.ok(risky.score > stable.score);
+  assert.equal(risky.band, 'P0');
+  assert.ok(risky.reasons.some((r) => r.includes('business-critical')));
+  assert.ok(risky.reasons.some((r) => r.includes('critical/high-severity')));
+  assert.ok(priorities.findIndex((p) => p.screenId === 'tp-risky') < priorities.findIndex((p) => p.screenId === 'tp-stable'), 'results must be sorted highest-risk-first');
+  for (const p of priorities) {
+    assert.ok(p.score >= TEST_PRIORITY_CONFIG.min && p.score <= TEST_PRIORITY_CONFIG.max);
+  }
+});
