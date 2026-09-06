@@ -1372,3 +1372,29 @@ test('generateHypotheses returns zero hypotheses for a category already covered 
   const hypotheses = generateHypotheses({ category: 'console-error', title: 'Console error: some noise', evidence: '{}' });
   assert.equal(hypotheses.length, 0);
 });
+
+// ---- Playbook §34: Metamorphic Testing Engine (config default -- pure
+// logic; the three relation runners (runSortPermutationScenario,
+// runFilterOrderIndependenceScenario, runSearchNarrowingScenario) themselves
+// launch a real browser and were live-verified separately against
+// server/src/demo-app/metamorphic-fixture.html: a sort that silently drops
+// an item, an order-dependent filter that resets on the second checkbox,
+// and a narrower search that introduces a stale/unrelated result each
+// violated their respective metamorphic relation and produced exactly the
+// expected finding, while the correct/well-behaved counterpart of each
+// produced ZERO findings -- confirming no false positives across all three
+// relations.) ----
+
+import { METAMORPHIC_CONFIG, runSearchNarrowingScenario } from '../src/services/metamorphicTestingService.ts';
+
+test('METAMORPHIC_CONFIG has sane defaults for grace period and nav timeout', () => {
+  assert.ok(METAMORPHIC_CONFIG.graceMs > 0);
+  assert.ok(METAMORPHIC_CONFIG.navTimeoutMs > 0);
+});
+
+test('runSearchNarrowingScenario rejects a narrowerQuery that does not actually extend broaderQuery, before launching a browser', async () => {
+  await assert.rejects(
+    () => runSearchNarrowingScenario({ name: 'x', url: 'http://x', searchInputSelector: '#s', broaderQuery: 'app', narrowerQuery: 'banana', itemSelector: '.item' }),
+    /must extend broaderQuery/
+  );
+});

@@ -1,0 +1,93 @@
+<!doctype html>
+<html>
+<head><title>Metamorphic Fixture</title></head>
+<body>
+  <h1>Metamorphic Fixture</h1>
+
+  <!-- MR-SORT section. ?sortBug=drop makes sorting drop one item (a
+       tie-breaking bug that loses a record instead of just reordering). -->
+  <button id="sort-btn">Sort</button>
+  <ul id="sort-list"></ul>
+
+  <!-- MR-FILTER section: two independent checkboxes. ?filterBug=orderdep
+       makes checking "B" after "A" silently uncheck/ignore "A" (an
+       order-dependent filter-reset bug) -- but checking "A" after "B" works
+       correctly, so the two orders disagree. -->
+  <label><input type="checkbox" id="filter-a" /> Filter A (category=Tools)</label>
+  <label><input type="checkbox" id="filter-b" /> Filter B (inStock=true)</label>
+  <ul id="filter-list"></ul>
+
+  <!-- MR-SEARCH section. ?searchBug=stale makes the SECOND (narrower)
+       search actually reuse the FIRST (broader) query's full unfiltered
+       result set appended with one extra unrelated item -- simulating a
+       stale/race condition that serves an old result set instead of the
+       new query's own narrower one. -->
+  <input id="search-input" type="text" />
+  <ul id="search-list"></ul>
+
+  <script>
+    const params = new URLSearchParams(location.search);
+    const sortBug = params.get('sortBug'); // 'drop' | null
+    const filterBug = params.get('filterBug'); // 'orderdep' | null
+    const searchBug = params.get('searchBug'); // 'stale' | null
+
+    // ---- MR-SORT ----
+    const sortItems = ['Charlie', 'Alpha', 'Bravo'];
+    function renderSortList(items) {
+      document.getElementById('sort-list').innerHTML = items.map((i) => `<li class="sort-item">${i}</li>`).join('');
+    }
+    renderSortList(sortItems);
+    document.getElementById('sort-btn').addEventListener('click', () => {
+      let sorted = [...sortItems].sort();
+      if (sortBug === 'drop') sorted = sorted.slice(1); // bug: silently drops the first item
+      renderSortList(sorted);
+    });
+
+    // ---- MR-FILTER ----
+    const filterCatalog = [
+      { name: 'Item1', category: 'Tools', inStock: true },
+      { name: 'Item2', category: 'Tools', inStock: false },
+      { name: 'Item3', category: 'Other', inStock: true },
+      { name: 'Item4', category: 'Other', inStock: false },
+    ];
+    let filterAChecked = false;
+    let filterBChecked = false;
+    function renderFilterList() {
+      let results = filterCatalog;
+      if (filterAChecked) results = results.filter((c) => c.category === 'Tools');
+      if (filterBChecked) results = results.filter((c) => c.inStock);
+      document.getElementById('filter-list').innerHTML = results.map((c) => `<li class="filter-item">${c.name}</li>`).join('');
+    }
+    document.getElementById('filter-a').addEventListener('change', (e) => {
+      filterAChecked = e.target.checked;
+      renderFilterList();
+    });
+    document.getElementById('filter-b').addEventListener('change', (e) => {
+      filterBChecked = e.target.checked;
+      if (filterBug === 'orderdep' && filterAChecked) {
+        // Bug: checking B after A silently resets A.
+        filterAChecked = false;
+        document.getElementById('filter-a').checked = false;
+      }
+      renderFilterList();
+    });
+    renderFilterList();
+
+    // ---- MR-SEARCH ----
+    const searchCatalog = ['app', 'apple', 'application', 'applet', 'banana'];
+    function renderSearchList(query) {
+      let results = searchCatalog.filter((s) => s.includes(query));
+      if (searchBug === 'stale' && query === 'appl') {
+        // Bug: the "narrower" query's result set incorrectly includes an
+        // item the broader "app" query never matched.
+        results = [...results, 'banana'];
+      }
+      document.getElementById('search-list').innerHTML = results.map((s) => `<li class="search-item">${s}</li>`).join('');
+    }
+    document.getElementById('search-input').addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') renderSearchList(e.target.value);
+    });
+    renderSearchList('');
+  </script>
+</body>
+</html>
