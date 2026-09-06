@@ -13,7 +13,7 @@
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
-import { chromium } from "playwright";
+import { chromium, firefox, webkit } from "playwright";
 import { nanoid } from "nanoid";
 import { db } from "../db.js";
 import { getScreen, compareScreenshotToBaseline, prepareForVisualCapture, getVisualIgnoreSelectors } from "./screensService.js";
@@ -292,6 +292,38 @@ function attachVideoToFindings(findings: BugFindingRow[], videoUrl: string) {
   }
 }
 
+// Playbook §Q: stamps which browser engine produced this finding into its
+// evidence, the same after-the-fact-update pattern as attachVideoToFindings
+// above (rather than threading browserName through every recordBugFinding
+// call site in this file) -- crossBrowserScanService.ts reads this back to
+// present each finding alongside its engine in a cross-browser report. Not
+// part of the fingerprint (bugFingerprintService.computeFingerprint never
+// looks at evidence.browserName): the SAME underlying defect seen on two
+// engines must still hash identically, or "common vs. browser-specific"
+// classification (which compares fingerprint sets across engines) couldn't
+// work at all.
+function attachBrowserToFindings(findings: BugFindingRow[], browserName: string) {
+  if (findings.length === 0 || browserName === "chromium") return; // chromium is the long-standing default; only stamp non-default engines to avoid rewriting every existing finding's evidence shape
+  const now = new Date().toISOString();
+  const update = db.prepare("UPDATE bug_findings SET evidence = ?, updated_at = ? WHERE id = ?");
+  const tx = db.transaction((rows: BugFindingRow[]) => {
+    for (const row of rows) {
+      let evidence: Record<string, any>;
+      try {
+        evidence = JSON.parse(row.evidence || "{}");
+      } catch {
+        evidence = {};
+      }
+      evidence.browserName = browserName;
+      const evidenceJson = JSON.stringify(evidence);
+      update.run(evidenceJson, now, row.id);
+      row.evidence = evidenceJson;
+      row.updated_at = now;
+    }
+  });
+  tx(findings);
+}
+
 // Fire-and-forget: file only the findings worth a human's attention immediately.
 // Low/medium noise (a handful of console warnings) shouldn't spam the tracker.
 function autoFileIfSevere(finding: BugFindingRow) {
@@ -457,6 +489,8 @@ export interface ScanScreenOptions {
   viewport?: { name: string; width: number; height: number };
   /** Deeper Bug Detection #6: run declarative UI-vs-API consistency rules for this screen. Defaults to true when a real screenId is available. */
   checkUiApiConsistency?: boolean;
+  /** Playbook §Q: which browser engine to scan with. Defaults to "chromium" (this codebase's only browser support until now). See crossBrowserScanService.ts for the orchestration layer that runs one screen across several engines and classifies each finding as common vs. browser-specific. */
+  browserName?: "chromium" | "firefox" | "webkit";
 }
 
 const DESKTOP_VIEWPORT = { name: "desktop", width: 1280, height: 800 };
@@ -470,12 +504,16 @@ export async function scanScreenForUiBugs(
   if (!screen.url_or_path) return [];
   const screenId = catalogScreenId ?? null;
   const viewport = options?.viewport ?? DESKTOP_VIEWPORT;
+  const browserName = options?.browserName ?? "chromium";
   const findings: BugFindingRow[] = [];
   // SCAN_CHROMIUM_PATH is an optional escape hatch for a Chromium binary at a
   // non-standard path (e.g. a deployment that pins its own browser build) --
   // undefined by default, which preserves Playwright's normal auto-resolution
-  // for everyone who hasn't set it.
-  const browser = await chromium.launch({ headless: true, executablePath: process.env.SCAN_CHROMIUM_PATH || undefined });
+  // for everyone who hasn't set it. It's Chromium-specific (the only engine
+  // this sandbox has installed); Firefox/WebKit always use Playwright's
+  // normal auto-resolution.
+  const browserType = browserName === "firefox" ? firefox : browserName === "webkit" ? webkit : chromium;
+  const browser = await browserType.launch({ headless: true, executablePath: browserName === "chromium" ? process.env.SCAN_CHROMIUM_PATH || undefined : undefined });
   const context = await browser.newContext({
     viewport: { width: viewport.width, height: viewport.height },
     recordVideo: { dir: UPLOAD_DIR, size: { width: viewport.width, height: viewport.height } },
@@ -1278,6 +1316,7 @@ ${Object.entries(grouped)
     }
     await browser.close();
   }
+  attachBrowserToFindings(findings, browserName);
   return findings;
 }
 

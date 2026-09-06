@@ -1199,3 +1199,48 @@ test('buildSessionExpiryOtherTabTemplate builds a flow that clears cookies in ta
   assert.equal(invariants[0].type, 'visible');
   assert.equal(invariants[0].selector, '#login-prompt');
 });
+
+// ---- Playbook §Q: Cross-Browser Testing (pure classifyCrossBrowserFindings
+// logic -- no browser launch. scanScreenForUiBugs()'s new `browserName`
+// option and scanScreenAcrossBrowsers() itself were live-verified separately
+// against server/src/demo-app/buggy-fixture.html: the default (implicit
+// chromium) scan still detected the same findings as before with no
+// browserName stamp in evidence, and a single-engine cross-browser run
+// classified every one of those findings as "common" (with nothing to
+// differ against). Firefox/WebKit engines are NOT installed in this sandbox
+// (see the file-level doc comment in crossBrowserScanService.ts), so the
+// 3-engine common-vs-browser-specific split itself is proven here with
+// synthetic fixture data instead of a live run.) ----
+
+import { classifyCrossBrowserFindings } from '../src/services/crossBrowserScanService.ts';
+
+function fakeFinding(id, fingerprint) {
+  return { id, fingerprint, title: `finding ${id}`, category: 'console-error', severity: 'medium' };
+}
+
+test('classifyCrossBrowserFindings splits a fingerprint seen on every engine into common, and single-engine fingerprints into browser-specific', () => {
+  const byBrowser = {
+    chromium: [fakeFinding('c1', 'fp-common'), fakeFinding('c2', 'fp-chromium-only')],
+    firefox: [fakeFinding('f1', 'fp-common'), fakeFinding('f2', 'fp-firefox-only')],
+    webkit: [fakeFinding('w1', 'fp-common')],
+  };
+  const result = classifyCrossBrowserFindings(byBrowser, ['chromium', 'firefox', 'webkit']);
+  assert.deepEqual(result.common, ['fp-common']);
+  assert.equal(result.browserSpecific.length, 2);
+  const chromiumOnly = result.browserSpecific.find((b) => b.fingerprint === 'fp-chromium-only');
+  const firefoxOnly = result.browserSpecific.find((b) => b.fingerprint === 'fp-firefox-only');
+  assert.deepEqual(chromiumOnly.browsers, ['chromium']);
+  assert.deepEqual(firefoxOnly.browsers, ['firefox']);
+});
+
+test('classifyCrossBrowserFindings with a single browser classifies every finding as common (nothing to differ against)', () => {
+  const result = classifyCrossBrowserFindings({ chromium: [fakeFinding('c1', 'fp-a'), fakeFinding('c2', 'fp-b')] }, ['chromium']);
+  assert.equal(result.common.length, 2);
+  assert.equal(result.browserSpecific.length, 0);
+});
+
+test('classifyCrossBrowserFindings ignores a finding with no fingerprint rather than misclassifying it', () => {
+  const result = classifyCrossBrowserFindings({ chromium: [{ id: 'x', fingerprint: null }] }, ['chromium']);
+  assert.equal(result.common.length, 0);
+  assert.equal(result.browserSpecific.length, 0);
+});

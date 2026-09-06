@@ -8,6 +8,7 @@ import {
   updateBugFindingStatus,
 } from "../services/bugDetectionService.js";
 import { runResponsiveBugScan } from "../services/responsiveService.js";
+import { runCrossBrowserBugScanForScreen, type ScanBrowserName } from "../services/crossBrowserScanService.js";
 import { formatBugReport, getBugDashboard, getBugGroup, reverifyHighConfidenceFinding } from "../services/bugReportingService.js";
 import {
   createConsistencyRule,
@@ -118,6 +119,25 @@ bugsRouter.post("/scan", async (req, res) => {
     res.status(201).json({ findings, count: findings.length });
   } catch (err: any) {
     res.status(400).json(errBody(400, err.message || "Bug scan failed."));
+  }
+});
+
+// Playbook §Q -- cross-browser scan: runs the same exploratory UI scan
+// against each requested browser engine and classifies findings as common
+// (present under every engine) vs. browser-specific (present under only a
+// subset). A two-segment path ("/scan/cross-browser"), so it can't collide
+// with the single-segment GET/PATCH /:id routes below regardless of
+// registration order.
+bugsRouter.post("/scan/cross-browser", async (req, res) => {
+  const { screenId, browsers } = req.body as { screenId?: string; browsers?: ScanBrowserName[] };
+  if (!screenId || !Array.isArray(browsers) || browsers.length === 0) {
+    return res.status(400).json(errBody(400, "screenId and a non-empty browsers array are required."));
+  }
+  try {
+    const result = await runCrossBrowserBugScanForScreen(screenId, browsers);
+    res.status(201).json(result);
+  } catch (err: any) {
+    res.status(400).json(errBody(400, err.message || "Cross-browser bug scan failed."));
   }
 });
 
