@@ -32,6 +32,7 @@ import { listBehaviorTestingRouter } from "./routes/listBehaviorTesting.js";
 import { fileTransferTestingRouter } from "./routes/fileTransferTesting.js";
 import { bugAnalysisEnginesRouter } from "./routes/bugAnalysisEngines.js";
 import { metamorphicTestingRouter } from "./routes/metamorphicTesting.js";
+import { chaosExplorationRouter } from "./routes/chaosExploration.js";
 import { authzTestingRouter } from "./routes/authzTesting.js";
 import { exploratoryAgentRouter } from "./routes/exploratoryAgent.js";
 import { openApiContractsRouter } from "./routes/openApiContracts.js";
@@ -326,6 +327,7 @@ app.use("/api/list-behavior-testing", listBehaviorTestingRouter);
 app.use("/api/file-transfer-testing", fileTransferTestingRouter);
 app.use("/api/bug-analysis", bugAnalysisEnginesRouter);
 app.use("/api/metamorphic-testing", metamorphicTestingRouter);
+app.use("/api/chaos-exploration", chaosExplorationRouter);
 // Embedded Allure report viewer (Phase 8 step 5): served statically so the
 // client can open it in an <iframe> instead of requiring download/unzip/open.
 app.use("/allure-report", express.static(path.join(__dirname, "..", "allure-report")));

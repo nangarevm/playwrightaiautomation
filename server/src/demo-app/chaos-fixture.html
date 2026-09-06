@@ -1,0 +1,36 @@
+<!doctype html>
+<html>
+<head><title>Chaos Fixture</title></head>
+<body>
+  <h1>Chaos Fixture</h1>
+
+  <input id="qty-input" type="text" placeholder="Quantity" />
+  <select id="unit-select">
+    <option>each</option>
+    <option>dozen</option>
+    <option>CRASH</option>
+  </select>
+  <button id="calc-btn">Calculate</button>
+  <button id="noop-btn">Refresh totals</button>
+  <div id="result"></div>
+
+  <script>
+    // Deliberate crash bug: selecting the "CRASH" unit and then clicking
+    // Calculate throws an uncaught exception (simulating a real bug where an
+    // unexpected enum value reaches code that assumes it can only ever be
+    // one of the "normal" options).
+    document.getElementById('calc-btn').addEventListener('click', () => {
+      const qty = document.getElementById('qty-input').value;
+      const unit = document.getElementById('unit-select').value;
+      if (unit === 'CRASH') {
+        const handlers = undefined;
+        handlers.compute(qty); // throws: Cannot read properties of undefined
+      }
+      document.getElementById('result').textContent = `Computed for ${qty} ${unit}`;
+    });
+    document.getElementById('noop-btn').addEventListener('click', () => {
+      document.getElementById('result').textContent = 'Totals refreshed.';
+    });
+  </script>
+</body>
+</html>

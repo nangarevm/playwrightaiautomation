@@ -1398,3 +1398,24 @@ test('runSearchNarrowingScenario rejects a narrowerQuery that does not actually 
     /must extend broaderQuery/
   );
 });
+
+// ---- Playbook §35: Chaos Exploration Engine (config default -- pure logic;
+// runChaosExploration() itself launches a real browser and was live-verified
+// separately against server/src/demo-app/chaos-fixture.html: a seeded
+// search across 300 seeds found one (seed=2) that discovers a deliberate
+// crash bug (selecting an unexpected <select> option then clicking
+// "Calculate" throws an uncaught exception) within 8 random actions;
+// replaying that exact seed reproduced the identical action count and
+// finding, confirming the run is genuinely deterministic/reproducible
+// despite being seeded-random; and maxActions=0 took zero actions and found
+// nothing, as expected for a zero-budget run.) ----
+
+import { CHAOS_CONFIG } from '../src/services/chaosExplorationService.ts';
+
+test('CHAOS_CONFIG has sane defaults for action budget, delay, nav timeout, and a non-empty chaos value pool', () => {
+  assert.ok(CHAOS_CONFIG.maxActions > 0);
+  assert.ok(CHAOS_CONFIG.actionDelayMs >= 0);
+  assert.ok(CHAOS_CONFIG.navTimeoutMs > 0);
+  assert.ok(CHAOS_CONFIG.chaosTextValues.length > 0);
+  assert.ok(CHAOS_CONFIG.chaosTextValues.includes(''), 'the chaos value pool should include an empty string (a very common edge case)');
+});
