@@ -67,7 +67,12 @@ export type BugSource = "ui_exploratory" | "api_fuzz" | "regression";
 //   security               <- an authz probe (IDOR / vertical escalation)
 //                          found a request that should have been denied but
 //                          wasn't (authzTestingService.ts, Phase 4a)
-export type BugCategory = "console-error" | "api-status" | "api-schema" | "ui-visual" | "ui-dom" | "ui-api-mismatch" | "functional" | "accessibility" | "performance" | "security";
+//   network-resilience     <- a deliberately-injected network failure (offline/
+//                          abort/timeout/malformed response) exposed a broken
+//                          recovery path -- infinite spinner, false success,
+//                          or an unhandled console exception
+//                          (networkFailureInjectionService.ts)
+export type BugCategory = "console-error" | "api-status" | "api-schema" | "ui-visual" | "ui-dom" | "ui-api-mismatch" | "functional" | "accessibility" | "performance" | "security" | "network-resilience";
 
 export interface BugFindingInput {
   source: BugSource;

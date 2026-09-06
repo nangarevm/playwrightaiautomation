@@ -1092,3 +1092,45 @@ test('withLlmGateway never cache-hits for visual_diff_reasoning, even on an iden
   await withLlmGateway('visual_diff_reasoning', { provider: 'mock', prompt: 'diffPercentage=5 thresholdPercent=1' }, run);
   assert.equal(runCalls, 2, 'the second identical call must NOT be served from cache');
 });
+
+// ---- Playbook §L: Network / Failure Injection (config + named-template
+// builders -- pure logic; runNetworkFailureScenario() itself launches a real
+// browser and page.route() interception, and was live-verified separately
+// against server/src/demo-app/network-failure-fixture.html: an infinite-
+// spinner button under a "timeout" injection produced a high-severity
+// infinite-spinner finding, a false-success button under "http_error"
+// produced a critical false-success finding, a silent-failure button under
+// both "http_error" and "malformed_json" produced medium silent-failure
+// findings, and a well-behaved button produced ZERO findings under
+// "http_error" and "offline" -- confirming no false positive on correct
+// error handling.) ----
+
+import { NETWORK_FAILURE_CONFIG, buildOfflineDuringSubmitScenario, buildTimeoutDuringSubmitScenario, buildHttpErrorDuringSubmitScenario } from '../src/services/networkFailureInjectionService.ts';
+
+test('NETWORK_FAILURE_CONFIG has sane defaults for the grace period and indicator selector lists', () => {
+  assert.ok(NETWORK_FAILURE_CONFIG.gracePeriodMs > 0);
+  assert.ok(NETWORK_FAILURE_CONFIG.errorIndicatorSelectors.length > 0);
+  assert.ok(NETWORK_FAILURE_CONFIG.successIndicatorSelectors.length > 0);
+  assert.ok(NETWORK_FAILURE_CONFIG.spinnerSelectors.length > 0);
+  assert.ok(NETWORK_FAILURE_CONFIG.highLatencyDelayMs > NETWORK_FAILURE_CONFIG.gracePeriodMs, 'high-latency delay must exceed the grace period, or every high_latency scenario would look like a plain timeout');
+  assert.ok(NETWORK_FAILURE_CONFIG.navTimeoutMs > 0);
+});
+
+test('buildOfflineDuringSubmitScenario/buildTimeoutDuringSubmitScenario build a ready scenario with the given mode, url, urlPattern, and triggerSelector', () => {
+  const offline = buildOfflineDuringSubmitScenario({ name: 'Checkout offline', url: 'http://x/checkout', apiPattern: '**/api/checkout', submitSelector: '#pay-btn' });
+  assert.equal(offline.mode, 'offline');
+  assert.equal(offline.name, 'Checkout offline');
+  assert.equal(offline.url, 'http://x/checkout');
+  assert.equal(offline.urlPattern, '**/api/checkout');
+  assert.equal(offline.triggerSelector, '#pay-btn');
+  assert.equal(offline.httpStatus, undefined);
+
+  const timeout = buildTimeoutDuringSubmitScenario({ name: 'Checkout timeout', url: 'http://x/checkout', apiPattern: '**/api/checkout', submitSelector: '#pay-btn' });
+  assert.equal(timeout.mode, 'timeout');
+});
+
+test('buildHttpErrorDuringSubmitScenario carries the given httpStatus through to the scenario', () => {
+  const scenario = buildHttpErrorDuringSubmitScenario({ name: 'Checkout 503', url: 'http://x/checkout', apiPattern: '**/api/checkout', submitSelector: '#pay-btn', httpStatus: 503 });
+  assert.equal(scenario.mode, 'http_error');
+  assert.equal(scenario.httpStatus, 503);
+});

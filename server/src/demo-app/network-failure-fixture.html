@@ -1,0 +1,58 @@
+<!doctype html>
+<html>
+<head><title>Network Failure Injection Fixture</title></head>
+<body>
+  <h1>Checkout</h1>
+
+  <!-- Bug: on failure, the spinner is shown but never hidden -- no .catch/.finally at all. -->
+  <button id="stuck-spinner-btn">Pay (stuck spinner)</button>
+  <div id="stuck-spinner-indicator" class="animate-spin" role="progressbar" style="display:none">Processing payment...</div>
+
+  <!-- Bug: the .catch handler renders the SAME success message the .then handler does. -->
+  <button id="false-success-btn">Pay (false success)</button>
+  <div id="false-success-indicator" class="success" style="display:none">Payment successful!</div>
+
+  <!-- Bug: no .catch handler and no loading indicator at all -- a failure produces zero user-visible feedback. -->
+  <button id="silent-fail-btn">Pay (silent failure)</button>
+
+  <!-- Correct behavior: hides the spinner and shows an error message on failure -- must NOT produce a finding. -->
+  <button id="well-behaved-btn">Pay (well-behaved)</button>
+  <div id="well-behaved-spinner" class="animate-spin" role="progressbar" style="display:none">Processing payment...</div>
+  <div id="well-behaved-error" role="alert" class="error" style="display:none">Payment failed. Please try again.</div>
+
+  <script>
+    document.getElementById('stuck-spinner-btn').addEventListener('click', () => {
+      document.getElementById('stuck-spinner-indicator').style.display = 'block';
+      fetch('/demo/api/checkout', { method: 'POST' }).then(() => {
+        document.getElementById('stuck-spinner-indicator').style.display = 'none';
+      });
+      // Deliberately no .catch -- on a failed/aborted/hung request the
+      // spinner above is never hidden.
+    });
+
+    document.getElementById('false-success-btn').addEventListener('click', () => {
+      fetch('/demo/api/checkout', { method: 'POST' })
+        .then(() => { document.getElementById('false-success-indicator').style.display = 'block'; })
+        .catch(() => { document.getElementById('false-success-indicator').style.display = 'block'; });
+    });
+
+    document.getElementById('silent-fail-btn').addEventListener('click', () => {
+      fetch('/demo/api/checkout', { method: 'POST' });
+      // Deliberately no .then/.catch handling at all.
+    });
+
+    document.getElementById('well-behaved-btn').addEventListener('click', () => {
+      document.getElementById('well-behaved-spinner').style.display = 'block';
+      fetch('/demo/api/checkout', { method: 'POST' })
+        .then((res) => {
+          document.getElementById('well-behaved-spinner').style.display = 'none';
+          if (!res.ok) throw new Error('checkout failed');
+        })
+        .catch(() => {
+          document.getElementById('well-behaved-spinner').style.display = 'none';
+          document.getElementById('well-behaved-error').style.display = 'block';
+        });
+    });
+  </script>
+</body>
+</html>
