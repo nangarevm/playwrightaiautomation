@@ -1,0 +1,61 @@
+<!doctype html>
+<html>
+<head><title>Multi-Tab Fixture</title></head>
+<body>
+  <h1>Multi-Tab Fixture</h1>
+
+  <!-- Logout-across-tabs section. ?authStore=session (default) is the BUGGY
+       pattern: the "authenticated" flag lives in sessionStorage, which is
+       per-tab, so logging out in tab A never affects tab B's sessionStorage.
+       ?authStore=local is the CORRECT pattern: the flag lives in
+       localStorage, which is shared across tabs in the same context, so
+       tab B correctly loses access on its next refresh. -->
+  <div id="authed-content" style="display:none">Welcome, authenticated user.</div>
+  <button id="logout-btn">Log out</button>
+
+  <!-- Concurrent-edit-lost-update section: "notes" is a shared record
+       (backed by localStorage, so both tabs read/write the same value --
+       simulating a real backend record with no optimistic-concurrency
+       check: last save wins, silently, with no conflict warning). -->
+  <input id="notes-input" type="text" />
+  <button id="save-btn">Save</button>
+  <div id="saved-value">(none saved yet)</div>
+
+  <!-- Session-expiry-in-other-tab section: a real session cookie is set on
+       load. Clicking "authenticated action" is deliberately BUGGY -- it
+       never re-checks whether the cookie is still present before acting,
+       so a session that expired in another tab (context.clearCookies())
+       is silently treated as still valid. -->
+  <button id="authenticated-action-btn">Do authenticated action</button>
+  <div id="login-prompt" role="alert" style="display:none">Your session has expired. Please log in again.</div>
+
+  <script>
+    const params = new URLSearchParams(location.search);
+    const authStore = params.get('authStore') === 'local' ? localStorage : sessionStorage;
+
+    function renderAuth() {
+      if (authStore.getItem('authed') === null) authStore.setItem('authed', '1');
+      document.getElementById('authed-content').style.display = authStore.getItem('authed') === '1' ? 'block' : 'none';
+    }
+    document.getElementById('logout-btn').addEventListener('click', () => {
+      authStore.setItem('authed', '0');
+      renderAuth();
+    });
+    renderAuth();
+
+    function renderNotes() {
+      document.getElementById('saved-value').textContent = localStorage.getItem('notes') || '(none saved yet)';
+    }
+    document.getElementById('save-btn').addEventListener('click', () => {
+      localStorage.setItem('notes', document.getElementById('notes-input').value);
+      renderNotes();
+    });
+    renderNotes();
+
+    if (!document.cookie.includes('session=')) document.cookie = 'session=abc123; path=/';
+    document.getElementById('authenticated-action-btn').addEventListener('click', () => {
+      // Bug: no check of document.cookie here at all before "succeeding".
+    });
+  </script>
+</body>
+</html>

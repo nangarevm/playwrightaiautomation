@@ -1134,3 +1134,68 @@ test('buildHttpErrorDuringSubmitScenario carries the given httpStatus through to
   assert.equal(scenario.mode, 'http_error');
   assert.equal(scenario.httpStatus, 503);
 });
+
+// ---- Playbook §N: Multi-Tab / Multi-Context Testing (config validation +
+// named-template builders -- pure logic; runMultiTabScenario() itself
+// launches a real browser with two Pages sharing one BrowserContext, and
+// was live-verified separately against
+// server/src/demo-app/multi-tab-fixture.html: a sessionStorage-backed
+// logout (buggy -- sessionStorage is per-tab) produced exactly 1
+// cross-tab-session finding while the same flow against a localStorage-
+// backed logout (correct -- localStorage is shared across tabs) produced
+// ZERO; a genuine concurrent-edit lost-update (tab B's save silently
+// clobbering tab A's) produced exactly 1 finding while a single-tab
+// control edit with no real conflict produced ZERO; and a session that
+// expired in tab A (context.clearCookies()) followed by an authenticated
+// action in tab B whose handler never re-checks the cookie produced
+// exactly 1 finding.) ----
+
+import { runMultiTabScenario, buildLogoutInOneTabTemplate, buildConcurrentEditLostUpdateTemplate, buildSessionExpiryOtherTabTemplate } from '../src/services/multiTabTestingService.ts';
+
+test('runMultiTabScenario rejects a scenario with no steps or no invariants', async () => {
+  await assert.rejects(() => runMultiTabScenario({ name: 'x', steps: [], invariants: [{ afterStep: 0, tab: 'a', type: 'visible', selector: '#x', message: 'm' }] }), /at least one step/);
+  await assert.rejects(() => runMultiTabScenario({ name: 'x', steps: [{ tab: 'a', action: 'wait', ms: 1 }], invariants: [] }), /at least one invariant/);
+});
+
+test('runMultiTabScenario rejects an invariant whose afterStep is out of range', async () => {
+  await assert.rejects(
+    () => runMultiTabScenario({ name: 'x', steps: [{ tab: 'a', action: 'wait', ms: 1 }], invariants: [{ afterStep: 5, tab: 'a', type: 'visible', selector: '#x', message: 'm' }] }),
+    /must be a valid index/
+  );
+});
+
+test('buildLogoutInOneTabTemplate builds a 4-step flow (navigate both tabs, logout in A, refresh B) with a not_visible invariant on tab B', () => {
+  const { steps, invariants } = buildLogoutInOneTabTemplate({ url: 'http://x/app', logoutSelector: '#logout', authenticatedOnlySelector: '#authed' });
+  assert.equal(steps.length, 4);
+  assert.deepEqual(steps.map((s) => s.tab), ['a', 'b', 'a', 'b']);
+  assert.equal(invariants.length, 1);
+  assert.equal(invariants[0].tab, 'b');
+  assert.equal(invariants[0].type, 'not_visible');
+  assert.equal(invariants[0].afterStep, 3);
+});
+
+test('buildConcurrentEditLostUpdateTemplate builds a 7-step flow where tab B saves after tab A, then tab A refreshes and must not see tab B\'s value', () => {
+  const { steps, invariants } = buildConcurrentEditLostUpdateTemplate({
+    url: 'http://x/record',
+    fillSelector: '#notes',
+    valueA: 'A value',
+    valueB: 'B value',
+    saveSelector: '#save',
+    savedValueSelector: '#saved',
+  });
+  assert.equal(steps.length, 7);
+  assert.equal(steps[steps.length - 1].action, 'refresh');
+  assert.equal(steps[steps.length - 1].tab, 'a');
+  assert.equal(invariants.length, 1);
+  assert.equal(invariants[0].type, 'text_not_contains');
+  assert.equal(invariants[0].text, 'B value');
+});
+
+test('buildSessionExpiryOtherTabTemplate builds a flow that clears cookies in tab A then expects a visible login prompt in tab B', () => {
+  const { steps, invariants } = buildSessionExpiryOtherTabTemplate({ url: 'http://x/app', authenticatedActionSelector: '#do-action', loginPromptSelector: '#login-prompt' });
+  assert.ok(steps.some((s) => s.action === 'clear_cookies' && s.tab === 'a'));
+  assert.equal(invariants.length, 1);
+  assert.equal(invariants[0].tab, 'b');
+  assert.equal(invariants[0].type, 'visible');
+  assert.equal(invariants[0].selector, '#login-prompt');
+});
