@@ -14,32 +14,29 @@ export function getModelForTier(tier: ModelTier): string {
   return process.env.LLM_MODEL_PRIMARY?.trim() || DEFAULT_PRIMARY;
 }
 
-export type LlmProviderCallType = "test_case_generation" | "script_generation" | "exploratory_decision";
+export type LlmProviderCallType = "test_case_generation" | "script_generation" | "exploratory_decision" | "visual_diff_reasoning";
+
+const MAX_TOKENS_DEFAULTS: Record<LlmProviderCallType, { primary: number; economy: number }> = {
+  test_case_generation: { primary: 2000, economy: 1500 },
+  script_generation: { primary: 1500, economy: 1200 },
+  // Phase 4c: the exploratory decision response is a tiny structured
+  // {actionId, rationale} object, not prose/code -- a much smaller budget suffices.
+  exploratory_decision: { primary: 400, economy: 300 },
+  // Master-prompt §7: a short classification + one-sentence reasoning.
+  visual_diff_reasoning: { primary: 400, economy: 300 },
+};
+
+const MAX_TOKENS_ENV_KEYS: Record<LlmProviderCallType, { primary: string; economy: string }> = {
+  test_case_generation: { primary: "LLM_MAX_TOKENS_TEST_PRIMARY", economy: "LLM_MAX_TOKENS_TEST_ECONOMY" },
+  script_generation: { primary: "LLM_MAX_TOKENS_SCRIPT_PRIMARY", economy: "LLM_MAX_TOKENS_SCRIPT_ECONOMY" },
+  exploratory_decision: { primary: "LLM_MAX_TOKENS_EXPLORE_PRIMARY", economy: "LLM_MAX_TOKENS_EXPLORE_ECONOMY" },
+  visual_diff_reasoning: { primary: "LLM_MAX_TOKENS_VISUAL_PRIMARY", economy: "LLM_MAX_TOKENS_VISUAL_ECONOMY" },
+};
 
 export function getMaxTokensForTier(tier: ModelTier, callType: LlmProviderCallType): number {
-  const defaults =
-    callType === "test_case_generation"
-      ? { primary: 2000, economy: 1500 }
-      : callType === "script_generation"
-        ? { primary: 1500, economy: 1200 }
-        // Phase 4c: the exploratory decision response is a tiny structured
-        // {actionId, rationale} object, not prose/code -- a much smaller budget suffices.
-        : { primary: 400, economy: 300 };
-  const envKey =
-    callType === "test_case_generation"
-      ? tier === "primary"
-        ? "LLM_MAX_TOKENS_TEST_PRIMARY"
-        : "LLM_MAX_TOKENS_TEST_ECONOMY"
-      : callType === "script_generation"
-        ? tier === "primary"
-          ? "LLM_MAX_TOKENS_SCRIPT_PRIMARY"
-          : "LLM_MAX_TOKENS_SCRIPT_ECONOMY"
-        : tier === "primary"
-          ? "LLM_MAX_TOKENS_EXPLORE_PRIMARY"
-          : "LLM_MAX_TOKENS_EXPLORE_ECONOMY";
-  const fromEnv = process.env[envKey];
+  const fromEnv = process.env[MAX_TOKENS_ENV_KEYS[callType][tier]];
   if (fromEnv && Number.isFinite(Number(fromEnv))) return Number(fromEnv);
-  return defaults[tier];
+  return MAX_TOKENS_DEFAULTS[callType][tier];
 }
 
 export function getMaxInputChars(): number {

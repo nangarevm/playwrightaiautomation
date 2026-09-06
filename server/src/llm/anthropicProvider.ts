@@ -135,5 +135,49 @@ export function makeAnthropicProvider(apiKey: string): LlmProvider {
         return { actionId: "stop", rationale: "Could not parse the model's response." };
       }
     },
+
+    // Master-prompt §7: the one place in this platform an LLM call looks at
+    // actual image bytes. Layered on top of the deterministic pixel-diff --
+    // this NEVER decides whether a finding exists (screensService's
+    // pixelmatch threshold already did), only annotates it with a classification
+    // of likely-real-regression vs. likely-dynamic-content-noise, always
+    // presented as inference (see bugConfidenceService's use of this result).
+    async analyzeVisualDiff(input, options): Promise<{ isLikelyRealRegression: boolean; reasoning: string }> {
+      const tier: ModelTier = options?.tier ?? "economy";
+      const system =
+        "You are looking at a BEFORE and AFTER screenshot of the same web page, which a pixel-diff tool has already flagged as differing. " +
+        "Decide whether the visual difference looks like a REAL UI regression (broken layout, missing/moved element, changed styling, broken image) " +
+        "versus LIKELY NOISE from dynamic content (a timestamp, a live counter, an ad, an animation frame, a carousel position, randomized sample data). " +
+        'Output ONLY a JSON object: {"isLikelyRealRegression": true|false, "reasoning": "<one sentence>"}. No prose, no code fences.';
+      const userContent = `Pixel-diff was ${input.diffPercentage}% (configured threshold: ${input.thresholdPercent}%). The first image is BEFORE, the second is AFTER.`;
+      const model = getModelForTier(tier);
+      const max_tokens = getMaxTokensForTier(tier, "visual_diff_reasoning");
+      const msg = await client.messages.create({
+        model,
+        max_tokens,
+        system,
+        messages: [
+          {
+            role: "user",
+            content: [
+              { type: "text", text: userContent },
+              { type: "image", source: { type: "base64", media_type: "image/png", data: input.beforeImageBase64 } },
+              { type: "image", source: { type: "base64", media_type: "image/png", data: input.afterImageBase64 } },
+            ],
+          },
+        ],
+      });
+      const text = msg.content.map((b) => (b.type === "text" ? b.text : "")).join("\n");
+      const jsonStr = text.replace(/```json|```/g, "").trim();
+      try {
+        const parsed = JSON.parse(jsonStr);
+        return { isLikelyRealRegression: Boolean(parsed.isLikelyRealRegression), reasoning: String(parsed.reasoning ?? "") };
+      } catch {
+        // Unparseable response -- default to NOT claiming a real regression
+        // (the deterministic pixel-diff finding still stands on its own;
+        // this only fails to add a confident annotation, never suppresses it).
+        return { isLikelyRealRegression: false, reasoning: "Could not parse the model's response." };
+      }
+    },
   };
 }

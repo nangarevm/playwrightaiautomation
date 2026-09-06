@@ -452,6 +452,20 @@ export function setExplorationDefaultMaxDepth(value: number, updatedBy: CurrentU
   return { exploration_default_max_depth: getExplorationDefaultMaxDepth() };
 }
 
+// Master-prompt §7: optional AI visual-diff reasoning on/off toggle.
+// Defaults off -- see db.ts's column comment for why.
+export function getVisualAiReasoningEnabled(): boolean {
+  const row = db.prepare("SELECT visual_ai_reasoning_enabled FROM org_settings WHERE id = 1").get() as { visual_ai_reasoning_enabled: number };
+  return !!row.visual_ai_reasoning_enabled;
+}
+
+export function setVisualAiReasoningEnabled(enabled: boolean, updatedBy: CurrentUser | undefined) {
+  const now = new Date().toISOString();
+  db.prepare("UPDATE org_settings SET visual_ai_reasoning_enabled = ?, updated_by = ?, updated_at = ? WHERE id = 1").run(enabled ? 1 : 0, updatedBy?.id ?? null, now);
+  logAudit(updatedBy, "org_visual_ai_reasoning_enabled_changed", "org_settings", "1", { enabled });
+  return { visual_ai_reasoning_enabled: getVisualAiReasoningEnabled() };
+}
+
 // FR-2.11: QA-Lead-managed domain/business rules, persisted as a real entity
 // (previously a free-text string re-typed per generation call) so generation
 // can pull the active set automatically and a threshold demonstrably shows up

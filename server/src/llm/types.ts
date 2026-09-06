@@ -44,6 +44,26 @@ export interface ExploratoryDecision {
   rationale: string;
 }
 
+// Master-prompt §7: optional AI visual-diff reasoning, layered ON TOP OF
+// (never replacing) screensService.ts's deterministic pixel-diff -- the
+// pixel-diff still decides whether a finding exists at all; this only adds
+// an annotation (never gates the finding's existence) distinguishing a
+// likely-real visual regression from likely dynamic-content noise
+// (timestamps/ads/counters/animations the mask-selector list didn't catch).
+// Always an inference, per master prompt §19 -- callers must label it as
+// such, never as confirmed fact.
+export interface VisualDiffReasoningInput {
+  beforeImageBase64: string;
+  afterImageBase64: string;
+  diffPercentage: number;
+  thresholdPercent: number;
+}
+
+export interface VisualDiffReasoningResult {
+  isLikelyRealRegression: boolean;
+  reasoning: string;
+}
+
 export interface LlmProvider {
   name: string;
   generateTestCases(inputText: string, options?: Pick<LlmCallOptions, "tier">): Promise<GeneratedTestCase[]>;
@@ -68,4 +88,6 @@ export interface LlmProvider {
   ): Promise<AutomationArtifacts[]>;
   /** Phase 4c: pick the next exploratory action. Every provider implements this -- exploratoryAgentService.ts never trusts the answer alone (see its own hard budget/validity enforcement). */
   decideNextExploratoryAction(input: ExploratoryDecisionInput, options?: Pick<LlmCallOptions, "tier">): Promise<ExploratoryDecision>;
+  /** Master-prompt §7: classify a detected pixel-diff as likely-real vs. likely-noise. Every provider implements this; the mock provider's answer is a deterministic stand-in (no real vision), not a genuine image analysis. */
+  analyzeVisualDiff(input: VisualDiffReasoningInput, options?: Pick<LlmCallOptions, "tier">): Promise<VisualDiffReasoningResult>;
 }

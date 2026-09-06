@@ -12,6 +12,7 @@ import {
   getCostSavingSetting,
   getExplorationDefaultMaxActions,
   getExplorationDefaultMaxDepth,
+  getVisualAiReasoningEnabled,
   getMaxDuplicateRequests,
   getMaxRequestsPerPage,
   getOrgRedactionSetting,
@@ -34,6 +35,7 @@ import {
   setAuthzTestingEnabled,
   setExplorationDefaultMaxActions,
   setExplorationDefaultMaxDepth,
+  setVisualAiReasoningEnabled,
   setBusinessRuleActive,
   setCriticalPath,
   setCostSavingMode,
@@ -264,6 +266,14 @@ adminRouter.put("/org-settings/exploration-defaults", requireRole("QA Lead"), (r
   } catch (err: any) {
     res.status(400).json(errBody(400, err.message));
   }
+});
+
+// Master-prompt §7: optional AI visual-diff reasoning on/off toggle.
+adminRouter.get("/org-settings/visual-ai-reasoning-enabled", (_req, res) => {
+  res.json({ visual_ai_reasoning_enabled: getVisualAiReasoningEnabled() });
+});
+adminRouter.put("/org-settings/visual-ai-reasoning-enabled", requireRole("QA Lead"), (req, res) => {
+  res.json(setVisualAiReasoningEnabled(!!req.body?.enabled, req.user));
 });
 
 // Deeper Bug Detection #5: on/off toggle for the mobile/tablet re-scan layered

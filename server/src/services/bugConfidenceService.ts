@@ -46,6 +46,8 @@ export const CONFIDENCE_CONFIG = {
   criticalSeverityBonus: 0.05,
   lowSeverityPenalty: 0.1,
   visualSmallDiffPenalty: 0.15, // a ui-visual finding just barely over threshold is the likeliest false positive in the whole engine
+  visualAiConfirmedBonus: 0.1, // master-prompt §7: the optional AI visual-diff annotation says this looks like a real regression
+  visualAiNoisePenalty: 0.15, // master-prompt §7: the optional AI visual-diff annotation says this looks like dynamic-content noise
   min: 0.05,
   max: 0.95,
 };
@@ -87,6 +89,16 @@ export function scoreConfidence(
         // Within 2x of the configured threshold -- the likeliest zone for
         // animation/timestamp/font-rendering noise rather than a real regression.
         score -= CONFIDENCE_CONFIG.visualSmallDiffPenalty;
+      }
+      // Master-prompt §7: an optional AI visual-diff annotation (never
+      // required -- most findings won't have one, see
+      // org_settings.visual_ai_reasoning_enabled) shifts confidence in
+      // whichever direction it points, on top of the diff-margin signal
+      // above rather than instead of it -- a diff that's both small AND
+      // AI-flagged as noise is doubly discounted; a small diff the AI
+      // still calls a real regression has that discount partially offset.
+      if (typeof evidence?.aiVisualReasoning?.isLikelyRealRegression === "boolean") {
+        score += evidence.aiVisualReasoning.isLikelyRealRegression ? CONFIDENCE_CONFIG.visualAiConfirmedBonus : -CONFIDENCE_CONFIG.visualAiNoisePenalty;
       }
     } catch {
       /* evidence not parseable -- score on the other signals only */

@@ -269,6 +269,18 @@ export const mockProvider: LlmProvider = {
     const chosen = novel ?? untried[0];
     return { actionId: chosen.id, rationale: `Trying an untried action: ${chosen.description}` };
   },
+
+  // Master-prompt §7: a deterministic stand-in -- NOT real vision (this
+  // provider never looks at the actual image bytes), just a rule over the
+  // numeric diffPercentage already computed by the deterministic pixel-diff.
+  // Real image-based reasoning only happens with the anthropic provider.
+  async analyzeVisualDiff(input): Promise<{ isLikelyRealRegression: boolean; reasoning: string }> {
+    const ratio = input.thresholdPercent > 0 ? input.diffPercentage / input.thresholdPercent : input.diffPercentage;
+    if (ratio >= 3) {
+      return { isLikelyRealRegression: true, reasoning: `Diff (${input.diffPercentage}%) is far above the configured threshold (${input.thresholdPercent}%), consistent with a real layout/content regression rather than minor dynamic-content noise.` };
+    }
+    return { isLikelyRealRegression: false, reasoning: `Diff (${input.diffPercentage}%) is close to the configured threshold (${input.thresholdPercent}%) -- within the range commonly caused by animations, timestamps, or other dynamic content rather than a confirmed regression.` };
+  },
 };
 
 // FR-3.5: generates a Playwright API-request test rather than a UI browser

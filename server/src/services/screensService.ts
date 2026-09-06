@@ -283,7 +283,17 @@ export function compareScreenshotToBaseline(
   screenId: string,
   currentScreenshot: Buffer,
   opts?: { viewportName?: string; thresholdPercent?: number }
-): { hasBaseline: boolean; visualChangeDetected: boolean; diffPercentage?: number; thresholdPercent?: number; dimensions?: { width: number; height: number }; method?: "pixel-diff"; diffImage?: Buffer } {
+): {
+  hasBaseline: boolean;
+  visualChangeDetected: boolean;
+  diffPercentage?: number;
+  thresholdPercent?: number;
+  dimensions?: { width: number; height: number };
+  method?: "pixel-diff";
+  diffImage?: Buffer;
+  /** Master-prompt §7: the baseline PNG bytes, so a caller can optionally pass both before/after images to an AI visual-diff reasoning call. Only set when hasBaseline is true. */
+  beforeImage?: Buffer;
+} {
   const filePath = baselineFilePath(screenId, opts?.viewportName);
   if (!fs.existsSync(filePath)) return { hasBaseline: false, visualChangeDetected: false };
   const beforePng = fs.readFileSync(filePath);
@@ -297,6 +307,7 @@ export function compareScreenshotToBaseline(
     dimensions: { width, height },
     method: "pixel-diff",
     diffImage,
+    beforeImage: beforePng,
   };
 }
 

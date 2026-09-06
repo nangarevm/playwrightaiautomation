@@ -27,7 +27,9 @@ import { checkAndRecordApiResponse } from "./apiSchemaService.js";
 import { discoverAndCacheOpenApiSpec, checkAgainstOpenApiContract } from "./openApiContractService.js";
 import { runDomChecks, getDomCheckIgnoreSelectors } from "./domChecksService.js";
 import { checkUiApiConsistency } from "./uiApiConsistencyService.js";
-import { getVisualDiffThresholdPercent, getMaxDuplicateRequests, getAccessibilityEnabled, getSlowApiThresholdMs, getSlowPageThresholdMs, getMaxRequestsPerPage } from "./adminService.js";
+import { getVisualDiffThresholdPercent, getMaxDuplicateRequests, getAccessibilityEnabled, getSlowApiThresholdMs, getSlowPageThresholdMs, getMaxRequestsPerPage, getVisualAiReasoningEnabled } from "./adminService.js";
+import { withLlmGateway } from "./llmGatewayService.js";
+import { llm } from "../llm/index.js";
 import { runResponsiveBugScan } from "./responsiveService.js";
 import { runAccessibilityChecks, getAccessibilityIgnoreRules } from "./accessibilityService.js";
 import { computeFingerprint } from "./bugFingerprintService.js";
@@ -1104,17 +1106,56 @@ ${Object.entries(grouped)
         });
         if (diff.hasBaseline && diff.visualChangeDetected) {
           const screenshotUrl = diff.diffImage ? saveUploadFile(diff.diffImage, ".png") : await screenshotNow();
+
+          // Master-prompt §7: optional AI visual-diff reasoning, annotating
+          // (never gating) the deterministic pixel-diff finding above.
+          // Always presented as an inference, per master prompt §19 -- see
+          // the evidence.aiVisualReasoning shape below and
+          // bugConfidenceService's use of it.
+          let aiVisualReasoning: { isLikelyRealRegression: boolean; reasoning: string } | null = null;
+          if (getVisualAiReasoningEnabled() && diff.beforeImage) {
+            try {
+              aiVisualReasoning = await withLlmGateway(
+                "visual_diff_reasoning",
+                {
+                  provider: llm.name,
+                  prompt: `diffPercentage=${diff.diffPercentage} thresholdPercent=${diff.thresholdPercent}`,
+                },
+                async (_preparedPrompt, tier) => {
+                  const result = await llm.analyzeVisualDiff(
+                    {
+                      beforeImageBase64: diff.beforeImage!.toString("base64"),
+                      afterImageBase64: currentScreenshot.toString("base64"),
+                      diffPercentage: diff.diffPercentage ?? 0,
+                      thresholdPercent: diff.thresholdPercent ?? 0,
+                    },
+                    { tier }
+                  );
+                  return { result, outputText: JSON.stringify(result) };
+                }
+              );
+            } catch {
+              // Best-effort annotation -- the deterministic finding below is recorded regardless.
+              aiVisualReasoning = null;
+            }
+          }
+
           findings.push(
             recordBugFinding({
               source: "ui_exploratory",
               category: "ui-visual",
               severity: (diff.diffPercentage ?? 0) > 25 ? "high" : "medium",
               title: `Visual regression on ${screen.name} (${viewport.name}): ${diff.diffPercentage}% of pixels differ`,
-              detail: `Pixel diff against the stored baseline is ${diff.diffPercentage}%, above the configured threshold of ${diff.thresholdPercent}%.`,
+              detail: `Pixel diff against the stored baseline is ${diff.diffPercentage}%, above the configured threshold of ${diff.thresholdPercent}%.${aiVisualReasoning ? ` AI assessment (inference, not confirmed): ${aiVisualReasoning.isLikelyRealRegression ? "likely a real regression" : "possibly dynamic-content noise"} -- ${aiVisualReasoning.reasoning}` : ""}`,
               screenId,
               runId,
               viewport: viewport.name,
-              evidence: { diffPercentage: diff.diffPercentage, thresholdPercent: diff.thresholdPercent, dimensions: diff.dimensions },
+              evidence: {
+                diffPercentage: diff.diffPercentage,
+                thresholdPercent: diff.thresholdPercent,
+                dimensions: diff.dimensions,
+                ...(aiVisualReasoning ? { aiVisualReasoning: { ...aiVisualReasoning, isInferred: true } } : {}),
+              },
               stepsToReproduce: [
                 ...baseSteps,
                 `Compare against the saved visual baseline for this screen (${viewport.name}).`,

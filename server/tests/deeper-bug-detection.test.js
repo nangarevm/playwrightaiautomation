@@ -1042,3 +1042,53 @@ test('OPENAPI_CONTRACT_CONFIG has a non-empty well-known path list and sane boun
   assert.ok(OPENAPI_CONTRACT_CONFIG.maxDiffIssuesPerResponse > 0);
   assert.ok(OPENAPI_CONTRACT_CONFIG.maxRefDepth > 0);
 });
+
+// ---- Master-prompt §7: optional AI visual-diff reasoning (the real
+// anthropic vision call is not exercised here -- verified live above with
+// the mock provider's deterministic stand-in against a real visual
+// regression; this covers config/gating/confidence-scoring, which is pure logic) ----
+
+import { getVisualAiReasoningEnabled, setVisualAiReasoningEnabled } from '../src/services/adminService.ts';
+import { llm } from '../src/llm/index.ts';
+
+test('visual_ai_reasoning_enabled defaults to false (opt-in, costs a real LLM call per visual finding)', () => {
+  assert.equal(getVisualAiReasoningEnabled(), false);
+  setVisualAiReasoningEnabled(true, undefined);
+  assert.equal(getVisualAiReasoningEnabled(), true);
+  setVisualAiReasoningEnabled(false, undefined); // restore default
+});
+
+test('mock provider analyzeVisualDiff is a deterministic stand-in over diffPercentage/threshold ratio, not real vision', async () => {
+  const farAbove = await llm.analyzeVisualDiff({ beforeImageBase64: 'x', afterImageBase64: 'y', diffPercentage: 30, thresholdPercent: 1 });
+  assert.equal(farAbove.isLikelyRealRegression, true);
+
+  const nearThreshold = await llm.analyzeVisualDiff({ beforeImageBase64: 'x', afterImageBase64: 'y', diffPercentage: 1.2, thresholdPercent: 1 });
+  assert.equal(nearThreshold.isLikelyRealRegression, false);
+
+  assert.ok(typeof farAbove.reasoning === 'string' && farAbove.reasoning.length > 0);
+});
+
+test('scoreConfidence shifts for a ui-visual finding based on the optional AI annotation, on top of (not instead of) the existing diff-margin penalty', () => {
+  const base = { category: 'ui-visual', severity: 'medium', reproducibility_attempts: 1, reproducibility_successes: 1 };
+  const noAnnotation = scoreConfidence({ ...base, evidence: JSON.stringify({ diffPercentage: 1.5, thresholdPercent: 1.0 }) });
+  const aiConfirmed = scoreConfidence({ ...base, evidence: JSON.stringify({ diffPercentage: 1.5, thresholdPercent: 1.0, aiVisualReasoning: { isLikelyRealRegression: true } }) });
+  const aiNoise = scoreConfidence({ ...base, evidence: JSON.stringify({ diffPercentage: 1.5, thresholdPercent: 1.0, aiVisualReasoning: { isLikelyRealRegression: false } }) });
+
+  assert.ok(aiConfirmed > noAnnotation, 'an AI-confirmed regression must raise confidence above the un-annotated baseline');
+  assert.ok(aiNoise < noAnnotation, 'an AI-flagged-as-noise diff must lower confidence below the un-annotated baseline');
+  for (const score of [noAnnotation, aiConfirmed, aiNoise]) {
+    assert.ok(score >= CONFIDENCE_CONFIG.min && score <= CONFIDENCE_CONFIG.max);
+  }
+});
+
+test('withLlmGateway never cache-hits for visual_diff_reasoning, even on an identical prompt -- a text-only cache key could otherwise return a real-image classification for a different pair of screenshots', async () => {
+  const { withLlmGateway } = await import('../src/services/llmGatewayService.ts');
+  let runCalls = 0;
+  const run = async () => {
+    runCalls++;
+    return { result: { isLikelyRealRegression: true, reasoning: 'x' }, outputText: 'x' };
+  };
+  await withLlmGateway('visual_diff_reasoning', { provider: 'mock', prompt: 'diffPercentage=5 thresholdPercent=1' }, run);
+  await withLlmGateway('visual_diff_reasoning', { provider: 'mock', prompt: 'diffPercentage=5 thresholdPercent=1' }, run);
+  assert.equal(runCalls, 2, 'the second identical call must NOT be served from cache');
+});

@@ -21,7 +21,7 @@ import type { ModelTier } from "../llm/modelConfig.js";
 import { getMaxInputChars } from "../llm/modelConfig.js";
 
 export type { ModelTier } from "../llm/modelConfig.js";
-export type LlmCallType = "test_case_generation" | "script_generation" | "exploratory_decision";
+export type LlmCallType = "test_case_generation" | "script_generation" | "exploratory_decision" | "visual_diff_reasoning";
 
 // $/MTok, matching the SRS 13.5 worked example (Claude Sonnet 5 introductory
 // pricing) for the primary tier; the economy tier models a materially cheaper
@@ -55,6 +55,15 @@ const CACHE_SIMILARITY_THRESHOLD: Record<LlmCallType, number> = {
   // have to fall back from anyway. An exact match is still a real savings
   // for a genuinely repeated state (e.g. re-visiting the same page shape).
   exploratory_decision: 1,
+  // Master-prompt §7: caching is deliberately DISABLED for this call type
+  // (threshold > 1, so even an exact Jaccard match of 1.0 never qualifies).
+  // The cache key is built from the prepared prompt TEXT only
+  // (diffPercentage/threshold), which never includes the actual image
+  // bytes -- a text-only cache hit here could return a real-image
+  // classification for a completely different pair of screenshots that
+  // merely produced the same diff percentage, which is exactly the kind of
+  // wrong-but-plausible-looking answer this cache must never produce.
+  visual_diff_reasoning: 1.1,
 };
 const CACHE_MAX_ENTRIES = 200;
 const COMPRESSION_TRIGGER_CHARS = 1200; // only compress inputs large enough for it to matter (FR-9.6: "large inputs")

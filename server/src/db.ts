@@ -982,6 +982,15 @@ CREATE TABLE IF NOT EXISTS exploration_sessions (
 ensureColumn("org_settings", "exploration_default_max_actions", "INTEGER NOT NULL DEFAULT 20");
 ensureColumn("org_settings", "exploration_default_max_depth", "INTEGER NOT NULL DEFAULT 3");
 
+// Master-prompt §7 (Visual Regression): optional AI visual-diff reasoning,
+// layered ON TOP OF (never replacing) the existing deterministic pixel-diff
+// -- the pixel-diff still decides whether a finding exists at all; this only
+// adds an annotation (evidence.aiReasoning) and adjusts confidence. Defaults
+// OFF: it costs a real LLM call per visual-change finding and needs a real
+// vision-capable provider to be more than the mock's deterministic stand-in
+// -- "where available" per the master prompt's own phrasing, not a default-on behavior.
+ensureColumn("org_settings", "visual_ai_reasoning_enabled", "INTEGER NOT NULL DEFAULT 0");
+
 db.exec(`
 -- API response schema capture/validation: one row per distinct "METHOD path"
 -- endpoint seen during a crawl/execution. First sighting stores the inferred
