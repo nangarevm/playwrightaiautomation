@@ -1595,3 +1595,19 @@ test('verifyFinding returns NOT_VERIFIABLE for a functional/network-resilience f
 test('verifyFinding throws for an unknown finding id', async () => {
   await assert.rejects(() => verifyFinding('does-not-exist'), /not found/i);
 });
+
+// ---- Playbook §B: Auth deep-link probe (config default -- pure logic;
+// runAuthDeepLinkScenario() itself launches a real browser and was live-
+// verified separately against server/src/demo-app/auth-deep-link-fixture.html:
+// a fixture whose "guard" unconditionally shows protected content regardless
+// of auth state was caught as a CRITICAL auth-bypass finding, while the
+// correctly-gated fixture (shows a login form, not the protected content,
+// to an unauthenticated visitor) produced ZERO findings.) ----
+
+import { AUTH_DEEP_LINK_CONFIG } from '../src/services/authDeepLinkService.ts';
+
+test('AUTH_DEEP_LINK_CONFIG has sane defaults for grace/nav timeouts and a non-empty login-indicator selector list', () => {
+  assert.ok(AUTH_DEEP_LINK_CONFIG.graceMs > 0);
+  assert.ok(AUTH_DEEP_LINK_CONFIG.navTimeoutMs > 0);
+  assert.ok(AUTH_DEEP_LINK_CONFIG.loginIndicatorSelectors.length > 0);
+});

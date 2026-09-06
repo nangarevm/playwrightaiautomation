@@ -36,6 +36,7 @@ import { chaosExplorationRouter } from "./routes/chaosExploration.js";
 import { testPriorityRouter } from "./routes/testPriority.js";
 import { qualityIntelligenceRouter } from "./routes/qualityIntelligence.js";
 import { bugVerificationRouter } from "./routes/bugVerification.js";
+import { authDeepLinkRouter } from "./routes/authDeepLink.js";
 import { authzTestingRouter } from "./routes/authzTesting.js";
 import { exploratoryAgentRouter } from "./routes/exploratoryAgent.js";
 import { openApiContractsRouter } from "./routes/openApiContracts.js";
@@ -345,6 +346,7 @@ app.use("/api/chaos-exploration", chaosExplorationRouter);
 app.use("/api/test-priority", testPriorityRouter);
 app.use("/api/quality-intelligence", qualityIntelligenceRouter);
 app.use("/api/bug-verification", bugVerificationRouter);
+app.use("/api/auth-deep-link", authDeepLinkRouter);
 // Embedded Allure report viewer (Phase 8 step 5): served statically so the
 // client can open it in an <iframe> instead of requiring download/unzip/open.
 app.use("/allure-report", express.static(path.join(__dirname, "..", "allure-report")));

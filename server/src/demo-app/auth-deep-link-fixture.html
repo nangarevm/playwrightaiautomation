@@ -1,0 +1,38 @@
+<!doctype html>
+<html>
+<head><title>Auth Deep Link Fixture</title></head>
+<body>
+  <h1>Account Dashboard</h1>
+
+  <!-- Bug (?authBug=1): the "guard" only hides the login form, but the
+       protected content is in the initial HTML and always shown regardless
+       of auth state -- a classic client-side-only guard that never actually
+       gates anything. -->
+  <div id="protected-content" style="display:none">Welcome back! Your balance is $4,281.00.</div>
+
+  <!-- Correct behavior (default): protected content starts hidden, and is
+       only revealed if a real session cookie is present; otherwise the
+       login form is shown. -->
+  <form id="login-form" action="#" style="display:none">
+    <h2>Sign in</h2>
+    <input type="text" placeholder="Username" />
+    <input type="password" placeholder="Password" />
+    <button type="submit">Sign in</button>
+  </form>
+
+  <script>
+    const params = new URLSearchParams(location.search);
+    const authBug = params.get('authBug') === '1';
+    const hasSession = document.cookie.includes('session=');
+
+    if (authBug) {
+      // Bug: shows protected content unconditionally, ignoring auth state entirely.
+      document.getElementById('protected-content').style.display = 'block';
+    } else if (hasSession) {
+      document.getElementById('protected-content').style.display = 'block';
+    } else {
+      document.getElementById('login-form').style.display = 'block';
+    }
+  </script>
+</body>
+</html>
