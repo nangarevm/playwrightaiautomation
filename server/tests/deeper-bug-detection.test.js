@@ -1611,3 +1611,41 @@ test('AUTH_DEEP_LINK_CONFIG has sane defaults for grace/nav timeouts and a non-e
   assert.ok(AUTH_DEEP_LINK_CONFIG.navTimeoutMs > 0);
   assert.ok(AUTH_DEEP_LINK_CONFIG.loginIndicatorSelectors.length > 0);
 });
+
+// ---- Playbook §4: Static Discovery -- robots.txt Sitemap: directive
+// (fetchSitemapUrls itself makes a real network fetch and was live-verified
+// separately: a robots.txt served at the real site root declaring
+// `Sitemap: .../custom-sitemap.xml` -- a non-default path neither of the
+// two hardcoded guesses (/sitemap.xml, /sitemap_index.xml) would ever try --
+// correctly surfaced the one URL declared only in that custom sitemap.) ----
+
+import { fetchSitemapUrls } from '../src/crawler/urlUtils.ts';
+
+test('fetchSitemapUrls returns an empty array (not a throw) for a site with no reachable robots.txt or sitemap', async () => {
+  const urls = await fetchSitemapUrls('http://localhost:1/nonexistent-port-should-refuse-connection');
+  assert.deepEqual(urls, []);
+});
+
+// ---- Playbook §48: Final Report (pure aggregation over every other
+// service already built -- no browser launch, live-verified separately
+// with synthetic screens/findings: a report generated against a "changed"
+// Checkout screen carrying a critical finding correctly rolled it into the
+// bug dashboard, coverage model, quality score, heatmap, and ranked it as
+// the top test-priority screen, all in one assembled object.) ----
+
+import { generateFinalReport, FINAL_REPORT_CONFIG } from '../src/services/finalReportService.ts';
+
+test('generateFinalReport assembles the bug dashboard, coverage model, quality scores, heatmap, test priorities, and regressions into one report', () => {
+  makeTestScreenForPriority('fr-scr', 'Final Report Screen', 'checkout', 'changed');
+  recordBugFinding({ source: 'ui_exploratory', category: 'functional', severity: 'critical', title: 'Final report bug', detail: 'd', screenId: 'fr-scr', evidence: {} });
+
+  const report = generateFinalReport();
+  assert.ok(report.generatedAt);
+  assert.ok(typeof report.bugDashboard === 'object');
+  assert.ok(report.coverageModel.totalScreens >= 1);
+  assert.ok(typeof report.qualityScore.appWide.score === 'number');
+  assert.ok(report.qualityScore.worstScreens.length <= FINAL_REPORT_CONFIG.topScreensCount);
+  assert.ok(report.topHeatmapCells.some((c) => c.screenId === 'fr-scr'));
+  assert.ok(report.topPriorityScreens.some((p) => p.screenId === 'fr-scr'));
+  assert.ok(typeof report.regressions.summary.totalRegressedFindings === 'number');
+});

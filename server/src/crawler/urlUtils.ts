@@ -40,6 +40,29 @@ export function originOf(rawUrl: string): string | null {
   }
 }
 
+// Playbook §4 (Static Discovery): many real sites declare their sitemap at a
+// non-default path and only advertise it via a `Sitemap:` directive in
+// robots.txt (the two hardcoded guesses below miss those entirely) --
+// best-effort fetch robots.txt and fold any declared sitemap URLs into the
+// candidate list before falling back to the two conventional guesses. Never
+// throws/blocks on a missing or unparsable robots.txt -- exactly as
+// optional as the sitemap fetch itself already was.
+async function fetchRobotsTxtSitemapUrls(origin: string): Promise<string[]> {
+  try {
+    const res = await fetch(`${origin}/robots.txt`, { signal: AbortSignal.timeout(8000) });
+    if (!res.ok) return [];
+    const text = await res.text();
+    const urls: string[] = [];
+    for (const line of text.split(/\r?\n/)) {
+      const match = line.match(/^\s*sitemap\s*:\s*(\S+)/i);
+      if (match) urls.push(match[1].trim());
+    }
+    return urls;
+  } catch {
+    return []; // robots.txt is optional -- BFS/sitemap discovery still works without it
+  }
+}
+
 // Best-effort sitemap seeding so BFS doesn't miss pages only linked from sitemap.xml.
 // Recursively expands sitemap indexes and never returns nested *.xml sitemap URLs
 // as crawl targets (those are indexes, not user-facing pages).
@@ -47,7 +70,8 @@ export async function fetchSitemapUrls(siteUrl: string, maxUrls = 200): Promise<
   const origin = originOf(siteUrl);
   if (!origin) return [];
 
-  const candidates = [`${origin}/sitemap.xml`, `${origin}/sitemap_index.xml`];
+  const robotsTxtSitemaps = await fetchRobotsTxtSitemapUrls(origin);
+  const candidates = [...robotsTxtSitemaps, `${origin}/sitemap.xml`, `${origin}/sitemap_index.xml`];
   const found: string[] = [];
   const visitedSitemaps = new Set<string>();
 

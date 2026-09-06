@@ -37,6 +37,7 @@ import { testPriorityRouter } from "./routes/testPriority.js";
 import { qualityIntelligenceRouter } from "./routes/qualityIntelligence.js";
 import { bugVerificationRouter } from "./routes/bugVerification.js";
 import { authDeepLinkRouter } from "./routes/authDeepLink.js";
+import { finalReportRouter } from "./routes/finalReport.js";
 import { authzTestingRouter } from "./routes/authzTesting.js";
 import { exploratoryAgentRouter } from "./routes/exploratoryAgent.js";
 import { openApiContractsRouter } from "./routes/openApiContracts.js";
@@ -115,6 +116,20 @@ app.use(attachUser); // FR-8.1: resolve X-User-Id into req.user (defaults to a p
 app.use(rateLimitMiddleware); // Dev TDD §6.5: 429 RATE_LIMITED, per-identity fixed window
 app.use(enforceReadOnlyRoles); // FR-8.1: Manager/Stakeholder role is read-only
 app.use(idempotencyMiddleware); // SR-FR-0.4: replay the stored response for a repeated Idempotency-Key
+
+// Playbook §4 (Static Discovery) verification fixture: a robots.txt at the
+// real site root declaring a Sitemap: directive pointing at a NON-default
+// path (/demo/custom-sitemap.xml, not /sitemap.xml or /sitemap_index.xml),
+// proving fetchSitemapUrls (urlUtils.ts) actually reads robots.txt rather
+// than only ever trying the two hardcoded default paths.
+app.get("/robots.txt", (req, res) => {
+  res.type("text/plain").send(`User-agent: *\nDisallow:\nSitemap: ${req.protocol}://${req.get("host")}/demo/custom-sitemap.xml\n`);
+});
+app.get("/demo/custom-sitemap.xml", (req, res) => {
+  res.type("application/xml").send(
+    `<?xml version="1.0" encoding="UTF-8"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"><url><loc>${req.protocol}://${req.get("host")}/demo/login.html</loc></url></urlset>`
+  );
+});
 
 // Bundled demo app-under-test, so generated scripts have something real to run against
 app.use("/demo", express.static(path.join(__dirname, "demo-app")));
@@ -347,6 +362,7 @@ app.use("/api/test-priority", testPriorityRouter);
 app.use("/api/quality-intelligence", qualityIntelligenceRouter);
 app.use("/api/bug-verification", bugVerificationRouter);
 app.use("/api/auth-deep-link", authDeepLinkRouter);
+app.use("/api/final-report", finalReportRouter);
 // Embedded Allure report viewer (Phase 8 step 5): served statically so the
 // client can open it in an <iframe> instead of requiring download/unzip/open.
 app.use("/allure-report", express.static(path.join(__dirname, "..", "allure-report")));
