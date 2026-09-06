@@ -10,7 +10,11 @@
 // ellipsis and no -webkit-line-clamp, content wider/taller than the box), and
 // interactive elements positioned entirely outside the horizontal viewport
 // while still not marked aria-hidden (a mouse user can never reach them, but
-// they may still be tab-focusable).
+// they may still be tab-focusable), interactive elements covered by a
+// different, unrelated element at their own center point (master prompt §6's
+// "clickable elements that cannot be clicked" / "unclickable clickable" --
+// a z-index/overlay bug), and page content wider than the viewport (forced
+// horizontal scrolling).
 //
 // NOTE ON STYLE: every helper below is inlined at its call site inside the
 // page.evaluate() callback -- no local `const foo = () => {}` function
@@ -25,7 +29,13 @@
 import type { Page } from "playwright";
 import { db } from "../db.js";
 
-export type DomIssueKind = "zero_size_with_content" | "overlapping_elements" | "text_overflow" | "off_viewport";
+export type DomIssueKind =
+  | "zero_size_with_content"
+  | "overlapping_elements"
+  | "text_overflow"
+  | "off_viewport"
+  | "covered_element"
+  | "horizontal_scroll_overflow";
 
 export interface DomIssue {
   kind: DomIssueKind;
@@ -228,6 +238,55 @@ export async function runDomChecks(page: Page, ignoreSelectors: string[] = []): 
             message: `${offViewport.length} interactive element(s) are positioned entirely outside the horizontal viewport (not marked aria-hidden) -- unreachable by a sighted mouse user.`,
             samples: offViewport.slice(0, 3),
             count: offViewport.length,
+          });
+        }
+
+        // 5. Covered/unclickable elements ("unclickable clickable"): the
+        // element actually hit-tested at each interactive element's own
+        // center point should be itself, one of its own descendants (an
+        // icon inside a button), or an ancestor wrapper -- if a DIFFERENT,
+        // unrelated element is hit instead, a real user click there lands
+        // on the wrong target (a classic z-index/overlay bug: a transparent
+        // modal backdrop or an absolutely-positioned decoration sitting on
+        // top of a real, "visible" button).
+        const covered: string[] = [];
+        for (const el of interactive) {
+          if (covered.length >= maxSamples) break;
+          if (ignored.has(el)) continue;
+          const rect = el.getBoundingClientRect();
+          if (rect.width === 0 || rect.height === 0) continue;
+          const cx = rect.left + rect.width / 2;
+          const cy = rect.top + rect.height / 2;
+          if (cx < 0 || cy < 0 || cx > window.innerWidth || cy > window.innerHeight) continue; // already covered by the off-viewport check above
+          const hit = document.elementFromPoint(cx, cy);
+          if (!hit || hit === el || el.contains(hit) || hit.contains(el)) continue;
+          const label = (el.getAttribute("aria-label") || el.textContent || el.tagName).toString().trim().slice(0, 30);
+          const hitLabel = (hit.getAttribute("aria-label") || hit.textContent || hit.tagName).toString().trim().slice(0, 30);
+          covered.push(`"${label}" is covered by "${hitLabel}" at its own center point`);
+        }
+        if (covered.length > 0) {
+          issues.push({
+            kind: "covered_element",
+            severity: "high",
+            message: `${covered.length} interactive element(s) are covered by a different, unrelated element at their own center point -- a real click there would hit the wrong target ("unclickable clickable").`,
+            samples: covered.slice(0, 3),
+            count: covered.length,
+          });
+        }
+
+        // 6. Horizontal scroll overflow: the page's content is wider than
+        // the viewport, forcing horizontal scrolling -- almost always an
+        // unintentional layout bug (a fixed-width element, an image
+        // without max-width: 100%) rather than a deliberate design choice.
+        const scrollWidth = document.documentElement.scrollWidth;
+        const viewportWidth = window.innerWidth;
+        if (scrollWidth > viewportWidth + 5) {
+          issues.push({
+            kind: "horizontal_scroll_overflow",
+            severity: "medium",
+            message: `The page's content (${scrollWidth}px) is wider than the viewport (${viewportWidth}px), forcing horizontal scrolling.`,
+            samples: [],
+            count: 1,
           });
         }
 

@@ -1,0 +1,27 @@
+<!doctype html>
+<html>
+<head>
+  <title>Covered/Scroll Fixture</title>
+  <style>
+    body { margin: 0; }
+    .wide-box { width: 2000px; height: 50px; background: #eee; }
+    .stack { position: relative; width: 200px; height: 50px; }
+    .real-button { position: absolute; top: 0; left: 0; width: 200px; height: 50px; }
+    .overlay { position: absolute; top: 0; left: 0; width: 200px; height: 50px; background: rgba(0,0,0,0.01); z-index: 10; }
+  </style>
+</head>
+<body>
+  <h1>Covered element + horizontal scroll fixture</h1>
+
+  <!-- Deliberate bug: an invisible overlay div sits on top of a real button,
+       intercepting clicks that appear to land on the button. -->
+  <div class="stack">
+    <button class="real-button" id="real-btn">Submit</button>
+    <div class="overlay" id="click-blocker"></div>
+  </div>
+
+  <!-- Deliberate bug: a fixed-width element wider than any reasonable
+       viewport forces horizontal scrolling. -->
+  <div class="wide-box">This box is deliberately too wide for the viewport.</div>
+</body>
+</html>
