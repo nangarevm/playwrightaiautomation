@@ -1285,3 +1285,90 @@ test('FILE_TRANSFER_CONFIG has sane defaults for grace/nav/download timeouts and
   assert.ok(FILE_TRANSFER_CONFIG.successIndicatorSelectors.length > 0);
   assert.ok(FILE_TRANSFER_CONFIG.errorIndicatorSelectors.length > 0);
 });
+
+// ---- Playbook §32/§33: Hypothesis Engine + Bug Expansion Engine (pure
+// DB-aggregation logic -- no browser launch, both live-verified separately
+// against synthetic screens/findings: the same console error recorded on
+// two different screens grouped into one systemic-issue spanning both,
+// while an unrelated one-off finding on a third screen did not; a
+// network-resilience finding generated exactly one hypothesis naming every
+// OTHER cataloged screen as a candidate, while a plain console-error
+// finding -- already covered automatically everywhere by the passive scan
+// -- generated none.) ----
+
+import { findSystemicIssues } from '../src/services/bugExpansionService.ts';
+import { generateHypotheses } from '../src/services/hypothesisEngineService.ts';
+
+function makeTestScreen(id, name) {
+  const now = new Date().toISOString();
+  db.prepare(
+    "INSERT INTO screens (id, name, module_name, source_input_id, url_or_path, last_captured_state_hash, change_status, last_compared_at, created_at, updated_at) VALUES (?, ?, NULL, 'test-src', ?, 'hash', 'new', ?, ?, ?)"
+  ).run(id, name, `http://x/${name}`, now, now, now);
+}
+
+test('findSystemicIssues groups the same defect recurring across 2+ screens, and excludes a one-off finding seen on only 1 screen', () => {
+  makeTestScreen('exp-scr-1', 'Expansion Screen 1');
+  makeTestScreen('exp-scr-2', 'Expansion Screen 2');
+  makeTestScreen('exp-scr-3', 'Expansion Screen 3');
+
+  recordBugFinding({
+    source: 'ui_exploratory',
+    category: 'console-error',
+    severity: 'medium',
+    title: "Console error: Cannot read properties of undefined (reading 'map')",
+    detail: "TypeError: Cannot read properties of undefined (reading 'map') at renderList",
+    screenId: 'exp-scr-1',
+    evidence: { endpointKey: 'shared-list-component' },
+  });
+  recordBugFinding({
+    source: 'ui_exploratory',
+    category: 'console-error',
+    severity: 'medium',
+    title: "Console error: Cannot read properties of undefined (reading 'map')",
+    detail: "TypeError: Cannot read properties of undefined (reading 'map') at renderList",
+    screenId: 'exp-scr-2',
+    evidence: { endpointKey: 'shared-list-component' },
+  });
+  recordBugFinding({
+    source: 'ui_exploratory',
+    category: 'console-error',
+    severity: 'low',
+    title: 'Console error: 404 favicon.ico not found',
+    detail: 'GET /favicon.ico 404',
+    screenId: 'exp-scr-3',
+    evidence: {},
+  });
+
+  const groups = findSystemicIssues({ minScreens: 2 });
+  const sharedGroup = groups.find((g) => g.sampleTitle.includes('renderList') === false && g.sampleTitle.includes("reading 'map'"));
+  assert.ok(sharedGroup, 'the shared console error must be classified as a systemic issue');
+  assert.equal(sharedGroup.screenIds.length, 2);
+  assert.ok(sharedGroup.screenIds.includes('exp-scr-1') && sharedGroup.screenIds.includes('exp-scr-2'));
+  assert.ok(!groups.some((g) => g.sampleTitle.includes('favicon')), 'a one-off finding seen on only 1 screen must not be classified as systemic');
+});
+
+test('generateHypotheses suggests network-failure-injection for a network-resilience finding, naming every OTHER cataloged screen as a candidate', () => {
+  makeTestScreen('hyp-scr-1', 'Hypothesis Screen 1');
+  makeTestScreen('hyp-scr-2', 'Hypothesis Screen 2');
+
+  const finding = recordBugFinding({
+    source: 'ui_exploratory',
+    category: 'network-resilience',
+    severity: 'high',
+    title: 'Infinite spinner after injected "timeout" failure: Checkout pay',
+    detail: 'stuck spinner',
+    screenId: 'hyp-scr-1',
+    evidence: { scenario: 'Checkout pay', mode: 'timeout' },
+  });
+
+  const hypotheses = generateHypotheses(finding, finding.screen_id);
+  assert.equal(hypotheses.length, 1);
+  assert.equal(hypotheses[0].suggestedScenarioType, 'network-failure-injection');
+  assert.ok(!hypotheses[0].candidateScreens.some((s) => s.id === 'hyp-scr-1'), "the finding's own screen must be excluded from its own candidate list");
+  assert.ok(hypotheses[0].candidateScreens.some((s) => s.id === 'hyp-scr-2'));
+});
+
+test('generateHypotheses returns zero hypotheses for a category already covered by the automatic passive scan (e.g. plain console-error)', () => {
+  const hypotheses = generateHypotheses({ category: 'console-error', title: 'Console error: some noise', evidence: '{}' });
+  assert.equal(hypotheses.length, 0);
+});
