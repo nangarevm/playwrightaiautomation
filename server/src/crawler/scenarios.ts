@@ -26,7 +26,7 @@
 
 import { nanoid } from "nanoid";
 import type { ElementRecord, NavEdge, ScenarioRecord } from "./types.js";
-import { pickPreferredLocator, stripTransientLoadingLabel } from "./locatorQuality.js";
+import { pickPreferredLocator, stripTransientLoadingLabel, isBrowserChromeLabel } from "./locatorQuality.js";
 
 const MAX_PER_FIELD_CATEGORY = 6; // cap individual-field scenarios per form (required-empty, invalid-format)
 const MAX_STANDALONE_ELEMENTS = 12; // cap per-element scenarios on a no-form page
@@ -94,6 +94,10 @@ function makeScenario(
   };
 }
 
+function productElements(elements: ElementRecord[]): ElementRecord[] {
+  return elements.filter((e) => !isBrowserChromeLabel(e.label || ""));
+}
+
 function isFilterChipLabel(label: string): boolean {
   // Keep this list tight: only generic facet chips mistaken for submit, not real nav labels.
   return /^(all|none|images?|videos?|audio|filter|filters|sort|close|more|\d+)$/i.test(label.trim());
@@ -108,7 +112,7 @@ function isSubmitLikeLabel(label: string): boolean {
 
 /** Prefer real submit/search controls; never treat category chips like "All" as submit. */
 function pickSubmitControl(formElements: ElementRecord[]): ElementRecord | undefined {
-  const buttons = formElements.filter((e) => e.type === "button" && e.label);
+  const buttons = formElements.filter((e) => e.type === "button" && e.label && !isBrowserChromeLabel(e.label));
   const preferred = buttons.find((b) => isSubmitLikeLabel(b.label));
   const chosen = preferred || buttons.find((b) => !isFilterChipLabel(b.label));
   if (!chosen) return undefined;
@@ -125,8 +129,8 @@ function buildFormScenarios(
   formElements: ElementRecord[],
   coverageMode: import("./types.js").CoverageMode = "full"
 ): ScenarioRecord[] {
-  const inputs = formElements.filter((e) => ["input", "textarea", "dropdown", "checkbox"].includes(e.type));
-  const submit = pickSubmitControl(formElements);
+  const inputs = productElements(formElements).filter((e) => ["input", "textarea", "dropdown", "checkbox"].includes(e.type));
+  const submit = pickSubmitControl(productElements(formElements));
   if (inputs.length === 0) return [];
 
   const flowGroup = formElements[0]?.component || pageTitle;
@@ -234,7 +238,7 @@ function buildFormScenarios(
           `Given the user is on "${pageTitle}"`,
           `When the user ${skipClause}, filling in every other field with a valid value`,
           submitStep,
-          "Then the form is still accepted since that field isn't required",
+          "Then the form is still accepted since that field is not required",
         ],
         [field, ...submitLocator]
       )
@@ -291,7 +295,7 @@ function buildFormScenarios(
         flowGroup,
         [
           `Given the user is on "${pageTitle}"`,
-          `When the user enters a value that isn't a valid ${field.inputType} into "${field.label}"`,
+          `When the user fills in "${field.label}" with an invalid ${field.inputType}`,
           submitStep,
           `Then a format-validation error is shown for "${field.label}" and the form is not submitted`,
         ],
@@ -385,6 +389,38 @@ function buildFormScenarios(
     );
   }
 
+  // 10. Break-the-app: XSS / HTML / SQL-like payloads against the first text field.
+  if (textField) {
+    scenarios.push(
+      makeScenario(
+        `Verify ${flowGroup} does not execute injected script from "${textField.label}"`,
+        "negative",
+        flowGroup,
+        [
+          `Given the user is on "${pageTitle}"`,
+          `When the user fills in "${textField.label}" with "<script>alert(1)</script><img src=x onerror=alert(1)>"`,
+          submitStep,
+          "Then the payload is treated as text, no script runs, and the page does not white-screen",
+        ],
+        [textField, ...submitLocator]
+      )
+    );
+    scenarios.push(
+      makeScenario(
+        `Verify ${flowGroup} stays stable with SQL-like input in "${textField.label}"`,
+        "negative",
+        flowGroup,
+        [
+          `Given the user is on "${pageTitle}"`,
+          `When the user fills in "${textField.label}" with "OR 1=1 DROP TABLE users"`,
+          submitStep,
+          "Then the app shows validation or a safe error — not a 500 or empty crash page",
+        ],
+        [textField, ...submitLocator]
+      )
+    );
+  }
+
   return scenarios;
 }
 
@@ -416,10 +452,10 @@ export function buildBaselineCoverageScenarios(
   pageTitle: string,
   elements: ElementRecord[],
   pageUrl?: string,
-  coverageMode: import("./types.js").CoverageMode = "minimal"
+  _coverageMode: import("./types.js").CoverageMode = "minimal"
 ): ScenarioRecord[] {
   const label = pageDisplayName(pageTitle, pageUrl);
-  const scenarios: ScenarioRecord[] = [
+  return [
     makeScenario(
       `Verify ${label} loads successfully`,
       "positive",
@@ -428,29 +464,24 @@ export function buildBaselineCoverageScenarios(
       elements.slice(0, 5),
       "smoke"
     ),
+    makeScenario(
+      `Regression: verify ${label} still loads and renders key content`,
+      "positive",
+      label,
+      [
+        `Given the user navigates to "${label}"`,
+        "When the page finishes loading",
+        "Then key content is visible and the page is not blank or errored",
+      ],
+      elements.slice(0, 5),
+      "regression"
+    ),
   ];
-  if (coverageMode !== "minimal") {
-    scenarios.push(
-      makeScenario(
-        `Regression: verify ${label} still loads and renders key content`,
-        "positive",
-        label,
-        [
-          `Given the user navigates to "${label}"`,
-          "When the page finishes loading",
-          "Then key content is visible and the page is not blank or errored",
-        ],
-        elements.slice(0, 5),
-        "regression"
-      )
-    );
-  }
-  return scenarios;
 }
 
 /** Intra-page multi-step journey when the site has no cross-page nav edges yet. */
 export function buildIntraPageFlowScenario(pageTitle: string, elements: ElementRecord[]): ScenarioRecord | null {
-  const interactive = elements.filter((e) => ["link", "button", "input", "dropdown"].includes(e.type) && e.label);
+  const interactive = productElements(elements).filter((e) => ["link", "button", "input", "dropdown"].includes(e.type) && e.label);
   if (interactive.length < 2) return null;
   const steps = interactive.slice(0, 4);
   const narrated: string[] = [`Given the user starts on "${pageTitle}"`];
@@ -462,13 +493,13 @@ export function buildIntraPageFlowScenario(pageTitle: string, elements: ElementR
       narrated.push(`${connector} the user clicks "${el.label}"`);
     }
   });
-  narrated.push(`Then the user completes the in-page flow on "${pageTitle}" without errors`);
+  narrated.push(`Then the end-to-end in-page flow on "${pageTitle}" completes without errors`);
   return {
     id: nanoid(10),
-    title: `Verify the in-page flow on "${pageTitle}"`,
+    title: `End-to-end: verify the full in-page scenario on "${pageTitle}"`,
     type: "flow",
     tier: "regression",
-    flowGroup: `Flow: ${pageTitle}`,
+    flowGroup: `E2E: ${pageTitle}`,
     steps: narrated,
     locators: steps.flatMap((e) => e.locators.slice(0, 1)),
   };
@@ -479,7 +510,7 @@ export function buildNegativeAndEdgeBaselines(pageTitle: string, elements: Eleme
   const scenarios: ScenarioRecord[] = [];
   const label = pageDisplayName(pageTitle, pageUrl);
   const inputs = elements.filter((e) => ["input", "textarea", "dropdown", "checkbox"].includes(e.type) && e.label);
-  const buttons = elements.filter((e) => e.type === "button" && e.label);
+  const buttons = productElements(elements).filter((e) => e.type === "button" && e.label);
   const links = elements.filter((e) => e.type === "link" && e.label);
   const textInputs = inputs.filter((i) => (i.type === "input" || i.type === "textarea") && i.inputType !== "file");
 
@@ -589,13 +620,17 @@ export function buildScenariosForPage(
   formCount: number,
   pageUrl?: string,
   componentInventory?: import("./types.js").ComponentInventoryItem[],
-  coverageMode: import("./types.js").CoverageMode = "minimal"
+  coverageMode: import("./types.js").CoverageMode = "full"
 ): ScenarioRecord[] {
-  const mode = coverageMode || "minimal";
+  const mode = coverageMode || "full";
   const label = pageDisplayName(pageTitle, pageUrl);
 
   if (mode === "minimal") {
-    return buildMinimalScenariosForPage(pageTitle, elements, formCount, pageUrl, componentInventory || []);
+    const minimal = buildMinimalScenariosForPage(pageTitle, elements, formCount, pageUrl, componentInventory || []);
+    const e2e = buildIntraPageFlowScenario(pageTitle, elements);
+    if (e2e) minimal.push(e2e);
+    minimal.push(...buildNegativeAndEdgeBaselines(pageTitle, elements, pageUrl).slice(0, 2));
+    return minimal;
   }
 
   // Smoke page-load + regression health are required for every discovered page --
@@ -624,7 +659,7 @@ export function buildScenariosForPage(
 
   // Nav/link coverage on every page (in addition to smoke/regression baselines).
   const standaloneCap = mode === "standard" ? MAX_STANDALONE_STANDARD : MAX_STANDALONE_ELEMENTS;
-  const standalone = elements.filter((e) => ["link", "button"].includes(e.type) && e.label);
+  const standalone = productElements(elements).filter((e) => ["link", "button"].includes(e.type) && e.label);
   for (const el of standalone.slice(0, standaloneCap)) {
     scenarios.push(
       makeScenario(
@@ -637,6 +672,9 @@ export function buildScenariosForPage(
       )
     );
   }
+
+  const e2e = buildIntraPageFlowScenario(pageTitle, elements);
+  if (e2e) scenarios.push(e2e);
 
   return scenarios;
 }
@@ -702,7 +740,7 @@ export function buildConsolidatedComponentScenario(
   const label = pageDisplayName(pageTitle, pageUrl);
   const kinds = inventory.map((i) => i.label);
   const links = elements.filter((e) => e.type === "link" && e.label && !/^(https?:\/\/|www\.)/i.test(e.label));
-  const buttons = elements.filter((e) => e.type === "button" && e.label);
+  const buttons = productElements(elements).filter((e) => e.type === "button" && e.label);
   const inputs = elements.filter((e) => (e.type === "input" || e.type === "textarea") && e.label);
   const dropdowns = elements.filter((e) => e.type === "dropdown" && e.label);
 
@@ -751,7 +789,7 @@ export function buildComponentCoverageScenarios(
   const label = pageDisplayName(pageTitle, pageUrl);
   const scenarios: ScenarioRecord[] = [];
   const links = elements.filter((e) => e.type === "link" && e.label && !/^(https?:\/\/|www\.)/i.test(e.label));
-  const buttons = elements.filter((e) => e.type === "button" && e.label);
+  const buttons = productElements(elements).filter((e) => e.type === "button" && e.label);
   const inputs = elements.filter((e) => (e.type === "input" || e.type === "textarea") && e.label);
   const dropdowns = elements.filter((e) => e.type === "dropdown" && e.label);
   const checkboxes = elements.filter((e) => e.type === "checkbox" && e.label);
@@ -966,20 +1004,20 @@ export function buildComponentCoverageScenarios(
         );
         break;
       case "modals":
-        push(
-          `Verify modal/dialog content is reachable on ${label}`,
-          [
-            `Given the user is on "${label}"`,
-            ...(buttons.find((b) => /open|show|modal|dialog|report|contact/i.test(b.label))
-              ? [
-                  `When the user clicks "${buttons.find((b) => /open|show|modal|dialog|report|contact/i.test(b.label))!.label}"`,
-                  "Then a modal/dialog becomes visible",
-                ]
-              : ["Then a dialog region is present or can be opened from the page"]),
-          ],
-          buttons.filter((b) => /open|show|modal|dialog|report|contact/i.test(b.label)).slice(0, 1),
-          "functional"
-        );
+        {
+          const opener = buttons.find((b) => /open|show|modal|dialog|contact|subscribe|login|sign/i.test(b.label) && !/report/i.test(b.label));
+          if (!opener) break;
+          push(
+            `Verify modal/dialog content is reachable on ${label}`,
+            [
+              `Given the user is on "${label}"`,
+              `When the user clicks "${opener.label}"`,
+              "Then a modal/dialog becomes visible",
+            ],
+            [opener],
+            "functional"
+          );
+        }
         break;
       case "filters":
         push(
@@ -1233,7 +1271,7 @@ export function buildFlowScenariosForSite(
 
     const scenario: ScenarioRecord = {
       id: nanoid(10),
-      title: `Verify the end-to-end flow from "${titles[0]}" to "${titles[titles.length - 1]}"`,
+      title: `End-to-end: verify the journey from "${titles[0]}" to "${titles[titles.length - 1]}"`,
       type: "flow",
       tier: "regression", // core user journey -- part of the regression baseline
       flowGroup: `Journey: ${titles.join(" → ")}`,

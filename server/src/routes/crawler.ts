@@ -18,6 +18,7 @@ import type { CoverageMode } from "../crawler/types.js";
 import { planImpactSuite, startImpactSuite, getImpactSuiteJob, getLatestImpactSuiteJob, type ImpactTier } from "../services/impactSuiteService.js";
 import { db } from "../db.js";
 import { daysSinceIsoHint, estimateRecrawlEta } from "../services/recrawlCockpitService.js";
+import { exportCrawlScenariosToPdf, exportCrawlScenariosToXlsx } from "../services/testCaseFeatures.js";
 
 export const crawlerRouter = Router();
 
@@ -53,7 +54,7 @@ crawlerRouter.post("/run", async (req, res) => {
       mode,
       coverageMode,
     });
-    res.status(202).json({ siteId, isRerun, mode: resolvedMode, modeReason, status: "running", coverageMode: coverageMode || "minimal" });
+    res.status(202).json({ siteId, isRerun, mode: resolvedMode, modeReason, status: "running", coverageMode: coverageMode || "full" });
   } catch (err: any) {
     res.status(400).json(errBody(400, err.message || "Failed to start crawl."));
   }
@@ -243,7 +244,7 @@ crawlerRouter.post("/sites/:id/component-coverage/ensure", (req, res) => {
 
 /** Rebuild active scenarios to minimal/standard/full coverage without a full re-crawl. */
 crawlerRouter.post("/sites/:id/coverage/rebuild", (req, res) => {
-  const coverageMode = (req.body?.coverageMode || "minimal") as CoverageMode;
+  const coverageMode = (req.body?.coverageMode || "full") as CoverageMode;
   if (coverageMode !== "minimal" && coverageMode !== "standard" && coverageMode !== "full") {
     return res.status(400).json(errBody(400, "coverageMode must be 'minimal', 'standard', or 'full'."));
   }
@@ -257,6 +258,63 @@ crawlerRouter.post("/sites/:id/coverage/rebuild", (req, res) => {
 
 crawlerRouter.get("/sites/:id/scenarios", (req, res) => {
   res.json(listScenariosForSite(req.params.id, req.query.includeDeleted === "true"));
+});
+
+crawlerRouter.get("/sites/:id/export", async (req, res) => {
+  const format = String(req.query.format || "xlsx").toLowerCase();
+  if (format !== "xlsx" && format !== "pdf") {
+    return res.status(400).json(errBody(400, "format must be xlsx or pdf."));
+  }
+  const site = getSite(req.params.id);
+  if (!site) return res.status(404).json(errBody(404, "Site not found."));
+  const rows = db
+    .prepare(
+      `SELECT s.id, s.title, s.type, s.tier, s.steps_json, p.title as page_title, p.url as page_url
+       FROM crawl_scenarios s
+       JOIN crawl_pages p ON p.id = s.page_id
+       WHERE s.site_id = ? AND s.status = 'active'
+       ORDER BY p.url ASC, s.created_at ASC`
+    )
+    .all(req.params.id) as Array<{
+    id: string;
+    title: string;
+    type: string;
+    tier: string;
+    steps_json: string;
+    page_title: string;
+    page_url: string;
+  }>;
+  if (rows.length === 0) return res.status(404).json(errBody(404, "No test cases to export yet. Finish a crawl first."));
+  const mapped = rows.map((r) => {
+    let steps: string[] = [];
+    try {
+      steps = JSON.parse(r.steps_json || "[]");
+    } catch {
+      steps = [];
+    }
+    return {
+      id: r.id,
+      title: r.title,
+      type: r.type,
+      tier: r.tier,
+      pageTitle: r.page_title,
+      pageUrl: r.page_url,
+      steps,
+    };
+  });
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  try {
+    if (format === "xlsx") {
+      const exportPath = await exportCrawlScenariosToXlsx(mapped, `site-${req.params.id}-test-cases-${stamp}.xlsx`);
+      return res.download(exportPath);
+    }
+    const buffer = await exportCrawlScenariosToPdf(mapped);
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader("Content-Disposition", `attachment; filename="site-${req.params.id}-test-cases-${stamp}.pdf"`);
+    return res.send(buffer);
+  } catch (err: any) {
+    res.status(500).json(errBody(500, err.message || "Export failed."));
+  }
 });
 
 crawlerRouter.delete("/scenarios/:id", (req, res) => {

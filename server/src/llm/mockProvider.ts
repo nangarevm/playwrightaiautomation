@@ -4,6 +4,9 @@ import {
   scoreStableLocator,
   stripTransientLoadingLabel,
   stableRoleNameExpr,
+  isBrowserChromeLabel,
+  extractQuotedFieldLabel,
+  fieldLocatorFallbacks,
 } from "../crawler/locatorQuality.js";
 
 // A deterministic "AI" stand-in so the whole pipeline is runnable/demo-able
@@ -422,18 +425,27 @@ function buildCrawledPlaywrightScript(
       continue;
     }
 
-    const quoted = step.match(/["']([^"']+)["']/)?.[1];
+    const quoted = extractQuotedFieldLabel(step) || step.match(/"([^"]+)"/)?.[1];
     const locator = resolveCrawlLocatorForStep(step, locators, used);
 
     if (/\bfills?\s+in\b|\benters?\b|\btypes?\b|\bpastes?\b|\battach(?:es)?\b/.test(stepLower)) {
       stepLines.push(`  // ${collapsed}`);
       ensureSearchUiOpen();
-      if (locator) {
-        const value = inferFillValue(stepLower, quoted);
-        // Prefer fill directly — scrollIntoView times out on hidden/collapsed controls.
-        stepLines.push(`  await ${withFirst(locator)}.fill(${JSON.stringify(value)}, { timeout: 10000 });`);
+      const fillLabel = quoted || extractQuotedFieldLabel(step);
+      if (fillLabel && isBrowserChromeLabel(fillLabel)) {
+        stepLines.push(`  // skipped browser/hosting chrome field "${fillLabel}"`);
         lastClickLocator = null;
+        continue;
       }
+      const fillLocator =
+        locator && !/getByLabel\('t |getByRole\('textbox',\s*\{\s*name:\s*'t /i.test(locator)
+          ? locator
+          : fillLabel
+            ? fieldLocatorFallbacks(fillLabel)
+            : `page.locator('input:visible, textarea:visible').first()`;
+      const value = inferFillValue(stepLower, fillLabel || quoted);
+      stepLines.push(`  await ${withFirst(fillLocator)}.fill(${JSON.stringify(value)}, { timeout: 10000 });`);
+      lastClickLocator = null;
       continue;
     }
 
@@ -465,6 +477,11 @@ function buildCrawledPlaywrightScript(
 
     if (/\bclicks?\b|\bsubmits?\b|\btoggles?\b|\bpress(?:es)?\b/.test(stepLower)) {
       stepLines.push(`  // ${collapsed}`);
+      if (quoted && isBrowserChromeLabel(quoted)) {
+        stepLines.push(`  // skipped browser/hosting chrome control "${quoted}"`);
+        lastClickLocator = null;
+        continue;
+      }
       ensureSearchUiOpen();
 
       // Empty-submit / generic submit: prefer a real Search/Submit control, else Enter.
@@ -606,6 +623,7 @@ function isFragileClickLabel(label: string): boolean {
   const v = label.trim();
   if (v.length < 2) return true;
   if (/cdn-cgi|^#|^(https?:\/\/|www\.)/i.test(v)) return true;
+  if (isBrowserChromeLabel(v)) return true;
   // Extremely long truncated card blurbs almost always animate / truncate in DOM
   if (v.length > 90) return true;
   return false;
@@ -634,7 +652,7 @@ function locatorLabel(locator: string): string | null {
 }
 
 function resolveCrawlLocatorForStep(step: string, locators: string[], used: Set<number>): string | null {
-  const quoted = step.match(/["']([^"']+)["']/)?.[1];
+  const quoted = extractQuotedFieldLabel(step) || step.match(/"([^"]{2,80})"/)?.[1];
   const wantsClick = /\bclicks?\b|\bsubmits?\b|\btoggles?\b|\bpress(?:es)?\b/.test(step.toLowerCase());
   const wantsFill = /\bfills?\s+in\b|\benters?\b|\btypes?\b|\bpastes?\b|\battach(?:es)?\b/.test(step.toLowerCase());
   if (quoted) {
@@ -666,18 +684,15 @@ function resolveCrawlLocatorForStep(step: string, locators: string[], used: Set<
     if (ranked[0] && ranked[0].score >= 40) {
       used.add(ranked[0].i);
       // If the best match is still a brittle #id for a fill, synthesize label/role.
-      if (wantsFill && /locator\(["']#/.test(ranked[0].l)) {
-        const idle = stripTransientLoadingLabel(quoted);
-        return `page.getByLabel(${JSON.stringify(idle)}).or(page.getByRole('textbox', { name: ${JSON.stringify(idle)} }))`;
+      if (wantsFill && (/locator\(["']#/.test(ranked[0].l) || /Your email\*/.test(ranked[0].l))) {
+        return fieldLocatorFallbacks(quoted);
       }
       return normalizeLocatorExpression(ranked[0].l);
     }
     // No inventory match: for fills, still prefer label/role over inventing CSS.
     if (wantsFill) {
       const idle = stripTransientLoadingLabel(quoted);
-      if (idle) {
-        return `page.getByLabel(${JSON.stringify(idle)}).or(page.getByRole('textbox', { name: ${JSON.stringify(idle)} }))`;
-      }
+      if (idle) return fieldLocatorFallbacks(idle);
     }
     if (wantsClick) {
       const idle = stripTransientLoadingLabel(quoted);
@@ -733,14 +748,17 @@ function pickSubmitLocator(locators: string[], used: Set<number>): string | null
 }
 
 function inferFillValue(stepLower: string, quoted?: string): string {
-  if (/invalid email|bad email|malformed/.test(stepLower)) return "not-an-email";
-  if (/whitespace|spaces only|blank spaces/.test(stepLower)) return "   ";
-  if (/extremely long|very long|too long/.test(stepLower)) return "x".repeat(256);
+  if (/<script|onerror|xss|injected script/.test(stepLower)) {
+    return "<script>alert(1)</script><img src=x onerror=alert(1)>";
+  }
+  if (/drop table|or 1=1|sql-like/.test(stepLower)) return "' OR 1=1;--";
+  if (/invalid email|bad email|malformed|invalid e-mail/.test(stepLower)) return "not-an-email";
+  if (/whitespace|spaces only|blank spaces|only spaces/.test(stepLower)) return "   ";
+  if (/extremely long|very long|too long|1000\+/.test(stepLower)) return "x".repeat(400);
   if (/empty|leave(?:s|ing)? .* empty|without/.test(stepLower)) return "";
   if (/email/.test(stepLower) || /email/i.test(quoted || "")) return "user@example.com";
   if (/password|passcode/.test(stepLower)) return "ValidPass123!";
   if (/phone|tel|mobile/.test(stepLower)) return "5551234567";
-  // Word-boundary: avoid matching "age" inside "Message".
   if (/\b(number|qty|amount|age|zip|postal)\b/.test(stepLower) || /\b(number|qty|amount|age|zip|postal)\b/i.test(quoted || "")) {
     return "42";
   }

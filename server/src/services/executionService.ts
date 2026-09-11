@@ -101,6 +101,14 @@ export function getNpxCommand(): string {
   return process.platform === "win32" ? "npx.cmd" : "npx";
 }
 
+/** Playwright treats args starting with `-` as flags (`-roPe1XOFE.spec.ts`). */
+export function playwrightTestPathArg(relFile: string): string {
+  const posix = String(relFile || "").replace(/\\/g, "/");
+  const base = posix.split("/").pop() || posix;
+  if (base.startsWith("-")) return `./${posix}`;
+  return posix;
+}
+
 /** Strip huge Playwright stdout/stderr from HTTP trigger responses (kept on the run row). */
 export function summarizeRunForClient(runResult: any) {
   if (!runResult || typeof runResult !== "object") return runResult;
@@ -771,7 +779,7 @@ export function runExecution(scriptId: string, targetUrl: string, input: any = {
     // ran. Comma-separating both keeps stdout parsing working AND lets Allure
     // actually see the run.
     const workerCount = reuseBrowser ? 1 : Math.max(1, Math.min(5, Number(config.concurrency) || 5));
-    const args = ["playwright", "test", relFile, "--reporter=json,allure-playwright", `--workers=${workerCount}`];
+    const args = ["playwright", "test", playwrightTestPathArg(relFile), "--reporter=json,allure-playwright", `--workers=${workerCount}`];
     if (browserSet === "chromium+firefox") args.push("--project=chromium", "--project=firefox");
     else if (browserSet === "all") args.push("--project=chromium", "--project=firefox", "--project=webkit");
     else args.push("--project=chromium"); // "chromium" and "headless" both run Chromium only
@@ -1310,7 +1318,7 @@ export async function runExecutionBatch(scriptIds: string[], targetUrl: string, 
       const startedAt = Date.now();
       execFile(
         getNpxCommand(),
-        ["playwright", "test", ...files, "--reporter=json,allure-playwright", `--workers=${workers}`],
+        ["playwright", "test", ...files.map(playwrightTestPathArg), "--reporter=json,allure-playwright", `--workers=${workers}`],
         {
           cwd: SERVER_ROOT,
           env: {

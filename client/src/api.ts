@@ -26,7 +26,9 @@ async function req(path: string, opts?: RequestInit) {
   }
 
   if (!res.ok) {
-    const err = new Error(data.error || `Request failed: ${res.status}`) as Error & { conflict?: boolean; current?: any };
+    const detail = data.error || data.message || (typeof text === "string" && text.trim() ? text.slice(0, 240) : "");
+    const err = new Error(detail || `Request failed: ${res.status}`) as Error & { conflict?: boolean; current?: any; status?: number };
+    err.status = res.status;
     if (res.status === 409) {
       err.conflict = true;
       err.current = data.current;
@@ -506,6 +508,24 @@ export const api = {
   crawlerListSites: (): Promise<CrawlSite[]> => req("/crawler/sites"),
   crawlerGetSite: (siteId: string): Promise<CrawlSite> => req(`/crawler/sites/${siteId}`),
   crawlerGetSiteDetail: (siteId: string): Promise<CrawlSiteDetail> => req(`/crawler/sites/${siteId}/detail`),
+  crawlerExportScenarios: async (siteId: string, format: "xlsx" | "pdf") => {
+    const res = await fetch(`/api/crawler/sites/${siteId}/export?format=${format}`, {
+      headers: { "X-User-Id": getCurrentUserId() },
+    });
+    if (!res.ok) {
+      const text = await res.text();
+      throw new Error((() => { try { return JSON.parse(text).error; } catch { return text || `Export failed: ${res.status}`; } })());
+    }
+    const disposition = res.headers.get("Content-Disposition") || "";
+    const fileName = disposition.match(/filename="?([^"]+)"?/)?.[1] || `test-cases.${format}`;
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = fileName;
+    link.click();
+    URL.revokeObjectURL(url);
+  },
   crawlerEnsureComponentCoverage: (siteId: string): Promise<{ siteId: string; added: number; pagesUpdated: number }> =>
     req(`/crawler/sites/${siteId}/component-coverage/ensure`, { method: "POST", body: "{}" }),
   crawlerRebuildCoverage: (

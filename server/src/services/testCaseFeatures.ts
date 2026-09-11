@@ -365,6 +365,87 @@ export function exportTestCasesToPdf(rows: Array<Record<string, any>>): Promise<
   });
 }
 
+function suiteLabel(row: { type?: string; tier?: string }) {
+  if (row.type === "flow") return "end-to-end";
+  if (row.tier === "smoke") return "smoke";
+  if (row.tier === "regression") return "regression";
+  if (row.type === "negative") return "negative";
+  if (row.type === "edge") return "edge";
+  if (row.type === "positive") return "positive";
+  return row.tier || row.type || "functional";
+}
+
+/** Export crawled scenarios (before or after Playwright generation) as Excel. */
+export async function exportCrawlScenariosToXlsx(
+  rows: Array<{
+    id: string;
+    title: string;
+    type?: string;
+    tier?: string;
+    pageTitle?: string;
+    pageUrl?: string;
+    steps: string[];
+  }>,
+  fileName = "crawl-test-cases.xlsx"
+) {
+  const sheet = utils.json_to_sheet(
+    rows.map((row) => ({
+      Title: row.title,
+      Type: row.type || "",
+      Suite: suiteLabel(row),
+      Page: row.pageTitle || "",
+      URL: row.pageUrl || "",
+      Steps: (row.steps || []).join("\n"),
+    }))
+  );
+  const workbook = utils.book_new();
+  utils.book_append_sheet(workbook, sheet, "test-cases");
+  const exportPath = path.join(EXPORT_ROOT, fileName);
+  await writeFile(exportPath, write(workbook, { type: "buffer", bookType: "xlsx" }));
+  return exportPath;
+}
+
+/** Export crawled scenarios as a printable PDF. */
+export function exportCrawlScenariosToPdf(
+  rows: Array<{
+    id: string;
+    title: string;
+    type?: string;
+    tier?: string;
+    pageTitle?: string;
+    pageUrl?: string;
+    steps: string[];
+  }>
+): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    const doc = new PDFDocument({ margin: 40 });
+    const chunks: Buffer[] = [];
+    doc.on("data", (chunk) => chunks.push(chunk));
+    doc.on("end", () => resolve(Buffer.concat(chunks)));
+    doc.on("error", reject);
+
+    doc.fontSize(18).fillColor("#000").text("Generated Test Cases");
+    doc.fontSize(10).fillColor("#555").text(`Exported ${new Date().toISOString()} — ${rows.length} test case(s)`);
+    doc.moveDown();
+
+    rows.forEach((row, idx) => {
+      if (idx > 0) doc.moveDown().moveTo(doc.x, doc.y).lineTo(555, doc.y).strokeColor("#ddd").stroke().moveDown();
+      doc.fontSize(13).fillColor("#000").text(`${idx + 1}. ${row.title}`);
+      doc
+        .fontSize(9)
+        .fillColor("#555")
+        .text(
+          `Suite: ${suiteLabel(row)}  |  Type: ${row.type || "n/a"}  |  Page: ${row.pageTitle || ""}  |  ${row.pageUrl || ""}`
+        );
+      doc.moveDown(0.4);
+      (row.steps || []).forEach((step, i) => doc.fontSize(10).fillColor("#000").text(`${i + 1}. ${step}`));
+      if (doc.y > 700) doc.addPage();
+    });
+
+    doc.end();
+  });
+}
+
 // Word (.docx) export: same content as the PDF, structured as real Word
 // paragraphs/headings (not an HTML-renamed-to-.doc trick) so it opens and
 // edits cleanly in Word/Google Docs -- useful when a reviewer wants to mark

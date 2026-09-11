@@ -36,7 +36,7 @@ export default function Crawler() {
   /** auto = server decides (diff on re-crawl); incremental/full = force */
   const [crawlMode, setCrawlMode] = useState<"auto" | "incremental" | "full">("auto");
   /** minimal = few scenarios/page covering load + components + primary flow (saves LLM tokens) */
-  const [coverageMode, setCoverageMode] = useState<"minimal" | "standard" | "full">("minimal");
+  const [coverageMode, setCoverageMode] = useState<"minimal" | "standard" | "full">("full");
   const [lastModeInfo, setLastModeInfo] = useState<{ mode?: string; modeReason?: string; isRerun?: boolean } | null>(null);
   const [cockpit, setCockpit] = useState<any>(null);
   const [impactTier, setImpactTier] = useState<"smoke" | "critical" | "full-delta">("critical");
@@ -458,13 +458,14 @@ export default function Crawler() {
   }
 
   /** Shrink the active scenario list to minimal/standard/full without re-crawling. */
-  async function rebuildCoverage() {
+  async function rebuildCoverage(mode: "minimal" | "standard" | "full" = coverageMode) {
     if (!site) return;
     setBusy("coverage-rebuild");
     setError(null);
     try {
-      const res = await api.crawlerRebuildCoverage(site.id, coverageMode);
+      const res = await api.crawlerRebuildCoverage(site.id, mode);
       await refreshDetail();
+      setCoverageMode(mode);
       setProgressMessage(
         `Coverage rebuilt (${res.coverageMode}): +${res.added} added, ${res.retired} retired across ${res.pagesUpdated} page(s).`
       );
@@ -480,6 +481,27 @@ export default function Crawler() {
   // tests for the selected scenarios and run each one immediately (Ultrafast --
   // no profile/environment picking needed). The Allure report itself is built
   // from the Execution tab, where all runs (crawler-originated or not) land.
+  async function triggerUltrafastWithRetry(testCaseId: string, targetUrl: string, attempts = 4) {
+    let lastErr: any;
+    for (let i = 0; i < attempts; i++) {
+      try {
+        return await api.triggerUltrafast({ testCaseId }, targetUrl);
+      } catch (err: any) {
+        lastErr = err;
+        const msg = String(err?.message || err);
+        const status = Number(err?.status || 0);
+        const retryable =
+          status === 500 ||
+          status === 502 ||
+          status === 503 ||
+          /Request failed: (500|502|503)|Failed to fetch|ECONNREFUSED|database is busy|Transform failed/i.test(msg);
+        if (!retryable || i === attempts - 1) throw err;
+        await new Promise((resolve) => setTimeout(resolve, 1200 * (i + 1)));
+      }
+    }
+    throw lastErr;
+  }
+
   async function generateRunAndReport() {
     if (selected.size === 0) return;
     setBusy("generate-run-report");
@@ -504,7 +526,7 @@ export default function Crawler() {
         setProgressMessage(`Running test ${completed + 1} of ${runnable.length}: ${r.scriptFile || r.testCaseId}…`);
         setRunStatuses((prev) => ({ ...prev, [r.testCaseId]: { state: "running" } }));
         try {
-          const runResult = await api.triggerUltrafast({ testCaseId: r.testCaseId }, url.trim());
+          const runResult = await triggerUltrafastWithRetry(r.testCaseId, url.trim());
           if (!runResult.run) {
             // FR-4.26: a critical-path case routed to second-reviewer sign-off, or
             // below the confidence threshold -- genuinely not run yet, not a failure.
@@ -586,6 +608,18 @@ export default function Crawler() {
     }
   }
 
+  async function downloadSiteScenarios(format: "xlsx" | "pdf") {
+    if (!site?.id) return;
+    setDownloadBusy(true);
+    try {
+      await api.crawlerExportScenarios(site.id, format);
+    } catch (e: any) {
+      setError(e.message);
+    } finally {
+      setDownloadBusy(false);
+    }
+  }
+
   // First-time friendly: after a crawl finishes, pre-select every new scenario so
   // "Run all tests" works without manual checkbox hunting.
   useEffect(() => {
@@ -648,7 +682,10 @@ export default function Crawler() {
               <button
                 key={id}
                 type="button"
-                onClick={() => setSelectedPreset(id)}
+                onClick={() => {
+                  setSelectedPreset(id);
+                  setCoverageMode(id === "quick" ? "standard" : "full");
+                }}
                 className={`rounded-lg border px-3 py-2 text-left text-xs transition ${
                   selectedPreset === id ? "border-ink bg-ink/5" : "border-line hover:border-ink/40"
                 }`}
@@ -747,9 +784,9 @@ export default function Crawler() {
                 value={coverageMode}
                 onChange={(e) => setCoverageMode(e.target.value as typeof coverageMode)}
               >
-                <option value="minimal">Minimal — smoke + key flows (fastest)</option>
-                <option value="standard">Standard — forms + components</option>
-                <option value="full">Full — maximum scenarios</option>
+                <option value="minimal">Minimal — smoke + a few flows</option>
+                <option value="standard">Standard — smoke, regression, negatives, e2e</option>
+                <option value="full">Full — smoke, regression, e2e, positive, negative, edge</option>
               </select>
             </label>
           </div>
@@ -845,6 +882,38 @@ export default function Crawler() {
                 : ""}
             </p>
           )}
+          {site.status === "completed" && detail && (
+            <div className="flex flex-wrap items-center gap-2 pt-1">
+              <span className="text-xs text-ink/55">
+                {smokeCount} smoke · {regressionCount} regression · {flowCount} e2e · {negativeCount} negative
+                {edgeCount ? ` · ${edgeCount} edge` : ""}
+              </span>
+              <button
+                type="button"
+                className="rounded-md border border-ink/20 text-ink/70 px-2.5 py-1 text-xs disabled:opacity-40"
+                disabled={downloadBusy || allScenarios.length === 0}
+                onClick={() => downloadSiteScenarios("xlsx")}
+              >
+                Download Excel
+              </button>
+              <button
+                type="button"
+                className="rounded-md border border-ink/20 text-ink/70 px-2.5 py-1 text-xs disabled:opacity-40"
+                disabled={downloadBusy || allScenarios.length === 0}
+                onClick={() => downloadSiteScenarios("pdf")}
+              >
+                Download PDF
+              </button>
+              <button
+                type="button"
+                className="rounded-md border border-ink/20 text-ink/70 px-2.5 py-1 text-xs disabled:opacity-40"
+                disabled={busy === "coverage-rebuild"}
+                onClick={() => rebuildCoverage("full")}
+              >
+                {busy === "coverage-rebuild" ? "Expanding…" : "Expand full suite"}
+              </button>
+            </div>
+          )}
         </div>
       )}
 
@@ -885,7 +954,7 @@ export default function Crawler() {
                     className={`rounded-full px-2.5 py-1 capitalize ${tierFilter === t ? "bg-ink text-paper" : "text-ink/60"}`}
                     onClick={() => setTierFilter(t)}
                   >
-                    {t}
+                    {t === "all" ? `All (${allScenarios.length})` : t === "smoke" ? `smoke (${smokeCount})` : t === "regression" ? `regression (${regressionCount})` : `functional (${functionalCount})`}
                   </button>
                 ))}
               </div>

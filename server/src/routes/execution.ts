@@ -151,7 +151,12 @@ executionRouter.post("/ultrafast", async (req, res) => {
     if (err instanceof SecurityScanFailedError) {
       return res.status(422).json(errBody(422, err.message, { notes: err.notes }));
     }
-    res.status(400).json(errBody(400, err.message));
+    const msg = String(err?.message || err);
+    if (/SQLITE_BUSY|database is locked/i.test(msg)) {
+      return res.status(503).json(errBody(503, "Database is busy. Retry this run in a moment."));
+    }
+    console.error("[ultrafast] trigger failed:", err);
+    res.status(500).json(errBody(500, msg || "Could not start Ultrafast run"));
   }
 });
 
