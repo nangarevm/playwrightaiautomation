@@ -15,6 +15,7 @@ import {
   pickPreferredLocator,
   scoreStableLocator,
   stripTransientLoadingLabel,
+  isBrowserChromeLabel,
 } from "./locatorQuality.js";
 
 export interface RankedLocators {
@@ -156,6 +157,10 @@ export async function extractElementLocators(page: Page, handle: Locator): Promi
   const cleanPlaceholder = info.placeholder ? stripTransientLoadingLabel(info.placeholder) : "";
   const cleanAlt = info.alt ? stripTransientLoadingLabel(info.alt) : "";
   const cleanTitle = info.title ? stripTransientLoadingLabel(info.title) : "";
+
+  if (isBrowserChromeLabel(cleanName) || isBrowserChromeLabel(cleanLabel) || isBrowserChromeLabel(cleanTitle)) {
+    return null;
+  }
 
   const candidates: string[] = [];
 

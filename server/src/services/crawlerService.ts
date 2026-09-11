@@ -5,7 +5,7 @@
 
 import fs from "fs";
 import path from "path";
-import { nanoid } from "nanoid";
+import { customAlphabet, nanoid } from "nanoid";
 import { db } from "../db.js";
 import { runCrawl, type CrawlRunOutput } from "../crawler/index.js";
 import { KNOWN_COMPONENT_KINDS } from "../crawler/componentInventory.js";
@@ -30,6 +30,10 @@ import {
 } from "./flowStepNormalize.js";
 
 export { normalizeFlowStepsForCodegen, buildPageTitleUrlIndex } from "./flowStepNormalize.js";
+
+// Nanoid's default alphabet includes `-`, which Playwright treats as a CLI flag
+// when the spec filename is passed as `playwright test -abc.spec.ts`.
+const fileSafeId = customAlphabet("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz", 10);
 
 function daysSinceIso(iso?: string | null): number {
   if (!iso) return 999;
@@ -267,7 +271,7 @@ export async function startCrawl(params: {
       captureApi: params.captureApi,
       concurrency: params.concurrency,
       mode,
-      coverageMode: params.coverageMode || (process.env.CRAWL_COVERAGE_MODE as CoverageMode) || "minimal",
+      coverageMode: params.coverageMode || (process.env.CRAWL_COVERAGE_MODE as CoverageMode) || "full",
       knownUrls,
       onProgress: (p) => {
         db.prepare(
@@ -1185,7 +1189,7 @@ export async function generateTestsFromScenarios(scenarioIds: string[], actorUse
         }
       }
 
-      const testCaseId = nanoid(10);
+      const testCaseId = fileSafeId();
       db.prepare(`
         INSERT INTO test_cases
           (id, input_id, title, category, steps, expected_result, confidence_score, source_rationale, status, authorship_type, version, priority, created_at, updated_at)

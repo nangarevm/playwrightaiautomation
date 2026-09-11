@@ -16,6 +16,9 @@ import {
   HEAL_SUGGEST_MIN,
   stripHardWaits,
   ensureLoadingSettle,
+  extractQuotedFieldLabel,
+  fieldLocatorFallbacks,
+  isBrowserChromeLabel,
 } from "../crawler/locatorQuality.js";
 
 export interface HealSuggestion {
@@ -450,16 +453,32 @@ export function applyDeterministicScriptHeals(code: string): { code: string; sug
     }
   );
 
-  // locator('#id').fill preceded by a "fills in \"Label\"" comment → getByLabel/role
   next = next.replace(
-    /(\/\/[^\n]*fills?\s+in\s+["']([^"']+)["'][^\n]*\n)(\s*)await\s+page\.locator\(\s*["']#([^"']+)["']\s*\)(\.first\(\))?\.fill\(/g,
-    (full, comment, label, indent, _id, first = ".first()") => {
-      const idle = stripTransientLoadingLabel(label);
-      const to = `${comment}${indent}await page.getByLabel(${JSON.stringify(idle)}).or(page.getByRole('textbox', { name: ${JSON.stringify(idle)} }))${first || ".first()"}.fill(`;
+    /^\s*await page\.(getByRole|getByLabel|getByText)\([^;\n]*(Switch to dark mode|Report this website|Close report abuse|report abuse panel)[^;\n]*;\s*\n/gim,
+    "  // skipped browser/hosting chrome control\n"
+  );
+
+  next = next.replace(
+    /page\.getByLabel\(\s*['"]t a valid email into['"]\)(?:\.or\(page\.getByRole\('textbox',\s*\{\s*name:\s*['"]t a valid email into['"]\s*\}\)\))?/g,
+    fieldLocatorFallbacks("email")
+  );
+  next = next.replace(
+    /page\.getByRole\(\s*['"]textbox['"]\s*,\s*\{\s*name:\s*['"]Your email\*['"]\s*\}\)/g,
+    fieldLocatorFallbacks("email")
+  );
+
+  // locator('#id').fill preceded by a fill comment → label/type locator (double-quoted field only)
+  next = next.replace(
+    /(\/\/[^\n]*\n)(\s*)await\s+page\.locator\(\s*["']#([^"']+)["']\s*\)(\.first\(\))?\.fill\(/g,
+    (full, comment, indent, _id, first = ".first()") => {
+      const label = extractQuotedFieldLabel(comment);
+      if (!label || isBrowserChromeLabel(label)) return full;
+      const loc = fieldLocatorFallbacks(label);
+      const to = `${comment}${indent}await ${loc}${first || ".first()"}.fill(`;
       suggestions.push({
         from: `locator("#${_id}").fill`,
-        to: `getByLabel(${JSON.stringify(idle)}).fill`,
-        reason: "Prefer label/role over brittle #id for form fills",
+        to: `${loc}.fill`,
+        reason: "Prefer label/type locators over brittle #id for form fills",
       });
       return to;
     }

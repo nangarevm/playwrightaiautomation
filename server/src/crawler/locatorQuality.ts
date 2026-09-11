@@ -32,6 +32,37 @@ export function hasTransientLoadingLabel(name: string): boolean {
   return TRANSIENT_LOADING_LABEL_RE.test(String(name || ""));
 }
 
+/** Browser / hosting chrome — never treat as product under test. */
+export const BROWSER_CHROME_LABEL_RE =
+  /\b(switch to (dark|light) mode|report (this )?website|report abuse|close report abuse|translate this page|not secure|always show|site settings|cookies on this site|enable javascript|captcha|cloudflare|attention required|just a moment)\b/i;
+
+export function isBrowserChromeLabel(name: string): boolean {
+  const v = String(name || "").replace(/\s+/g, " ").trim();
+  if (!v) return false;
+  return BROWSER_CHROME_LABEL_RE.test(v);
+}
+
+/** Prefer double-quoted field names so contractions like "isn't" are not treated as quotes. */
+export function extractQuotedFieldLabel(text: string): string | null {
+  const src = String(text || "");
+  const doubles = [...src.matchAll(/"([^"]{2,80})"/g)].map((m) => m[1].trim());
+  const product = doubles.find((d) => !isBrowserChromeLabel(d) && !/^(https?:\/\/|www\.)/i.test(d));
+  if (product) return product;
+  if (doubles[0]) return doubles[0];
+  const singles = [...src.matchAll(/(?<![a-z])'([^']{3,80})'(?![a-z])/gi)].map((m) => m[1].trim());
+  const ok = singles.find((s) => !isBrowserChromeLabel(s) && !/^(t |s |re |ll |ve )/i.test(s));
+  return ok || null;
+}
+
+export function fieldLocatorFallbacks(label: string): string {
+  const idle = stripTransientLoadingLabel(label).replace(/\*+$/g, "").trim();
+  if (/email|e-mail/i.test(idle)) {
+    return `page.getByLabel(/e-?mail/i).or(page.getByPlaceholder(/e-?mail/i)).or(page.locator('input[type="email"], input[name*="mail" i], input[id*="mail" i]'))`;
+  }
+  const re = idle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replace(/\\\*$/g, "");
+  return `page.getByLabel(/${re}/i).or(page.getByPlaceholder(/${re}/i)).or(page.locator('input:visible, textarea:visible').first())`;
+}
+
 /**
  * Score Playwright locator expressions for stability (0–100).
  * Prefer testid / role / label / placeholder over CSS, XPath, nth, random ids.

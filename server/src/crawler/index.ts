@@ -15,15 +15,15 @@ import type { ApiCallRecord, ComponentInventoryItem, CoverageMode, CrawlOptions,
 
 function resolveCoverageMode(mode?: CoverageMode): CoverageMode {
   if (mode === "standard" || mode === "full" || mode === "minimal") return mode;
-  const env = (process.env.CRAWL_COVERAGE_MODE || "minimal").toLowerCase();
-  if (env === "standard" || env === "full") return env;
-  return "minimal";
+  const env = (process.env.CRAWL_COVERAGE_MODE || "full").toLowerCase();
+  if (env === "standard" || env === "minimal") return env;
+  return "full";
 }
 
 function maxFlowsForMode(mode: CoverageMode): number {
-  if (mode === "minimal") return 5;
-  if (mode === "standard") return 10;
-  return 20;
+  if (mode === "minimal") return 8;
+  if (mode === "standard") return 16;
+  return 30;
 }
 
 export interface CrawledPageOutput {
