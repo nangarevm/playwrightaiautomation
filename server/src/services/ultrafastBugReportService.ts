@@ -48,6 +48,7 @@ export interface ExecutionBug {
   testCaseId: string;
   stepsToReproduce: string[];
   screenshot: string | null;
+  validationStatus: "candidate" | "confirmed" | "rejected";
 }
 
 // Collect bugs from test execution (failures, timeouts, errors), joined all the
@@ -118,6 +119,7 @@ export function collectTestExecutionBugs(runIds: string[]): ExecutionBug[] {
       testCaseId: ev.test_case_id,
       stepsToReproduce,
       screenshot: null,
+      validationStatus: "candidate",
     };
   });
 }

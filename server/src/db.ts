@@ -512,6 +512,20 @@ ensureColumn("bug_findings", "fingerprint", "TEXT");
 ensureColumn("bug_findings", "occurrence_count", "INTEGER NOT NULL DEFAULT 1");
 ensureColumn("bug_findings", "affected_scenarios_json", "TEXT NOT NULL DEFAULT '[]'");
 ensureColumn("bug_findings", "site_id", "TEXT");
+ensureColumn("bug_findings", "defect_classification", "TEXT NOT NULL DEFAULT 'UNCERTAIN'");
+ensureColumn("bug_findings", "module_feature", "TEXT");
+ensureColumn("bug_findings", "requirement_reference", "TEXT");
+ensureColumn("bug_findings", "business_impact", "TEXT");
+ensureColumn("bug_findings", "severity_justification", "TEXT");
+ensureColumn("bug_findings", "priority_justification", "TEXT");
+ensureColumn("bug_findings", "suspected_root_cause", "TEXT");
+ensureColumn("bug_findings", "regression_risk", "TEXT");
+ensureColumn("bug_findings", "regression_risk_reason", "TEXT");
+ensureColumn("bug_findings", "suggested_fix", "TEXT");
+ensureColumn("bug_findings", "ai_confidence", "INTEGER NOT NULL DEFAULT 0");
+ensureColumn("bug_findings", "ai_confidence_reason", "TEXT");
+ensureColumn("bug_findings", "quality_gate_json", "TEXT NOT NULL DEFAULT '{}'");
+ensureColumn("bug_findings", "duplicate_of_id", "TEXT");
 // Findings created before the evidence gate have no fingerprint/reproduction
 // proof. Keep them visible for investigation but never count them as real bugs.
 db.prepare(`

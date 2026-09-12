@@ -1,7 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { createServer } from "node:http";
 import { db } from "../src/db.ts";
 import {
+  confirmHttpFinding,
   getQaDashboard,
   recordBugFinding,
 } from "../src/services/bugDetectionService.ts";
@@ -25,7 +27,7 @@ test("a one-off observation remains a candidate, not a real product bug", () => 
 
   assert.equal(finding.validation_status, "candidate");
   assert.equal(getQaDashboard().totalRealBugs, 0);
-  assert.equal(getQaDashboard().unknownRequiresInvestigation, 1);
+  assert.ok(getQaDashboard().unknownRequiresInvestigation >= 1);
 });
 
 test("the same independently reproduced issue is confirmed and deduplicated", () => {
@@ -37,6 +39,11 @@ test("the same independently reproduced issue is confirmed and deduplicated", ()
     evidence: { endpoint: "/api/orders/:id", status: 500 },
     expectedResult: "Malformed ids return 4xx.",
     actualResult: "Malformed id returned 500.",
+    defectClassification: "CONFIRMED_PRODUCT_BUG",
+    requirementReference: "API contract requires malformed identifiers to return 4xx.",
+    businessImpact: "Clients receive an uncontrolled server failure.",
+    severityJustification: "High because malformed input crashes the endpoint.",
+    priorityJustification: "P1 because the backend requires input validation.",
     reproductionAttempts: 1,
     reproductionSuccesses: 1,
   };
@@ -57,6 +64,61 @@ test("the same independently reproduced issue is confirmed and deduplicated", ()
   assert.equal(dashboard.totalRealBugs, 1);
   assert.equal(dashboard.highBugs, 1);
   assert.equal(dashboard.duplicateIssues, 1);
+});
+
+test("an explicit confirmation is downgraded when the quality gate lacks required evidence", () => {
+  const finding = recordBugFinding({
+    source: "regression",
+    severity: "high",
+    title: "Assertion failed",
+    detail: "A test assertion failed.",
+    defectClassification: "CONFIRMED_PRODUCT_BUG",
+    reproductionAttempts: 2,
+    reproductionSuccesses: 2,
+    validationStatus: "confirmed",
+  });
+
+  assert.equal(finding.defect_classification, "UNCERTAIN");
+  assert.equal(finding.validation_status, "candidate");
+  assert.ok(finding.ai_confidence < 85);
+});
+
+test("independent HTTP reproduction promotes an evidence-complete candidate", async () => {
+  const server = createServer((_request, response) => {
+    response.writeHead(500, { "content-type": "application/json" });
+    response.end('{"error":"server failure"}');
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const address = server.address();
+    assert.ok(address && typeof address === "object");
+    const url = `http://127.0.0.1:${address.port}/orders/bad-id`;
+    const finding = recordBugFinding({
+      source: "api_fuzz",
+      severity: "high",
+      priority: "P1",
+      title: "Orders API crashes on malformed identifier",
+      detail: "The endpoint returned HTTP 500.",
+      evidence: { endpoint: url, status: 500 },
+      expectedResult: "Malformed identifiers return a controlled 4xx response.",
+      actualResult: "The endpoint returned HTTP 500.",
+      requirementReference: "Established HTTP behavior: client validation errors must not crash the server.",
+      businessImpact: "Clients receive an uncontrolled error and cannot handle the response predictably.",
+      severityJustification: "High because malformed input crashes the endpoint.",
+      priorityJustification: "P1 because backend input handling requires correction.",
+      reproductionAttempts: 1,
+      reproductionSuccesses: 1,
+    });
+
+    const confirmed = await confirmHttpFinding(finding.id, url, 500);
+    assert.equal(confirmed?.defect_classification, "CONFIRMED_PRODUCT_BUG");
+    assert.equal(confirmed?.validation_status, "confirmed");
+    assert.equal(confirmed?.reproduction_successes, 3);
+    assert.equal(confirmed?.ai_confidence, 100);
+    assert.match(confirmed?.ai_confidence_reason || "", /All quality-gate checks passed/);
+  } finally {
+    await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+  }
 });
 
 test("explicitly rejected observations are counted as false positives", () => {

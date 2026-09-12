@@ -107,7 +107,15 @@ export default function Crawler() {
     errorMessage: string | null;
     reportUrl?: string | null;
     runId: string;
-    failureClass: "automation_issue" | "environment_issue" | "possible_bug" | "unknown" | null;
+    failureClass:
+      | "automation_issue"
+      | "environment_issue"
+      | "test_data_issue"
+      | "configuration_issue"
+      | "possible_bug"
+      | "uncertain"
+      | "unknown"
+      | null;
     failureLabel: string | null;
   };
   const [crawlFailures, setCrawlFailures] = useState<CrawlFailure[]>([]);

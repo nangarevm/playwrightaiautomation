@@ -3,6 +3,7 @@ import { api, BugFindingRow, QaDashboard } from "../api.js";
 import { Pill } from "../components/Pill.js";
 
 const SEVERITY_TONE: Record<BugFindingRow["severity"], "neutral" | "good" | "bad" | "warn"> = {
+  blocker: "bad",
   critical: "bad",
   high: "bad",
   medium: "warn",
@@ -21,15 +22,20 @@ const EMPTY_DASHBOARD: QaDashboard = {
   totalApiCallsAnalyzed: 0,
   totalUiStatesAnalyzed: 0,
   totalRealBugs: 0,
+  blockerBugs: 0,
   criticalBugs: 0,
   highBugs: 0,
   mediumBugs: 0,
   lowBugs: 0,
   automationFailures: 0,
   environmentFailures: 0,
+  testDataIssues: 0,
+  configurationIssues: 0,
   duplicateIssues: 0,
   falsePositivesRejected: 0,
   unknownRequiresInvestigation: 0,
+  highestRiskDefects: [],
+  coverageObservations: [],
 };
 
 function parseJson<T>(value: string | null | undefined, fallback: T): T {
@@ -138,12 +144,15 @@ export default function Bugs() {
           ["API calls analyzed", dashboard.totalApiCallsAnalyzed],
           ["UI states analyzed", dashboard.totalUiStatesAnalyzed],
           ["Real bugs", dashboard.totalRealBugs],
+          ["Blocker", dashboard.blockerBugs],
           ["Critical / P0", dashboard.criticalBugs],
           ["High / P1", dashboard.highBugs],
           ["Medium / P2", dashboard.mediumBugs],
           ["Low / P3", dashboard.lowBugs],
           ["Automation failures", dashboard.automationFailures],
           ["Environment failures", dashboard.environmentFailures],
+          ["Test-data issues", dashboard.testDataIssues],
+          ["Configuration issues", dashboard.configurationIssues],
           ["Duplicates merged", dashboard.duplicateIssues],
           ["False positives rejected", dashboard.falsePositivesRejected],
           ["Needs investigation", dashboard.unknownRequiresInvestigation],
@@ -153,6 +162,25 @@ export default function Bugs() {
             <p className="text-xl font-semibold text-ink">{value}</p>
           </div>
         ))}
+      </div>
+
+      <div className="grid gap-3 lg:grid-cols-2">
+        <div className="rounded-lg border border-line bg-white/60 p-4 shadow-panel">
+          <p className="text-sm font-medium">Highest-risk defects</p>
+          {dashboard.highestRiskDefects.length ? (
+            <ul className="mt-2 space-y-1 text-xs text-ink/65">
+              {dashboard.highestRiskDefects.map((bug) => (
+                <li key={bug.id}><strong>{bug.severity.toUpperCase()}</strong> · {bug.title}{bug.businessImpact ? ` — ${bug.businessImpact}` : ""}</li>
+              ))}
+            </ul>
+          ) : <p className="mt-2 text-xs text-ink/50">No confirmed product defects.</p>}
+        </div>
+        <div className="rounded-lg border border-line bg-white/60 p-4 shadow-panel">
+          <p className="text-sm font-medium">Coverage observations</p>
+          <ul className="mt-2 list-disc space-y-1 pl-4 text-xs text-ink/65">
+            {dashboard.coverageObservations.map((observation) => <li key={observation}>{observation}</li>)}
+          </ul>
+        </div>
       </div>
 
       <div className="rounded-lg border border-line bg-white/60 shadow-panel p-4 space-y-3">
@@ -202,6 +230,7 @@ export default function Bugs() {
         </select>
         <select className="rounded-md border border-line px-2 py-1 text-xs" value={severityFilter} onChange={(e) => setSeverityFilter(e.target.value)}>
           <option value="">All severities</option>
+          <option value="blocker">Blocker</option>
           <option value="critical">Critical</option>
           <option value="high">High</option>
           <option value="medium">Medium</option>
@@ -229,9 +258,12 @@ export default function Bugs() {
               <div className="flex items-start justify-between gap-2">
                 <div>
                   <p className="font-medium text-sm">{f.title}</p>
-                  <p className="text-xs text-ink/50">{SOURCE_LABEL[f.source]} · {new Date(f.created_at).toLocaleString()}</p>
+                  <p className="text-xs text-ink/50">
+                    {f.id} · {f.module_feature || SOURCE_LABEL[f.source]} · {new Date(f.created_at).toLocaleString()}
+                  </p>
                 </div>
-                <div className="flex items-center gap-1.5 shrink-0">
+                <div className="flex flex-wrap justify-end items-center gap-1.5">
+                  <Pill tone={f.defect_classification === "CONFIRMED_PRODUCT_BUG" ? "bad" : "neutral"}>{f.defect_classification}</Pill>
                   <Pill tone="neutral">{f.root_cause}</Pill>
                   <Pill tone={f.priority === "P0" || f.priority === "P1" ? "bad" : f.priority === "P2" ? "warn" : "neutral"}>{f.priority}</Pill>
                   <Pill tone={SEVERITY_TONE[f.severity]}>{f.severity}</Pill>
@@ -254,8 +286,33 @@ export default function Bugs() {
                 <span>Validation: <strong>{f.validation_status}</strong></span>
                 <span>Reproduced: <strong>{f.reproduction_successes}/{f.reproduction_attempts}</strong></span>
                 <span>Occurrences: <strong>{f.occurrence_count}</strong></span>
+                <span>AI confidence: <strong>{f.ai_confidence}%</strong></span>
+                {f.regression_risk && <span>Regression risk: <strong>{f.regression_risk}</strong></span>}
                 <span>Environment: <strong>{Object.values(parseJson<Record<string, string>>(f.environment_json, {})).join(" · ") || "Not captured"}</strong></span>
               </div>
+              {f.ai_confidence_reason && <p className="text-xs text-ink/55"><strong>Confidence basis:</strong> {f.ai_confidence_reason}</p>}
+              {(f.requirement_reference || f.business_impact) && (
+                <div className="rounded border border-line/70 p-2 text-xs space-y-1">
+                  {f.requirement_reference && <p><strong>Requirement / acceptance criteria:</strong> {f.requirement_reference}</p>}
+                  {f.business_impact && <p><strong>User / business impact:</strong> {f.business_impact}</p>}
+                  {f.severity_justification && <p><strong>Severity justification:</strong> {f.severity_justification}</p>}
+                  {f.priority_justification && <p><strong>Priority justification:</strong> {f.priority_justification}</p>}
+                  {f.regression_risk_reason && <p><strong>Regression risk:</strong> {f.regression_risk_reason}</p>}
+                  {f.suspected_root_cause && <p><strong>Suspected root cause:</strong> {f.suspected_root_cause}</p>}
+                  {f.suggested_fix && <p><strong>Suggested fix — not confirmed root cause:</strong> {f.suggested_fix}</p>}
+                </div>
+              )}
+              {(() => {
+                const gate = parseJson<Record<string, boolean>>(f.quality_gate_json, {});
+                const failedChecks = Object.entries(gate)
+                  .filter(([key, value]) => key !== "passed" && !value)
+                  .map(([key]) => key.replace(/([A-Z])/g, " $1").toLowerCase());
+                return failedChecks.length > 0 ? (
+                  <p className="text-xs text-ink/55">
+                    Human review required for: {failedChecks.join(", ")}.
+                  </p>
+                ) : null;
+              })()}
 
               {(() => {
                 const steps = parseJson<string[]>(f.steps_to_reproduce, []);
