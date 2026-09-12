@@ -290,7 +290,19 @@ export async function pushTestCaseToAdditionalTracker(integrationId: string, tes
 // test fails. Best-effort -- never throws, called fire-and-forget right after
 // a run completes (mirrors the notifyAllOnRunComplete pattern for FR-7.3).
 // SR-FR-7.2: retried with backoff before being logged as a failed delivery.
-export async function autoFileBugOnRegression(testCase: { id: string; title: string; category: string }, run: { id: string; status: string; evidence_path?: string | null }, previousStatus: string | null) {
+export async function autoFileBugOnRegression(
+  testCase: { id: string; title: string; category: string },
+  run: { id: string; status: string; evidence_path?: string | null },
+  previousStatus: string | null,
+  detail?: {
+    steps?: string[];
+    expectedResult?: string;
+    errorMessage?: string | null;
+    failureLabel?: string | null;
+    targetUrl?: string;
+    browserSet?: string;
+  }
+) {
   if (run.status !== "failed" && run.status !== "error") return { filed: false, reason: "run did not fail" };
   if (previousStatus !== "passed") return { filed: false, reason: "test was not previously passing" };
 
@@ -299,7 +311,26 @@ export async function autoFileBugOnRegression(testCase: { id: string; title: str
 
   const target = trackers[0] as any;
   const integration = getRawIntegration(target.id);
-  const description = `Automated test "${testCase.title}" (${testCase.category}) was previously passing and is now failing as of run ${run.id}.${run.evidence_path ? `\n\nEvidence: ${run.evidence_path}` : ""}`;
+  // FR-7.6 previously filed a one-line summary with no reproduction path -- a
+  // reviewer had to go dig through the run's raw evidence to even know what to
+  // try. Build the same kind of structured, replayable report a human tester
+  // would write: preconditions, the test case's own numbered steps, expected
+  // vs. actual result, and where the raw evidence lives.
+  const stepsSection = detail?.steps?.length
+    ? detail.steps.map((s, i) => `${i + 1}. ${s}`).join("\n")
+    : "(no recorded steps -- see the linked test case)";
+  const description = [
+    `Automated test "${testCase.title}" (${testCase.category}) was previously passing and is now failing as of run ${run.id}.`,
+    "",
+    `Preconditions: ${detail?.browserSet ? `${detail.browserSet} browser, ` : ""}target URL ${detail?.targetUrl || "(see run record)"}.`,
+    "",
+    "Steps to reproduce:",
+    stepsSection,
+    "",
+    `Expected result: ${detail?.expectedResult || "See the linked test case for the expected outcome."}`,
+    `Actual result: ${detail?.failureLabel ? `${detail.failureLabel} -- ` : ""}${detail?.errorMessage || "See run evidence for the captured error."}`,
+    run.evidence_path ? `\nEvidence: ${run.evidence_path}` : "",
+  ].join("\n");
 
   try {
     return await withRetry(

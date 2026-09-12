@@ -253,9 +253,18 @@ export async function triggerUltrafastRun(input: UltrafastTriggerInput) {
     const crawlSiteId = screen?.source_input_id || null;
     
     if (crawlSiteId) {
+      // `screens.crawl_site_id` doesn't exist -- collectCrawlBugsForSite joins
+      // siteId -> crawl_pages -> screens by URL instead (same fix as the
+      // /reporting/ultrafast-bug-report route). The inline query here used to
+      // throw and get swallowed by the outer catch, so bugReport was silently
+      // always null for any crawl-originated run.
       const crawlBugs = collectCrawlBugsForSite(crawlSiteId);
+
+      // collectTestExecutionBugs joins all the way back to the test case so the
+      // report shows its actual steps/expected result, not just the run id
+      // mislabeled as a test case id (the previous inline query here).
       const executionBugs = collectTestExecutionBugs([runResult.id]);
-      
+
       bugReport = generateUltrafastBugReport(crawlSiteId, crawlBugs, executionBugs);
     }
   } catch (err: any) {

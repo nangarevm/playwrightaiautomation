@@ -27,12 +27,13 @@ export const mockProvider: LlmProvider = {
           category: "Smoke",
           steps: [
             "Navigate to the login page",
-            "Enter a valid username in the 'Username' field",
-            "Enter a valid password in the 'Password' field",
+            "Enter a valid, registered username (e.g. 'demo_user') in the 'Username' field",
+            "Enter the matching valid password (e.g. 'demo_pass_123') in the 'Password' field",
             "Click the 'Log in' button",
           ],
-          expected_result: "User is redirected to the dashboard and sees a welcome message",
+          expected_result: "The 'Log in' button submits without error. The user is redirected off the login page to the dashboard. A 'Welcome' heading/message is visible, confirming the authenticated session started.",
           confidence_score: 0.93,
+          priority: "High",
           source_rationale: "Derived from input sentence describing the login form and its fields",
         },
         {
@@ -40,12 +41,13 @@ export const mockProvider: LlmProvider = {
           category: "Negative",
           steps: [
             "Navigate to the login page",
-            "Enter a valid username in the 'Username' field",
-            "Enter an incorrect password in the 'Password' field",
+            "Enter a valid, registered username (e.g. 'demo_user') in the 'Username' field",
+            "Enter an incorrect password (e.g. 'wrong_password') in the 'Password' field",
             "Click the 'Log in' button",
           ],
-          expected_result: "An inline error message 'Invalid username or password' is displayed and the user remains on the login page",
+          expected_result: "An inline error alert reading 'Invalid username or password' is displayed near the form. The user remains on the login page (no redirect). The Password field is cleared or left editable for retry; no session/auth cookie is set.",
           confidence_score: 0.88,
+          priority: "High",
           source_rationale: "Standard negative counterpart inferred from presence of a credentialed login form",
         },
         {
@@ -53,17 +55,65 @@ export const mockProvider: LlmProvider = {
           category: "Edge Case",
           steps: [
             "Navigate to the login page",
-            "Leave the 'Username' and 'Password' fields empty",
+            "Leave the 'Username' field empty",
+            "Leave the 'Password' field empty",
             "Click the 'Log in' button",
           ],
-          expected_result: "Validation errors are shown for both fields and no navigation occurs",
+          expected_result: "Validation errors are shown next to both the 'Username' and 'Password' fields. The form does not submit and no navigation occurs -- the user stays on the login page.",
           confidence_score: 0.81,
+          priority: "Medium",
           source_rationale: "Edge case generated from the required-field constraint implied by a standard login form",
+        },
+        {
+          title: "Login rejects a username with no matching account",
+          category: "Negative",
+          steps: [
+            "Navigate to the login page",
+            "Enter a username that is not registered (e.g. 'no_such_user_9182') in the 'Username' field",
+            "Enter any password in the 'Password' field",
+            "Click the 'Log in' button",
+          ],
+          expected_result: "The same generic 'Invalid username or password' error is shown as for a wrong password -- the error message does not reveal whether the username itself exists. The user remains on the login page.",
+          confidence_score: 0.83,
+          priority: "Medium",
+          source_rationale: "Negative case covering account enumeration/error-message consistency, implied by any credentialed login form",
+        },
+        {
+          title: "Login field accepts boundary-length input without breaking the form",
+          category: "Edge Case",
+          steps: [
+            "Navigate to the login page",
+            "Enter a 255-character string in the 'Username' field",
+            "Enter a 255-character string in the 'Password' field",
+            "Click the 'Log in' button",
+          ],
+          expected_result: "The form handles the long input gracefully -- either a clear validation message about the field's max length is shown, or the request completes without a server error (HTTP 5xx) or an unhandled UI crash.",
+          confidence_score: 0.72,
+          priority: "Low",
+          source_rationale: "Boundary-value edge case generated for any free-text credential field to catch unhandled length limits",
+        },
+        {
+          title: "Login form rejects script/SQL-injection-style input safely",
+          category: "Negative",
+          steps: [
+            "Navigate to the login page",
+            "Enter \"' OR '1'='1\" in the 'Username' field",
+            "Enter \"<script>alert(1)</script>\" in the 'Password' field",
+            "Click the 'Log in' button",
+          ],
+          expected_result: "The login is rejected with the normal invalid-credentials error -- the input is treated as literal text, not executed or used to bypass authentication. No script executes and no unhandled server error occurs.",
+          confidence_score: 0.7,
+          priority: "High",
+          source_rationale: "Security-oriented negative case generated for any credentialed input form to catch unsanitized handling of malicious input",
         },
       ];
     }
 
-    // Generic fallback: turn each sentence of the input into a lightweight functional test case
+    // Generic fallback: one detailed Functional/Smoke case per described sentence
+    // (each with a precondition, the action, and two verification steps -- not
+    // just a single vague "observe" line), plus a Negative and an Edge Case that
+    // apply to virtually any described flow, so coverage isn't limited to the
+    // single happy path implied by the input text.
     const sentences = inputText
       .split(/[.\n]/)
       .map((s) => s.trim())
@@ -83,18 +133,52 @@ export const mockProvider: LlmProvider = {
       ];
     }
 
-    return sentences.map((s, i) => ({
+    const functionalCases: GeneratedTestCase[] = sentences.map((s, i) => ({
       title: `Verify that ${s.slice(0, 60).replace(/\.+$/, "")}`,
-      category: i === 0 ? "Functional" : i === 1 ? "Smoke" : "Edge Case",
+      category: i === 0 ? "Smoke" : "Functional",
       steps: [
         "Navigate to the relevant page or endpoint",
-        `Follow the flow described in the input: "${s}"`,
-        "Observe the resulting application state",
+        `Set up any precondition data/state implied by: "${s}"`,
+        `Perform the action described in the input: "${s}"`,
+        "Observe the resulting UI state and any confirmation message",
       ],
-      expected_result: `The application behaves as described: ${s}`,
+      expected_result: `The application behaves exactly as described -- "${s}" -- and the UI reflects the change (updated state, confirmation message, or navigation) with no error shown.`,
       confidence_score: 0.7 - i * 0.05,
+      priority: i === 0 ? "High" : "Medium",
       source_rationale: `Generated directly from input sentence ${i + 1}`,
     }));
+
+    const primaryFlow = sentences[0];
+    const crossCuttingCases: GeneratedTestCase[] = [
+      {
+        title: `Action is rejected when required input is missing (${primaryFlow.slice(0, 40)}...)`,
+        category: "Negative",
+        steps: [
+          "Navigate to the relevant page or endpoint",
+          "Leave any required field(s) implied by the described flow empty, or omit any required data",
+          "Attempt to submit/perform the action",
+        ],
+        expected_result: "A clear validation error is shown identifying the missing/invalid input. No partial update is applied and no navigation away from the form occurs.",
+        confidence_score: 0.65,
+        priority: "Medium",
+        source_rationale: "Generic negative counterpart generated for any described input-driven flow, covering required-field validation",
+      },
+      {
+        title: `Boundary/large input is handled without a server or UI error (${primaryFlow.slice(0, 40)}...)`,
+        category: "Edge Case",
+        steps: [
+          "Navigate to the relevant page or endpoint",
+          "Enter the maximum realistic or an unusually large value into the primary input field(s) for the described flow",
+          "Attempt to submit/perform the action",
+        ],
+        expected_result: "The application either accepts the boundary value and completes the action, or shows a clear length/format validation message -- in neither case does it return a server error (HTTP 5xx) or an unhandled UI exception.",
+        confidence_score: 0.6,
+        priority: "Low",
+        source_rationale: "Generic edge-case counterpart generated for any described input-driven flow, covering boundary-value handling",
+      },
+    ];
+
+    return [...functionalCases, ...crossCuttingCases];
   },
 
   async generatePlaywrightScript(testCase, options): Promise<string> {

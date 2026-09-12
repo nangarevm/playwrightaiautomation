@@ -39,66 +39,87 @@ export function collectCrawlBugsForSite(siteId: string): BugFindingRow[] {
   return listBugFindingsForSite(siteId, { validationStatus: "confirmed" });
 }
 
-// Collect bugs from test execution (failures, timeouts, errors)
-export function collectTestExecutionBugs(runIds: string[]): Array<{
+export interface ExecutionBug {
   id: string;
   title: string;
   severity: BugSeverity;
   source: "test_failure";
   detail: string;
   testCaseId: string;
-  validationStatus: "candidate";
-}> {
-  const bugs: Array<{
+  stepsToReproduce: string[];
+  screenshot: string | null;
+}
+
+// Collect bugs from test execution (failures, timeouts, errors), joined all the
+// way back to the originating test case so the report can show the *actual*
+// steps that were run (not just "a test failed") -- preconditions, the test
+// case's own numbered steps, expected vs. actual result. Previously this only
+// read execution_evidence and mislabeled the run id as the test case id.
+export function collectTestExecutionBugs(runIds: string[]): ExecutionBug[] {
+  if (runIds.length === 0) return [];
+  const placeholders = runIds.map(() => "?").join(",");
+  const rows = db
+    .prepare(
+      `SELECT ee.id, ee.test_title, ee.error_message, ee.failure_class, ee.failure_label,
+              er.id as run_id, er.browser_set,
+              tc.id as test_case_id, tc.steps as tc_steps, tc.expected_result
+       FROM execution_evidence ee
+       JOIN execution_runs er ON ee.run_id = er.id
+       JOIN automation_scripts a ON er.script_id = a.id
+       JOIN test_cases tc ON a.test_case_id = tc.id
+       WHERE ee.run_id IN (${placeholders}) AND ee.error_message IS NOT NULL`
+    )
+    .all(...runIds) as Array<{
     id: string;
-    title: string;
-    severity: BugSeverity;
-    source: "test_failure";
-    detail: string;
-    testCaseId: string;
-    validationStatus: "candidate";
-  }> = [];
+    test_title: string;
+    error_message: string | null;
+    failure_class: string | null;
+    failure_label: string | null;
+    run_id: string;
+    browser_set: string | null;
+    test_case_id: string;
+    tc_steps: string | null;
+    expected_result: string | null;
+  }>;
 
-  for (const runId of runIds) {
-    // Get evidence for this run (failures, errors)
-    const evidence = db
-      .prepare(
-        `SELECT ee.id, ee.test_title, ee.error_message, ee.failure_class,
-                ee.failure_category, er.duration_ms
-         FROM execution_evidence ee
-         JOIN execution_runs er ON er.id = ee.run_id
-         WHERE ee.run_id = ? AND ee.error_message IS NOT NULL`
-      )
-      .all(runId) as Array<{
-      id: string;
-      test_title: string;
-      error_message: string | null;
-      failure_class: string | null;
-      failure_category: string | null;
-      duration_ms: number | null;
-    }>;
+  return rows.map((ev) => {
+    // execution_evidence has no duration_ms column (it never has -- a prior
+    // version of this query selected one anyway, which meant this function
+    // always threw "no such column: duration_ms" and every caller's
+    // try/catch silently swallowed it, so a test-execution bug report was
+    // never actually produced). Detect a timeout from the error text itself
+    // instead, same signal classifyTestFailure in executionService.ts uses.
+    const isTimeout = /test timeout of \d+ms exceeded/i.test(ev.error_message || "");
+    const isMissingElement = ev.error_message?.includes("locator") || ev.error_message?.includes("not found");
+    const isAssertion = ev.failure_class === "possible_bug" || ev.error_message?.toLowerCase().includes("assert");
 
-    for (const ev of evidence) {
-      // Categorize by error type
-      const isTimeout = ev.duration_ms != null && ev.duration_ms > 15000;
-      const isMissingElement = ev.error_message?.includes("locator") || ev.error_message?.includes("not found");
-      const isAssertion = ev.failure_category === "ASSERTION_FAILURE";
+    const severity: BugSeverity = isTimeout ? "high" : isMissingElement ? "medium" : isAssertion ? "high" : "medium";
 
-      const severity: BugSeverity = isTimeout ? "high" : isMissingElement ? "medium" : isAssertion ? "high" : "medium";
-
-      bugs.push({
-        id: ev.id,
-        title: isTimeout ? `Test timeout on ${ev.test_title}` : isMissingElement ? `Missing element in ${ev.test_title}` : `Failed: ${ev.test_title}`,
-        severity,
-        source: "test_failure",
-        detail: ev.error_message || "Test failed",
-        testCaseId: runId,
-        validationStatus: "candidate",
-      });
+    let steps: string[] = [];
+    try {
+      steps = ev.tc_steps ? JSON.parse(ev.tc_steps) : [];
+    } catch {
+      steps = [];
     }
-  }
 
-  return bugs;
+    const stepsToReproduce = [
+      ev.browser_set ? `Preconditions: run on the ${ev.browser_set} browser.` : undefined,
+      ...(steps.length > 0 ? steps.map((s, i) => `Step ${i + 1}: ${s}`) : [`Run the automated test: "${ev.test_title}"`]),
+      `Expected result: ${ev.expected_result || "See the linked test case for the expected outcome."}`,
+      `Actual result: ${ev.failure_label ? `${ev.failure_label} -- ` : ""}${ev.error_message || "Test failed"}`,
+    ].filter(Boolean) as string[];
+
+    return {
+      id: ev.id,
+      title: isTimeout ? `Test timeout on ${ev.test_title}` : isMissingElement ? `Missing element in ${ev.test_title}` : `Failed: ${ev.test_title}`,
+      severity,
+      source: "test_failure",
+      detail: ev.error_message || "Test failed",
+      testCaseId: ev.test_case_id,
+      stepsToReproduce,
+      screenshot: null,
+    };
+  });
 }
 
 // Categorize bug by its nature
@@ -135,7 +156,7 @@ function calculateSeverity(bug: any): BugSeverity {
 }
 
 // Aggregate all bugs from crawl and execution
-export function aggregateUltrafastBugs(crawlBugs: BugFindingRow[], executionBugs: any[]): AggregatedBug[] {
+export function aggregateUltrafastBugs(crawlBugs: BugFindingRow[], executionBugs: ExecutionBug[]): AggregatedBug[] {
   const bugs: AggregatedBug[] = [];
 
   // Add crawl bugs
@@ -154,7 +175,9 @@ export function aggregateUltrafastBugs(crawlBugs: BugFindingRow[], executionBugs
     });
   }
 
-  // Add execution bugs
+  // Add execution bugs -- stepsToReproduce/screenshot already built by
+  // collectTestExecutionBugs from the actual test case's steps and expected
+  // result, not a generic placeholder.
   for (const bug of executionBugs) {
     // A failed generated test is evidence to investigate, not a confirmed
     // product defect. It enters this report only after an independent
@@ -167,9 +190,9 @@ export function aggregateUltrafastBugs(crawlBugs: BugFindingRow[], executionBugs
       source: "test_failure",
       category: categorizeBug(bug),
       pageTitle: null,
-      stepsToReproduce: [`Run test case: ${bug.testCaseId}`],
-      screenshot: null,
-      evidence: { errorMessage: bug.detail },
+      stepsToReproduce: bug.stepsToReproduce?.length ? bug.stepsToReproduce : [`Run test case: ${bug.testCaseId}`],
+      screenshot: bug.screenshot ?? null,
+      evidence: { errorMessage: bug.detail, testCaseId: bug.testCaseId },
     });
   }
 

@@ -12,7 +12,20 @@ const TEST_CASE_SYSTEM =
   "Experienced QA engineer, not a template engine. Output ONLY a JSON array of test cases (no prose/fences). " +
   "Fields per item: title, category (Smoke|Regression|Functional|Edge Case|Negative|API), steps (string[]), " +
   "expected_result, confidence_score (0-1), source_rationale. Phrase titles/steps like a human QA plan " +
-  "(e.g. 'Verify login fails with an incorrect password'), not a mechanical field-by-field template.";
+  "(e.g. 'Verify login fails with an incorrect password'), not a mechanical field-by-field template.\n\n" +
+  "Coverage: don't stop at one happy-path case. For every distinct behavior, field, or flow named or implied " +
+  "in the input, work through it from multiple angles and emit a separate test case per angle that actually " +
+  "applies to that input (skip any that don't) -- positive/Smoke (the documented happy path), Negative " +
+  "(wrong/invalid input, unauthorized action, unmet precondition), Edge Case (empty/boundary/max-length values, " +
+  "unusual but valid input, rapid repeated actions), and Regression (a previously-specified behavior that a " +
+  "related change could silently break). A short input describing one form or one flow should still normally " +
+  "yield 4-8 cases, not 1-2, once positive/negative/edge angles are each considered.\n\n" +
+  "Detail: steps must be concrete and independently reproducible by someone unfamiliar with the feature -- " +
+  "name the exact field/button/label text, the exact value entered (e.g. 'Enter \"invalid@\" (missing domain) " +
+  "in the Email field', not 'enter an invalid email'), and split multi-action instructions into separate step " +
+  "strings. expected_result must state every observable outcome of the case, not just one -- UI state changed, " +
+  "message/error text shown (verbatim where the input specifies it), data persisted or rejected, and any " +
+  "side effect (redirect, email sent, record created) -- as full sentences, not a single fragment.";
 
 function scriptSystemPrompt(language: string, framework: string): string {
   if (framework !== "playwright") {
