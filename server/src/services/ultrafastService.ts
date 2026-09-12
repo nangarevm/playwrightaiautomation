@@ -186,7 +186,9 @@ export async function triggerUltrafastRun(input: UltrafastTriggerInput) {
       // generation request).
       .prepare(
         `SELECT id FROM automation_scripts WHERE test_case_id = ?
-         ORDER BY (CASE WHEN framework = 'playwright' AND language IN ('typescript', 'javascript') THEN 0 ELSE 1 END), created_at DESC
+         ORDER BY needs_regeneration ASC,
+                  (CASE WHEN framework = 'playwright' AND language IN ('typescript', 'javascript') THEN 0 ELSE 1 END),
+                  created_at DESC
          LIMIT 1`
       )
       .get(testCaseId) as { id: string } | undefined;
@@ -197,7 +199,9 @@ export async function triggerUltrafastRun(input: UltrafastTriggerInput) {
       const generated = db
         .prepare(
           `SELECT id FROM automation_scripts WHERE test_case_id = ?
-           ORDER BY (CASE WHEN framework = 'playwright' AND language IN ('typescript', 'javascript') THEN 0 ELSE 1 END), created_at DESC
+           ORDER BY needs_regeneration ASC,
+                    (CASE WHEN framework = 'playwright' AND language IN ('typescript', 'javascript') THEN 0 ELSE 1 END),
+                    created_at DESC
            LIMIT 1`
         )
         .get(testCaseId) as { id: string } | undefined;
@@ -241,23 +245,16 @@ export async function triggerUltrafastRun(input: UltrafastTriggerInput) {
   // Ultrafast enhancement: Collect and aggregate bugs from crawl + execution
   let bugReport = null;
   try {
-    const screen = testCase.screen_id ? (db.prepare("SELECT * FROM screens WHERE id = ?").get(testCase.screen_id) as any) : null;
-    const crawlSiteId = screen?.crawl_site_id || null;
+    const screen = testCase.screen_id
+      ? (db.prepare("SELECT source_input_id FROM screens WHERE id = ?").get(testCase.screen_id) as
+          | { source_input_id: string | null }
+          | undefined)
+      : null;
+    const crawlSiteId = screen?.source_input_id || null;
     
     if (crawlSiteId) {
-      const crawlBugs = db.prepare(
-        `SELECT DISTINCT b.* FROM bug_findings b 
-         JOIN screens s ON b.screen_id = s.id 
-         WHERE s.crawl_site_id = ?`
-      ).all(crawlSiteId) as any[];
-      
-      const executionBugs = db.prepare(
-        `SELECT ee.id, ee.test_title as title, ee.error_message as detail, 
-                er.id as testCaseId, ee.duration_ms
-         FROM execution_evidence ee
-         JOIN execution_runs er ON ee.run_id = er.id
-         WHERE er.id = ? AND ee.error_message IS NOT NULL`
-      ).all(runResult.id) as any[];
+      const crawlBugs = collectCrawlBugsForSite(crawlSiteId);
+      const executionBugs = collectTestExecutionBugs([runResult.id]);
       
       bugReport = generateUltrafastBugReport(crawlSiteId, crawlBugs, executionBugs);
     }

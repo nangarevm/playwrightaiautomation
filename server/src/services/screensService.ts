@@ -31,8 +31,21 @@ async function captureScreenshot(url: string): Promise<Buffer> {
   const browser = await chromium.launch({ headless: true });
   try {
     const page = await browser.newPage({ viewport: { width: 1280, height: 800 } });
-    await page.goto(url, { waitUntil: "load", timeout: 15000 });
-    return await page.screenshot({ fullPage: true });
+    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
+    await page.waitForLoadState("networkidle", { timeout: 5000 }).catch(() => undefined);
+    await page.addStyleTag({
+      content: `
+        *, *::before, *::after {
+          animation-duration: 0s !important;
+          animation-delay: 0s !important;
+          transition-duration: 0s !important;
+          caret-color: transparent !important;
+        }
+        time, [data-dynamic], [data-testid*="timestamp"], [class*="timestamp"],
+        [class*="advert"], [id*="advert"] { visibility: hidden !important; }
+      `,
+    });
+    return await page.screenshot({ fullPage: true, animations: "disabled", caret: "hide" });
   } finally {
     await browser.close();
   }
@@ -216,7 +229,10 @@ export async function diffAgainstVisualBaseline(screenId: string, params: { cont
     const { diffPercentage, width, height } = comparePngBuffers(beforePng, currentScreenshot);
     return {
       hasBaseline: true,
-      visualChangeDetected: diffPercentage > 0,
+      // Sub-pixel text rasterization and browser anti-aliasing regularly create
+      // tiny diffs. Only a material change crosses the product-review gate.
+      visualChangeDetected: diffPercentage >= 2,
+      ignoredAsRenderingNoise: diffPercentage > 0 && diffPercentage < 2,
       diffPercentage,
       dimensions: { width, height },
       method: "pixel-diff",

@@ -8,6 +8,8 @@ import {
   getRequirementCoverage,
   recordTimeBreakdownForRun,
 } from '../src/services/reportingService.ts';
+import { collectTestExecutionBugs } from '../src/services/ultrafastBugReportService.ts';
+import { getRunProgress } from '../src/services/realtimeExecutionService.ts';
 
 function resetData() {
   db.prepare('DELETE FROM auto_heal_actions').run();
@@ -113,4 +115,29 @@ test('recordTimeBreakdownForRun stores estimated duration and time saved for kno
 
   const row = db.prepare('SELECT estimated_duration_ms, time_saved_ms FROM execution_runs WHERE id = ?').get('run-1');
   assert.equal(row.estimated_duration_ms, 3.5 * 60_000);
+});
+
+test('Ultrafast execution findings use run duration and remain investigation candidates', () => {
+  const { scriptId } = seed();
+  insertRun('run-failed', scriptId, 'failed', 22000);
+  db.prepare(`
+    INSERT INTO execution_evidence (
+      id, run_id, test_title, test_file, status, evidence_path,
+      error_message, failure_class, failure_category, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    'evidence-failed', 'run-failed', 'Checkout workflow', 'checkout.spec.ts',
+    'failed', '', 'Expected total to match', 'possible_bug', 'ASSERTION_FAILURE',
+    new Date().toISOString()
+  );
+
+  const findings = collectTestExecutionBugs(['run-failed']);
+  assert.equal(findings.length, 1);
+  assert.equal(findings[0].validationStatus, 'candidate');
+
+  const progress = getRunProgress('run-failed');
+  assert.equal(progress.testsFailed, 1);
+  assert.equal(progress.testsPassed, 0);
+  assert.equal(progress.totalTests, 1);
+  assert.equal(progress.bugsFound, 0);
 });

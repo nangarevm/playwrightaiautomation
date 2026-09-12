@@ -43,7 +43,7 @@ reportingRouter.get("/tag-coverage", (req, res) => {
 });
 
 // Ultrafast mode bug report: comprehensive bug analysis from crawl + execution
-reportingRouter.get("/ultrafast-bug-report", (req, res) => {
+reportingRouter.get("/ultrafast-bug-report", async (req, res) => {
   try {
     const { siteId, format } = req.query as { siteId?: string; format?: "json" | "html" | "pdf" };
     
@@ -51,12 +51,7 @@ reportingRouter.get("/ultrafast-bug-report", (req, res) => {
       return res.status(400).json({ error: "siteId query parameter is required" });
     }
 
-    // Collect bugs from crawl
-    const crawlBugs = db.prepare(
-      `SELECT DISTINCT b.* FROM bug_findings b 
-       JOIN screens s ON b.screen_id = s.id 
-       WHERE s.crawl_site_id = ?`
-    ).all(siteId) as any[];
+    const crawlBugs = collectCrawlBugsForSite(siteId);
 
     // Collect bugs from recent test executions for this site
     const recentRuns = db.prepare(
@@ -65,35 +60,43 @@ reportingRouter.get("/ultrafast-bug-report", (req, res) => {
        JOIN test_cases tc ON a.test_case_id = tc.id
        WHERE tc.id IN (
          SELECT id FROM test_cases WHERE screen_id IN (
-           SELECT id FROM screens WHERE crawl_site_id = ?
+           SELECT id FROM screens WHERE source_input_id = ?
          )
        )
        ORDER BY er.created_at DESC LIMIT 20`
     ).all(siteId) as Array<{ id: string }>;
 
-    const executionBugs = [];
-    for (const run of recentRuns) {
-      const bugs = db.prepare(
-        `SELECT ee.id, ee.test_title as title, ee.error_message as detail, 
-                ee.duration_ms, er.id as testCaseId
-         FROM execution_evidence ee
-         JOIN execution_runs er ON ee.run_id = er.id
-         WHERE er.id = ? AND ee.error_message IS NOT NULL`
-      ).all(run.id) as any[];
-      executionBugs.push(...bugs);
-    }
+    const executionBugs = collectTestExecutionBugs(recentRuns.map((run) => run.id));
 
     const bugReport = generateUltrafastBugReport(siteId, crawlBugs, executionBugs);
-    const formattedReport = formatBugReport(bugReport, format || "json");
-
     if (format === "html") {
       res.setHeader("Content-Type", "text/html");
-      res.send(formattedReport);
+      res.send(formatBugReport(bugReport, "html"));
     } else if (format === "pdf") {
+      const pdf = await buildBugReportPdf(
+        bugReport.allBugs.map((bug) => ({
+          title: bug.title,
+          failureClass: "possible_bug",
+          validationStatus: "confirmed",
+          rootCause:
+            bug.category === "performance"
+              ? "REAL_PERFORMANCE_BUG"
+              : ["ui", "accessibility", "navigation", "content"].includes(bug.category)
+                ? "REAL_UI_BUG"
+                : "REAL_PRODUCT_BUG",
+          severity: bug.severity,
+          priority: bug.severity === "critical" ? "P0" : bug.severity === "high" ? "P1" : bug.severity === "medium" ? "P2" : "P3",
+          failureLabel: `${bug.category} defect`,
+          errorMessage: JSON.stringify(bug.evidence),
+          reportUrl: bug.screenshot,
+          reproducibility: "confirmed",
+          evidence: bug.evidence,
+        }))
+      );
       res.setHeader("Content-Type", "application/pdf");
-      res.send(formattedReport); // Would need pdfkit integration
+      res.send(pdf);
     } else {
-      res.json(JSON.parse(formattedReport));
+      res.json(bugReport);
     }
   } catch (err: any) {
     res.status(500).json({ error: err.message });

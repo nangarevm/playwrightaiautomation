@@ -107,10 +107,13 @@ export function getRunProgress(runId: string): {
   const run = db
     .prepare(
       `SELECT 
-        status, 
-        COUNT(CASE WHEN passed = 1 THEN 1 END) as tests_passed,
-        COUNT(CASE WHEN passed = 0 THEN 1 END) as tests_failed,
-        COUNT(*) as total_tests
+        er.status,
+        CASE WHEN er.status = 'passed' THEN 1 ELSE 0 END AS tests_passed,
+        SUM(CASE WHEN ee.status = 'failed' OR ee.error_message IS NOT NULL THEN 1 ELSE 0 END) AS tests_failed,
+        CASE
+          WHEN COUNT(ee.id) > 0 THEN COUNT(ee.id)
+          ELSE 1
+        END AS total_tests
        FROM execution_runs er
        LEFT JOIN execution_evidence ee ON er.id = ee.run_id
        WHERE er.id = ?
@@ -120,7 +123,15 @@ export function getRunProgress(runId: string): {
 
   if (!run) return null;
 
-  const bugsFound = db.prepare("SELECT COUNT(*) as count FROM bug_findings WHERE run_id = ?").get(runId) as any;
+  const bugsFound = db
+    .prepare(`
+      SELECT COUNT(*) AS count
+      FROM bug_findings
+      WHERE run_id = ?
+        AND validation_status = 'confirmed'
+        AND root_cause LIKE 'REAL_%'
+    `)
+    .get(runId) as any;
 
   // Estimate cost: roughly $0.50 per test on Ultrafast
   const estimatedCostPerTest = 0.5;

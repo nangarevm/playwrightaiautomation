@@ -1084,15 +1084,49 @@ export async function generateTestsFromScenarios(scenarioIds: string[], actorUse
 
     if (scenario.generated_test_case_id) {
       let scriptFile: string | undefined;
-      const existingScript = db
+      let existingScript = db
         .prepare(
-          `SELECT id, file_path FROM automation_scripts WHERE test_case_id = ?
-           ORDER BY (CASE WHEN framework = 'playwright' AND language IN ('typescript', 'javascript') THEN 0 ELSE 1 END), created_at DESC
+          `SELECT id, file_path, code, framework, language FROM automation_scripts WHERE test_case_id = ?
+           ORDER BY needs_regeneration ASC,
+                    (CASE WHEN framework = 'playwright' AND language IN ('typescript', 'javascript') THEN 0 ELSE 1 END),
+                    created_at DESC
            LIMIT 1`
         )
-        .get(scenario.generated_test_case_id) as { id: string; file_path: string } | undefined;
+        .get(scenario.generated_test_case_id) as
+        | { id: string; file_path: string; code: string; framework: string; language: string }
+        | undefined;
+      const currentGeneratorMarker =
+        scenario.type === "api" ? /durationMs.*Expected HTTP/s.test(existingScript?.code || "") : /__productIssues/.test(existingScript?.code || "");
+      if (
+        existingScript &&
+        existingScript.framework === "playwright" &&
+        ["typescript", "javascript"].includes(existingScript.language) &&
+        (!currentGeneratorMarker || /report-email|report-msg|report-abuse|go to homepage/i.test(existingScript.code || ""))
+      ) {
+        try {
+          db.prepare("UPDATE automation_scripts SET needs_regeneration = 1 WHERE id = ?").run(existingScript.id);
+          const generation = await generateAutomationScript(scenario.generated_test_case_id);
+          existingScript = db
+            .prepare(
+              `SELECT id, file_path, code, framework, language FROM automation_scripts
+               WHERE test_case_id = ? AND needs_regeneration = 0
+               ORDER BY created_at DESC LIMIT 1`
+            )
+            .get(scenario.generated_test_case_id) as typeof existingScript;
+          scriptFile = generation.artifacts[0]?.fileName || (existingScript ? path.basename(existingScript.file_path) : undefined);
+        } catch (err: any) {
+          db.prepare("UPDATE automation_scripts SET needs_regeneration = 0 WHERE id = ?").run(existingScript.id);
+          results.push({
+            scenarioId,
+            ok: false,
+            testCaseId: scenario.generated_test_case_id,
+            error: err.message || "Failed to upgrade stale automation script",
+          });
+          continue;
+        }
+      }
       if (existingScript) {
-        scriptFile = path.basename(existingScript.file_path);
+        scriptFile ||= path.basename(existingScript.file_path);
       } else {
         try {
           const generation = await generateAutomationScript(scenario.generated_test_case_id);
@@ -1113,7 +1147,9 @@ export async function generateTestsFromScenarios(scenarioIds: string[], actorUse
         testCaseId: scenario.generated_test_case_id,
         scriptFile,
         error: existingScript
-          ? "Test case already generated for this scenario (skipped duplicate)"
+          ? currentGeneratorMarker
+            ? "Test case already generated for this scenario (current generator)"
+            : "Regenerated stale automation with real product oracles"
           : "Regenerated missing automation script for existing test case",
       });
       continue;

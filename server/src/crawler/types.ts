@@ -81,7 +81,15 @@ export interface ApiCallRecord {
   trigger: string;
   method: string;
   endpoint: string;
+  /** Backward-compatible alias for responseSchema. */
   schema: Record<string, unknown>;
+  requestSchema?: Record<string, unknown>;
+  requestExample?: Record<string, unknown>;
+  responseSchema?: Record<string, unknown>;
+  status?: number;
+  responseTimeMs?: number;
+  responseHeaders?: Record<string, string>;
+  correlationId?: string | null;
   // Origin host of the request (e.g. "pune.gov.in") -- lets API-scenario
   // generation keep only same-origin calls (the site's own backend) and
   // drop third-party trackers/widgets/CDN calls that happen to share a page.

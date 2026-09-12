@@ -6,7 +6,7 @@ import { fileURLToPath } from "url";
 import { db } from "../db.js";
 import { recordTimeBreakdownForRun, updateFlakyFlagForScript } from "./reportingService.js";
 import { autoFileBugOnRegression, notifyAllOnRunComplete } from "./integrationsService.js";
-import { runBugScanForScreen, recordBugFinding } from "./bugDetectionService.js";
+import { confirmHttpFinding, runBugScanForScreen, recordBugFinding } from "./bugDetectionService.js";
 import { decryptSecret } from "./secretsService.js";
 import { getEnvironment, preflightHealthCheck } from "./environmentsService.js";
 import { logAudit } from "./adminService.js";
@@ -733,7 +733,11 @@ export function runExecution(scriptId: string, targetUrl: string, input: any = {
 
     // FR-4.15: apply the profile's custom execution rules (test-attribute/schedule/prior-outcome
     // conditioned overrides) on top of its base configuration before building the run
-    const testCase = db.prepare("SELECT title, category, screen_id FROM test_cases WHERE id = ?").get(script.test_case_id) as { title: string; category: string; screen_id?: string | null } | undefined;
+    const testCase = db
+      .prepare("SELECT title, category, screen_id, expected_result FROM test_cases WHERE id = ?")
+      .get(script.test_case_id) as
+      | { title: string; category: string; screen_id?: string | null; expected_result?: string | null }
+      | undefined;
     const ruleOverrides = evaluateCustomExecutionRules(profile?.rules_json, {
       testCaseTitle: testCase?.title,
       dayOfWeek: getDayOfWeek(),
@@ -962,6 +966,11 @@ export function runExecution(scriptId: string, targetUrl: string, input: any = {
         const classifyTestFailure = (message: string | null): { failureClass: string; failureLabel: string; failureCategory: string } => {
           if (!message) return { failureClass: "unknown", failureLabel: "No error detail captured", failureCategory: "UNKNOWN" };
           const m = message.toLowerCase();
+          const chromeLocator =
+            /report-email|report-msg|report-abuse|report this website|switch to dark|go to homepage|#report-/.test(m);
+          if (chromeLocator) {
+            return { failureClass: "automation_issue", failureLabel: "Hosting/browser chrome was targeted — not a product control", failureCategory: "LOCATOR_FAILURE" };
+          }
           if (/page crashed|target closed|browser has been closed|playwright\.connection/.test(m)) {
             return { failureClass: "environment_issue", failureLabel: "Page/browser crashed during the test", failureCategory: "PAGE_CRASH" };
           }
@@ -971,27 +980,37 @@ export function runExecution(scriptId: string, targetUrl: string, input: any = {
           if (/401|403|unauthorized|forbidden|login required|session expired|not authenticated/.test(m) && /expect|status|goto|navigation/.test(m)) {
             return { failureClass: "environment_issue", failureLabel: "Authentication/session failure — not a locator issue", failureCategory: "AUTHENTICATION_FAILURE" };
           }
-          if (/syntaxerror|typeerror.*invalid url|invalid url/.test(m)) {
+          if (/syntaxerror|typeerror.*invalid url|invalid url/.test(m) && !/pageerror|uncaught/.test(m)) {
             return { failureClass: "automation_issue", failureLabel: "Automation script issue -- the generated script itself is malformed (syntax/invalid input), not a product defect", failureCategory: "UNKNOWN" };
           }
-          if (/(getbylabel|getbyrole|getbytext|getbytestid|getbyplaceholder|getbyalttext|getbytitle|locator\()/.test(m) && /(timeout|waiting for|strict mode violation|resolved to \d+ elements)/.test(m)) {
-            return { failureClass: "automation_issue", failureLabel: "Locator failure -- the generated locator did not uniquely match the page (safe to consider healing)", failureCategory: "LOCATOR_FAILURE" };
+          if (/strict mode violation|resolved to \d+ elements/.test(m)) {
+            return { failureClass: "automation_issue", failureLabel: "Locator matched multiple elements — generated selector is too broad", failureCategory: "LOCATOR_FAILURE" };
+          }
+          if (/http 5\d\d|__productissues|internal server error|502 bad gateway|503 service|javascript: /.test(m)) {
+            return { failureClass: "possible_bug", failureLabel: "Potential product defect — independent HTTP/JavaScript evidence was captured", failureCategory: "NETWORK_FAILURE" };
+          }
+          if (/unexpected dialog/.test(m)) {
+            return { failureClass: "possible_bug", failureLabel: "Product bug — page showed an unexpected dialog (possible XSS or unhandled alert)", failureCategory: "JAVASCRIPT_ERROR" };
+          }
+          if (/expect\(.*\)\.|tohavetitle|tobevisible|tohavelength|assert/.test(m)) {
+            return { failureClass: "possible_bug", failureLabel: "Potential product defect — an application-state assertion failed and requires reproduction", failureCategory: "ASSERTION_FAILURE" };
+          }
+          if (/outside of the viewport/.test(m)) {
+            return { failureClass: "automation_issue", failureLabel: "Automation actionability failure — verify layout independently before reporting a UI defect", failureCategory: "LOCATOR_FAILURE" };
+          }
+          if (/(getbylabel|getbyrole|getbytext|getbytestid|getbyplaceholder|locator\()/.test(m) && /(timeout|waiting for)/.test(m)) {
+            return {
+              failureClass: "automation_issue",
+              failureLabel: "Automation locator failure — selector absence alone is not an application bug",
+              failureCategory: "LOCATOR_FAILURE",
+            };
           }
           if (/test timeout of \d+ms exceeded/.test(m)) {
             return {
               failureClass: "automation_issue",
-              failureLabel: "Timeout -- the test exceeded its time budget (slow load, missing wait, or insufficient timeout)",
+              failureLabel: "Automation timeout — requires independent UI/API evidence before product classification",
               failureCategory: "TIMEOUT",
             };
-          }
-          if (/returned http [45]\d\d|response\.ok|internal server error|502 bad gateway|503 service/.test(m)) {
-            return { failureClass: "possible_bug", failureLabel: "Possible product bug -- HTTP/API response did not match expectations", failureCategory: "NETWORK_FAILURE" };
-          }
-          if (/tohavetitle.*received|tobevisible.*received|not visible|404|page not found/.test(m)) {
-            return { failureClass: "possible_bug", failureLabel: "Possible product bug -- page content did not match expectations (do not heal assertions)", failureCategory: "ASSERTION_FAILURE" };
-          }
-          if (/expect\(.*\)\.|assert/.test(m)) {
-            return { failureClass: "possible_bug", failureLabel: "Assertion failure -- expected application state did not match; healing is not recommended", failureCategory: "ASSERTION_FAILURE" };
           }
           if (/pageerror|javascript error|uncaught \(in promise\)/.test(m)) {
             return { failureClass: "possible_bug", failureLabel: "JavaScript error on the page", failureCategory: "JAVASCRIPT_ERROR" };
@@ -1070,20 +1089,57 @@ export function runExecution(scriptId: string, targetUrl: string, input: any = {
 
               // Surface likely product defects in the Bugs tab, not only as test-run noise.
               if (ft.failureClass === "possible_bug") {
-                recordBugFinding({
+                const candidate = recordBugFinding({
                   source: "regression",
                   severity: "high",
-                  title: `Possible product defect: ${ft.title}`,
+                  rootCause:
+                    /API\/UI|HTTP 5\d\d|response/i.test(ft.errorMessage || "")
+                      ? "REAL_API_BUG"
+                      : ft.failureCategory === "JAVASCRIPT_ERROR"
+                        ? "REAL_UI_BUG"
+                        : "REAL_PRODUCT_BUG",
+                  priority: "P1",
+                  validationStatus: "candidate",
+                  title: `Requires product investigation: ${ft.title}`,
                   detail: ft.errorMessage || ft.failureLabel,
                   screenId: testCase?.screen_id ?? null,
                   runId,
-                  evidence: { testTitle: ft.title, testFile: ft.file, failureClass: ft.failureClass },
+                  evidence: {
+                    testTitle: ft.title,
+                    testFile: ft.file,
+                    failureClass: ft.failureClass,
+                    failureCategory: ft.failureCategory,
+                    targetUrl,
+                  },
+                  environment: {
+                    browser: browserSet,
+                    os: process.platform,
+                    viewport: "configured Playwright viewport",
+                    speedMode,
+                  },
+                  expectedResult: testCase?.expected_result || "The workflow should complete with the expected UI and API state.",
+                  actualResult: ft.errorMessage || ft.failureLabel,
+                  reproductionAttempts: 1,
+                  reproductionSuccesses: 1,
+                  affectedScenarios: [ft.title],
                   stepsToReproduce: [
                     `Run the automated test: ${ft.title}`,
                     `Target URL: ${targetUrl}`,
                     `Observe failure: ${ft.failureLabel}`,
+                    "Reproduce manually or with an independent UI/API probe before promoting this candidate to a product defect.",
                   ],
                 });
+                const httpSignal = (ft.errorMessage || "").match(
+                  /\bHTTP\s+(5\d\d)\s+(GET|POST|PUT|PATCH|DELETE)?\s*(https?:\/\/[^\s'"]+)/i
+                );
+                if (httpSignal) {
+                  const statusCode = Number(httpSignal[1]);
+                  const signalMethod = httpSignal[2] || "GET";
+                  const signalUrl = httpSignal[3].replace(/[),.;]+$/, "");
+                  if (signalMethod.toUpperCase() === "GET") {
+                    confirmHttpFinding(candidate.id, signalUrl, statusCode, signalMethod).catch(() => undefined);
+                  }
+                }
               }
             }
           }

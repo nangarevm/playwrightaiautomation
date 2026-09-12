@@ -3,7 +3,7 @@
 // and generates a comprehensive bug report for the user
 
 import { db } from "../db.js";
-import { listBugFindings, BugFindingRow } from "./bugDetectionService.js";
+import { listBugFindingsForSite, BugFindingRow } from "./bugDetectionService.js";
 import type { BugSeverity } from "./bugDetectionService.js";
 
 export interface AggregatedBug {
@@ -36,19 +36,7 @@ export interface UltrafastBugReport {
 
 // Collect bugs discovered during crawl for a site
 export function collectCrawlBugsForSite(siteId: string): BugFindingRow[] {
-  const page = db.prepare("SELECT id FROM crawl_pages WHERE site_id = ?").all(siteId) as Array<{ id: string }>;
-  const pageIds = page.map((p) => p.id);
-
-  const allBugs: BugFindingRow[] = [];
-  for (const pageId of pageIds) {
-    const bugs = db
-      .prepare(
-        "SELECT * FROM bug_findings WHERE screen_id IN (SELECT id FROM screens WHERE url_or_path IN (SELECT url FROM crawl_pages WHERE id = ?))"
-      )
-      .all(pageId) as BugFindingRow[];
-    allBugs.push(...bugs);
-  }
-  return allBugs;
+  return listBugFindingsForSite(siteId, { validationStatus: "confirmed" });
 }
 
 // Collect bugs from test execution (failures, timeouts, errors)
@@ -59,6 +47,7 @@ export function collectTestExecutionBugs(runIds: string[]): Array<{
   source: "test_failure";
   detail: string;
   testCaseId: string;
+  validationStatus: "candidate";
 }> {
   const bugs: Array<{
     id: string;
@@ -67,20 +56,25 @@ export function collectTestExecutionBugs(runIds: string[]): Array<{
     source: "test_failure";
     detail: string;
     testCaseId: string;
+    validationStatus: "candidate";
   }> = [];
 
   for (const runId of runIds) {
     // Get evidence for this run (failures, errors)
     const evidence = db
       .prepare(
-        `SELECT id, test_title, error_message, failure_class, duration_ms 
-         FROM execution_evidence WHERE run_id = ? AND error_message IS NOT NULL`
+        `SELECT ee.id, ee.test_title, ee.error_message, ee.failure_class,
+                ee.failure_category, er.duration_ms
+         FROM execution_evidence ee
+         JOIN execution_runs er ON er.id = ee.run_id
+         WHERE ee.run_id = ? AND ee.error_message IS NOT NULL`
       )
       .all(runId) as Array<{
       id: string;
       test_title: string;
       error_message: string | null;
       failure_class: string | null;
+      failure_category: string | null;
       duration_ms: number | null;
     }>;
 
@@ -88,7 +82,7 @@ export function collectTestExecutionBugs(runIds: string[]): Array<{
       // Categorize by error type
       const isTimeout = ev.duration_ms != null && ev.duration_ms > 15000;
       const isMissingElement = ev.error_message?.includes("locator") || ev.error_message?.includes("not found");
-      const isAssertion = ev.failure_class?.includes("AssertionError");
+      const isAssertion = ev.failure_category === "ASSERTION_FAILURE";
 
       const severity: BugSeverity = isTimeout ? "high" : isMissingElement ? "medium" : isAssertion ? "high" : "medium";
 
@@ -99,6 +93,7 @@ export function collectTestExecutionBugs(runIds: string[]): Array<{
         source: "test_failure",
         detail: ev.error_message || "Test failed",
         testCaseId: runId,
+        validationStatus: "candidate",
       });
     }
   }
@@ -145,6 +140,7 @@ export function aggregateUltrafastBugs(crawlBugs: BugFindingRow[], executionBugs
 
   // Add crawl bugs
   for (const bug of crawlBugs) {
+    if (bug.validation_status !== "confirmed" || !bug.root_cause.startsWith("REAL_")) continue;
     bugs.push({
       id: bug.id,
       title: bug.title,
@@ -160,6 +156,10 @@ export function aggregateUltrafastBugs(crawlBugs: BugFindingRow[], executionBugs
 
   // Add execution bugs
   for (const bug of executionBugs) {
+    // A failed generated test is evidence to investigate, not a confirmed
+    // product defect. It enters this report only after an independent
+    // verification process explicitly marks it confirmed.
+    if (bug.validationStatus !== "confirmed") continue;
     bugs.push({
       id: bug.id,
       title: bug.title,
