@@ -462,6 +462,17 @@ export interface BugReportPdfEntry {
   failureLabel: string | null;
   errorMessage: string | null;
   reportUrl?: string | null;
+  rootCause?: string | null;
+  priority?: string | null;
+  severity?: string | null;
+  environment?: Record<string, unknown> | null;
+  expectedResult?: string | null;
+  actualResult?: string | null;
+  reproducibility?: string | null;
+  evidence?: Record<string, unknown> | null;
+  validationStatus?: "candidate" | "confirmed" | "rejected" | null;
+  preconditions?: string[] | null;
+  testData?: Record<string, unknown> | null;
 }
 
 const FAILURE_CLASS_BADGE: Record<string, string> = {
@@ -485,7 +496,14 @@ export function buildBugReportPdf(entries: BugReportPdfEntry[]): Promise<Buffer>
     doc.on("end", () => resolve(Buffer.concat(chunks)));
     doc.on("error", reject);
 
-    const genuineBugs = entries.filter((e) => e.failureClass === "possible_bug" || e.failureClass === "unknown" || !e.failureClass);
+    const genuineBugs = entries.filter(
+      (e) => e.failureClass === "possible_bug" && e.validationStatus === "confirmed"
+    );
+    const investigations = entries.filter(
+      (e) =>
+        (e.failureClass === "possible_bug" || e.failureClass === "unknown" || !e.failureClass) &&
+        e.validationStatus !== "confirmed"
+    );
     const scriptIssues = entries.filter((e) => e.failureClass === "automation_issue" || e.failureClass === "environment_issue");
 
     doc.fontSize(18).fillColor("#000").text("AI Test Automation Platform — Bug Report");
@@ -493,7 +511,7 @@ export function buildBugReportPdf(entries: BugReportPdfEntry[]): Promise<Buffer>
     doc.fontSize(10).fillColor("#555").text(`Generated ${new Date().toISOString()}`);
     doc.moveDown();
     doc.fontSize(11).fillColor("#000").text(
-      `${entries.length} failure(s) this crawl: ${genuineBugs.length} product bug(s), ${scriptIssues.length} automation/environment issue(s).`
+      `${entries.length} issue(s): ${genuineBugs.length} confirmed product bug(s), ${investigations.length} requiring investigation, ${scriptIssues.length} automation/environment issue(s).`
     );
     doc.moveDown();
 
@@ -501,12 +519,33 @@ export function buildBugReportPdf(entries: BugReportPdfEntry[]): Promise<Buffer>
       doc.fontSize(12).fillColor("#000").text(e.title, { continued: false });
       const badge = FAILURE_CLASS_BADGE[e.failureClass ?? "unknown"] ?? "Uncategorized";
       doc.fontSize(9).fillColor("#b91c1c").text(badge);
+      if (e.rootCause || e.priority || e.severity) {
+        doc
+          .fontSize(9)
+          .fillColor("#333")
+          .text(
+            `Type: ${e.rootCause || "UNKNOWN_REQUIRES_INVESTIGATION"}  |  Severity: ${e.severity || "n/a"}  |  Priority: ${e.priority || "n/a"}`
+          );
+      }
       if (e.failureLabel) doc.fontSize(9).fillColor("#666").text(e.failureLabel);
+      if (e.environment && Object.keys(e.environment).length > 0) {
+        doc.fontSize(8).fillColor("#555").text(`Environment: ${JSON.stringify(e.environment)}`);
+      }
+      if (e.preconditions?.length) doc.fontSize(8).fillColor("#555").text(`Preconditions: ${e.preconditions.join("; ")}`);
+      if (e.testData && Object.keys(e.testData).length > 0) {
+        doc.fontSize(8).fillColor("#555").text(`Test data: ${JSON.stringify(e.testData)}`);
+      }
+      if (e.reproducibility) doc.fontSize(8).fillColor("#555").text(`Reproducibility: ${e.reproducibility}`);
+      if (e.expectedResult) doc.fontSize(9).fillColor("#166534").text(`Expected: ${e.expectedResult}`);
+      if (e.actualResult) doc.fontSize(9).fillColor("#991b1b").text(`Actual: ${e.actualResult}`);
       if (e.errorMessage) {
         doc.fontSize(8).fillColor("#7f1d1d").font("Courier").text(e.errorMessage.slice(0, 1000));
         doc.font("Helvetica");
       } else {
         doc.fontSize(9).fillColor("#999").text("No detailed error message was captured for this failure.");
+      }
+      if (e.evidence && Object.keys(e.evidence).length > 0) {
+        doc.fontSize(8).fillColor("#333").text(`Evidence: ${JSON.stringify(e.evidence).slice(0, 1200)}`);
       }
       if (e.reportUrl) doc.fontSize(8).fillColor("#2563eb").text(e.reportUrl);
       doc.moveDown(0.8);
@@ -519,6 +558,13 @@ export function buildBugReportPdf(entries: BugReportPdfEntry[]): Promise<Buffer>
       doc.moveDown();
     } else {
       genuineBugs.forEach(renderEntry);
+    }
+
+    if (investigations.length > 0) {
+      doc.moveDown(0.4);
+      doc.fontSize(14).fillColor("#000").text("Requires investigation (not confirmed product bugs)");
+      doc.moveDown(0.3);
+      investigations.forEach(renderEntry);
     }
 
     if (scriptIssues.length > 0) {

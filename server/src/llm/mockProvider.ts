@@ -5,6 +5,8 @@ import {
   stripTransientLoadingLabel,
   stableRoleNameExpr,
   isBrowserChromeLabel,
+  isChromeLocator,
+  isLowValueInteractiveLabel,
   extractQuotedFieldLabel,
   fieldLocatorFallbacks,
 } from "../crawler/locatorQuality.js";
@@ -280,6 +282,47 @@ function buildApiTestScript(
   const endpointPath = match?.[2] ?? "/api/status";
   const fallbackBase = (process.env.TARGET_URL || "http://localhost:4100").replace(/\/$/, "");
   const safePath = endpointPath.replace(/'/g, "\\'");
+  const stepText = testCase.steps.join("\n");
+  const expectedStatus = Number(stepText.match(/observed HTTP (\d{3})/i)?.[1] || 200);
+  const observedMs = Number(stepText.match(/observed (\d+)ms/i)?.[1] || 0);
+  let requestExample: Record<string, any> = {};
+  const requestMarker = "redacted observed example:";
+  const requestLine = testCase.steps.find((step) => step.toLowerCase().includes(requestMarker));
+  if (requestLine) {
+    try {
+      requestExample = JSON.parse(
+        requestLine.slice(requestLine.toLowerCase().indexOf(requestMarker) + requestMarker.length).trim()
+      );
+    } catch {
+      requestExample = {};
+    }
+  }
+  let observedSchema: Record<string, any> = {};
+  const schemaMarker = "observed response schema:";
+  const schemaLine = testCase.steps.find((step) => step.toLowerCase().includes(schemaMarker));
+  if (schemaLine) {
+    try {
+      observedSchema = JSON.parse(schemaLine.slice(schemaLine.toLowerCase().indexOf(schemaMarker) + schemaMarker.length).trim());
+    } catch {
+      observedSchema = {};
+    }
+  }
+  const expectedFields =
+    observedSchema.type === "object" && observedSchema.fields && typeof observedSchema.fields === "object"
+      ? Object.entries(observedSchema.fields)
+      : [];
+  const responseShapeAssertions =
+    observedSchema.type === "array"
+      ? `  expect(Array.isArray(body), 'API response changed from an array').toBeTruthy();`
+      : expectedFields.length > 0
+        ? expectedFields
+            .map(
+              ([field, type]) =>
+                `  expect(body, 'Missing response field ${String(field).replace(/'/g, "\\'")}').toHaveProperty(${JSON.stringify(field)});\n` +
+                `  expect(Array.isArray(body[${JSON.stringify(field)}]) ? 'array' : typeof body[${JSON.stringify(field)}]).toBe(${JSON.stringify(type)});`
+            )
+            .join("\n")
+        : "";
 
   if (language === "python") {
     return `import os
@@ -304,10 +347,26 @@ def test_${slugify(testCase.title).replace(/-/g, "_")}(playwright):
 // input (FR-1.4/FR-1.5), using Playwright's request fixture rather than a browser page.
 test('${testCase.title.replace(/'/g, "\\'")}', async ({ request }) => {
   const base = (process.env.TARGET_URL || '${fallbackBase.replace(/'/g, "\\'")}').replace(/\\/$/, '');
-  const response = await request.${method}(\`\${base}${safePath.startsWith("/") ? "" : "/"}${safePath}\`);
+  const requestData: Record<string, any> = ${JSON.stringify(requestExample)};
+  const missingSecrets: string[] = [];
+  for (const [key, value] of Object.entries(requestData)) {
+    const secret = typeof value === 'string' ? value.match(/^\\$\\{(.+)\\}$/)?.[1] : null;
+    if (secret) {
+      if (!process.env[secret]) missingSecrets.push(secret);
+      else requestData[key] = process.env[secret];
+    }
+  }
+  test.skip(missingSecrets.length > 0, 'Missing required API secret(s): ' + missingSecrets.join(', '));
+  const started = Date.now();
+  const response = await request.${method}(\`\${base}${safePath.startsWith("/") ? "" : "/"}${safePath}\`${Object.keys(requestExample).length > 0 ? ", { data: requestData }" : ""});
+  const durationMs = Date.now() - started;
   const status = response.status();
-  expect(status, \`Expected 2xx from ${method.toUpperCase()} ${safePath}, got \${status}\`).toBeGreaterThanOrEqual(200);
-  expect(status).toBeLessThan(300);
+  expect(status, \`Expected HTTP ${expectedStatus} from ${method.toUpperCase()} ${safePath}, got \${status}\`).toBe(${expectedStatus});
+  const contentType = response.headers()['content-type'] || '';
+  let body: any = null;
+  if (/json/i.test(contentType)) body = await response.json();
+${responseShapeAssertions || "  // No stable response fields were observed during discovery."}
+${observedMs > 0 ? `  expect(durationMs, 'API response regressed materially from the observed ${observedMs}ms').toBeLessThan(${Math.max(10_000, observedMs * 3)});` : ""}
 });
 `;
 }
@@ -400,6 +459,7 @@ function buildCrawledPlaywrightScript(
       .map((l) => l.trim())
       .filter(Boolean)
       .map((l) => (l.startsWith("page.") ? l : `page.${l}`))
+      .filter((l) => !isChromeLocator(l) && !isLowValueInteractiveLabel(locatorLabel(l) || ""))
   );
 
   const navHopCount = testCase.steps.filter((s) =>
@@ -516,17 +576,30 @@ function buildCrawledPlaywrightScript(
       stepLines.push(`  // ${collapsed}`);
       ensureSearchUiOpen();
       const fillLabel = quoted || extractQuotedFieldLabel(step);
-      if (fillLabel && isBrowserChromeLabel(fillLabel)) {
+      if (fillLabel && (isBrowserChromeLabel(fillLabel) || isLowValueInteractiveLabel(fillLabel))) {
         stepLines.push(`  // skipped browser/hosting chrome field "${fillLabel}"`);
         lastClickLocator = null;
         continue;
       }
       const fillLocator =
-        locator && !/getByLabel\('t |getByRole\('textbox',\s*\{\s*name:\s*'t /i.test(locator)
+        locator && !isChromeLocator(locator) && !/getByLabel\('t |getByRole\('textbox',\s*\{\s*name:\s*'t /i.test(locator)
           ? locator
           : fillLabel
             ? fieldLocatorFallbacks(fillLabel)
-            : `page.locator('input:visible, textarea:visible').first()`;
+            : `page.locator('form:not([id*="report"]) input:visible, form:not([id*="report"]) textarea:visible').first()`;
+      if (isChromeLocator(fillLocator)) {
+        stepLines.push(`  // skipped hosting-chrome locator for "${fillLabel || "field"}"`);
+        lastClickLocator = null;
+        continue;
+      }
+      if (/\battach(?:es)?\b/.test(stepLower)) {
+        const file = inferUploadFixture(stepLower);
+        stepLines.push(
+          `  await ${withFirst(fillLocator)}.setInputFiles({ name: ${JSON.stringify(file.name)}, mimeType: ${JSON.stringify(file.mimeType)}, buffer: Buffer.from(${JSON.stringify(file.base64)}, 'base64') });`
+        );
+        lastClickLocator = null;
+        continue;
+      }
       const value = inferFillValue(stepLower, fillLabel || quoted);
       stepLines.push(`  await ${withFirst(fillLocator)}.fill(${JSON.stringify(value)}, { timeout: 10000 });`);
       lastClickLocator = null;
@@ -561,7 +634,7 @@ function buildCrawledPlaywrightScript(
 
     if (/\bclicks?\b|\bsubmits?\b|\btoggles?\b|\bpress(?:es)?\b/.test(stepLower)) {
       stepLines.push(`  // ${collapsed}`);
-      if (quoted && isBrowserChromeLabel(quoted)) {
+      if (quoted && (isBrowserChromeLabel(quoted) || isLowValueInteractiveLabel(quoted))) {
         stepLines.push(`  // skipped browser/hosting chrome control "${quoted}"`);
         lastClickLocator = null;
         continue;
@@ -576,6 +649,9 @@ function buildCrawledPlaywrightScript(
           : locator || pickSubmitLocator(locators, used);
 
       if (clickLocator && isFilterChipLocator(clickLocator)) {
+        clickLocator = pickSubmitLocator(locators, used);
+      }
+      if (clickLocator && isChromeLocator(clickLocator)) {
         clickLocator = pickSubmitLocator(locators, used);
       }
 
@@ -623,15 +699,63 @@ with sync_playwright() as p:
 `;
   }
 
+  const isNegativeForm =
+    /validation error|submitted empty|rejects an invalid|rejects an unsupported|whitespace-only|left empty/i.test(testCase.title);
+  const isSecurityInput = /script-like|injected script|xss|sql-like/i.test(testCase.title);
+
+  const productOracles = `  const __productIssues: string[] = [];
+  const __apiEvents: Array<{ method: string; url: string; status: number; body: string | null; at: number }> = [];
+  page.on('pageerror', (err) => __productIssues.push('JavaScript: ' + err.message));
+  ${isSecurityInput ? "page.on('dialog', (d) => { __productIssues.push('Unexpected dialog: ' + d.message()); d.dismiss().catch(() => {}); });" : ""}
+  page.on('response', (res) => {
+    const status = res.status();
+    const url = res.url();
+    const request = res.request();
+    const method = request.method();
+    const resourceType = request.resourceType();
+    let sameOrigin = false;
+    try { sameOrigin = new URL(url).origin === new URL(page.url()).origin; } catch {}
+    if (sameOrigin && (resourceType === 'xhr' || resourceType === 'fetch')) {
+      __apiEvents.push({ method, url, status, body: request.postData(), at: Date.now() });
+    }
+    if (status >= 500 && !/analytics|gtag|doubleclick|hotjar|facebook|google-analytics|report-email|report-msg/i.test(url)) {
+      __productIssues.push('HTTP ' + status + ' ' + method + ' ' + url);
+    }
+  });`;
+
+  const validationAssert = isNegativeForm
+    ? `  await expect(page.locator(':invalid, [aria-invalid="true"], .error, .invalid-feedback, .field-error, [role="alert"]').or(page.getByText(/required|invalid|please enter|cannot be empty|must be|not allowed/i)).first()).toBeVisible({ timeout: 8000 });\n`
+    : "";
+
+  const productAssert = `  const __feedbackVisible = await page.locator('[role="alert"]:visible, .error:visible, .alert-danger:visible, .invalid-feedback:visible, .field-error:visible, [aria-invalid="true"]:visible').count().catch(() => 0);
+  for (const event of __apiEvents) {
+    if (${isNegativeForm ? "false" : "true"} && event.status >= 400) {
+      __productIssues.push('API/UI: ' + event.method + ' ' + event.url + ' returned HTTP ' + event.status + ' during a success flow');
+    } else if (event.status >= 400 && __feedbackVisible === 0) {
+      __productIssues.push('API/UI: request failed with HTTP ' + event.status + ' but the UI showed no error feedback');
+    }
+  }
+  const __mutations = __apiEvents.filter((e) => !['GET', 'HEAD', 'OPTIONS'].includes(e.method));
+  for (let i = 0; i < __mutations.length; i++) {
+    for (let j = i + 1; j < __mutations.length; j++) {
+      const a = __mutations[i], b = __mutations[j];
+      if (a.method === b.method && a.url === b.url && a.body === b.body && Math.abs(a.at - b.at) < 1500) {
+        __productIssues.push('Duplicate mutation request: ' + a.method + ' ' + a.url);
+      }
+    }
+  }
+  expect(__productIssues, __productIssues.join('\\n')).toHaveLength(0);`;
+
   const flowAssertion = isFlow
-    ? `  await expect(page.locator('body')).toBeVisible();\n  await expect(page).toHaveTitle(/.+/);`
-    : `  await expect(page).toHaveTitle(/.+/);\n  await expect(page.locator('body')).toBeVisible();`;
+    ? `  await expect(page.locator('body')).toBeVisible();\n  await expect(page).toHaveTitle(/.+/);\n${validationAssert}${productAssert}`
+    : `  await expect(page).toHaveTitle(/.+/);\n  await expect(page.locator('body')).toBeVisible();\n${validationAssert}${productAssert}`;
 
   return `import { test, expect } from '@playwright/test';
 
 // Auto-generated from crawler-discovered scenario (mock provider)
 test('${title}', async ({ page }) => {
-${flowTimeoutMs ? `  test.setTimeout(${flowTimeoutMs});\n` : ""}  await page.goto(${gotoExprTs}, { waitUntil: 'domcontentloaded', timeout: 45000 });
+${flowTimeoutMs ? `  test.setTimeout(${flowTimeoutMs});\n` : ""}${productOracles}
+  await page.goto(${gotoExprTs}, { waitUntil: 'domcontentloaded', timeout: 45000 });
   await page.waitForLoadState('domcontentloaded');
   await page.locator('[aria-busy="true"], [role="progressbar"], .spinner, .loader, .loading').first().waitFor({ state: 'hidden', timeout: 8000 }).catch(() => {});
 ${stepLines.length ? stepLines.join("\n") + "\n" : ""}${flowAssertion}
@@ -707,7 +831,7 @@ function isFragileClickLabel(label: string): boolean {
   const v = label.trim();
   if (v.length < 2) return true;
   if (/cdn-cgi|^#|^(https?:\/\/|www\.)/i.test(v)) return true;
-  if (isBrowserChromeLabel(v)) return true;
+  if (isBrowserChromeLabel(v) || isLowValueInteractiveLabel(v)) return true;
   // Extremely long truncated card blurbs almost always animate / truncate in DOM
   if (v.length > 90) return true;
   return false;
@@ -715,10 +839,26 @@ function isFragileClickLabel(label: string): boolean {
 
 function emitRobustClickLines(locator: string): string[] {
   const normalized = withFirst(locator);
+  const shouldChangeState = /\b(save|create|add|delete|remove|login|log in|sign in|search|continue|next|apply|update|edit)\b/i.test(
+    locator
+  );
+  if (!shouldChangeState) {
+    return [
+      // force:true tolerates CSS transitions / carousels that never report "stable"
+      `  await ${normalized}.click({ timeout: 8000, force: true });`,
+      `  await page.waitForLoadState('domcontentloaded');`,
+    ];
+  }
   return [
+    `  {`,
+    `    const __beforeUrl = page.url();`,
+    `    const __beforeState = await page.locator('body').innerText().catch(() => '');`,
     // force:true tolerates CSS transitions / carousels that never report "stable"
-    `  await ${normalized}.click({ timeout: 8000, force: true });`,
-    `  await page.waitForLoadState('domcontentloaded');`,
+    `    await ${normalized}.click({ timeout: 8000, force: true });`,
+    `    await page.waitForLoadState('domcontentloaded');`,
+    `    const __afterState = await page.locator('body').innerText().catch(() => '');`,
+    `    expect(page.url() !== __beforeUrl || __afterState !== __beforeState, 'Product action produced no observable UI or navigation state change').toBeTruthy();`,
+    `  }`,
   ];
 }
 
@@ -768,7 +908,7 @@ function resolveCrawlLocatorForStep(step: string, locators: string[], used: Set<
     if (ranked[0] && ranked[0].score >= 40) {
       used.add(ranked[0].i);
       // If the best match is still a brittle #id for a fill, synthesize label/role.
-      if (wantsFill && (/locator\(["']#/.test(ranked[0].l) || /Your email\*/.test(ranked[0].l))) {
+      if (wantsFill && (/locator\(["']#/.test(ranked[0].l) || isChromeLocator(ranked[0].l))) {
         return fieldLocatorFallbacks(quoted);
       }
       return normalizeLocatorExpression(ranked[0].l);
@@ -848,6 +988,30 @@ function inferFillValue(stepLower: string, quoted?: string): string {
   }
   if (/url|website/.test(stepLower)) return "https://example.com";
   return "test value";
+}
+
+function inferUploadFixture(stepLower: string): { name: string; mimeType: string; base64: string } {
+  if (/unsupported|\.exe/.test(stepLower)) {
+    return { name: "qa-unsupported.exe", mimeType: "application/octet-stream", base64: "TVqQAAMAAAAEAAAA" };
+  }
+  if (/pdf/.test(stepLower)) {
+    return { name: "qa-document.pdf", mimeType: "application/pdf", base64: "JVBERi0xLjQKJSVFT0YK" };
+  }
+  if (/excel|xlsx/.test(stepLower)) {
+    return {
+      name: "qa-workbook.xlsx",
+      mimeType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      base64: "UEsDBAoAAAAAA",
+    };
+  }
+  if (/video|mp4/.test(stepLower)) {
+    return { name: "qa-video.mp4", mimeType: "video/mp4", base64: "AAAAHGZ0eXBpc29tAAACAGlzb20=" };
+  }
+  return {
+    name: "qa-image.png",
+    mimeType: "image/png",
+    base64: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+  };
 }
 
 function resolveLocatorForStep(stepText: string, language: "typescript" | "javascript" | "python"): { code: string; usedFallback: boolean } {

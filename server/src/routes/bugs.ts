@@ -1,6 +1,7 @@
 import { Router } from "express";
 import {
   fuzzApiEndpoints,
+  getQaDashboard,
   getBugFinding,
   listBugFindings,
   markBugFindingFiled,
@@ -15,8 +16,19 @@ export const bugsRouter = Router();
 // Bug Detection Engine findings -- proactively discovered defects (exploratory
 // UI scan + API fuzz), distinct from FR-7.6's reactive regression auto-filing.
 bugsRouter.get("/", (req, res) => {
-  const { status, severity, screenId } = req.query as { status?: string; severity?: string; screenId?: string };
-  res.json(listBugFindings({ status, severity, screenId }));
+  const { status, severity, screenId, siteId, validationStatus } = req.query as {
+    status?: string;
+    severity?: string;
+    screenId?: string;
+    siteId?: string;
+    validationStatus?: string;
+  };
+  res.json(listBugFindings({ status, severity, screenId, siteId, validationStatus }));
+});
+
+bugsRouter.get("/dashboard/summary", (req, res) => {
+  const siteId = typeof req.query.siteId === "string" ? req.query.siteId : undefined;
+  res.json(getQaDashboard(siteId));
 });
 
 bugsRouter.get("/:id", (req, res) => {
@@ -29,7 +41,12 @@ bugsRouter.get("/:id", (req, res) => {
 // runs automatically right after an execution run completes when the run's
 // script is tagged to a screen with a known URL (see executionService.ts).
 bugsRouter.post("/scan", async (req, res) => {
-  const { screenId, apiBaseUrl, endpoints } = req.body as { screenId?: string; apiBaseUrl?: string; endpoints?: string[] };
+  const { screenId, apiBaseUrl, endpoints, headers } = req.body as {
+    screenId?: string;
+    apiBaseUrl?: string;
+    endpoints?: string[];
+    headers?: Record<string, string>;
+  };
   if (!screenId && !apiBaseUrl) {
     return res.status(400).json(errBody(400, "Provide screenId for a UI scan, or apiBaseUrl + endpoints for an API fuzz pass."));
   }
@@ -40,7 +57,7 @@ bugsRouter.post("/scan", async (req, res) => {
       findings.push(...(await runBugScanForScreen(screenId)));
     }
     if (apiBaseUrl && Array.isArray(endpoints) && endpoints.length > 0) {
-      findings.push(...(await fuzzApiEndpoints(apiBaseUrl, endpoints)));
+      findings.push(...(await fuzzApiEndpoints(apiBaseUrl, endpoints, undefined, headers || {})));
     }
     res.status(201).json({ findings, count: findings.length });
   } catch (err: any) {

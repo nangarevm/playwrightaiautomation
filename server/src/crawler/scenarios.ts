@@ -26,7 +26,7 @@
 
 import { nanoid } from "nanoid";
 import type { ElementRecord, NavEdge, ScenarioRecord } from "./types.js";
-import { pickPreferredLocator, stripTransientLoadingLabel, isBrowserChromeLabel } from "./locatorQuality.js";
+import { pickPreferredLocator, stripTransientLoadingLabel, isBrowserChromeLabel, isChromeLocator, isLowValueInteractiveLabel } from "./locatorQuality.js";
 
 const MAX_PER_FIELD_CATEGORY = 6; // cap individual-field scenarios per form (required-empty, invalid-format)
 const MAX_STANDALONE_ELEMENTS = 12; // cap per-element scenarios on a no-form page
@@ -95,7 +95,11 @@ function makeScenario(
 }
 
 function productElements(elements: ElementRecord[]): ElementRecord[] {
-  return elements.filter((e) => !isBrowserChromeLabel(e.label || ""));
+  return elements.filter((e) => {
+    if (isBrowserChromeLabel(e.label || "") || isLowValueInteractiveLabel(e.label || "")) return false;
+    if ((e.locators || []).some((l) => isChromeLocator(l))) return false;
+    return true;
+  });
 }
 
 function isFilterChipLabel(label: string): boolean {
@@ -481,9 +485,12 @@ export function buildBaselineCoverageScenarios(
 
 /** Intra-page multi-step journey when the site has no cross-page nav edges yet. */
 export function buildIntraPageFlowScenario(pageTitle: string, elements: ElementRecord[]): ScenarioRecord | null {
-  const interactive = productElements(elements).filter((e) => ["link", "button", "input", "dropdown"].includes(e.type) && e.label);
-  if (interactive.length < 2) return null;
-  const steps = interactive.slice(0, 4);
+  const interactive = productElements(elements).filter(
+    (e) => ["link", "button", "input", "dropdown", "textarea"].includes(e.type) && e.label && !isLowValueInteractiveLabel(e.label)
+  );
+  const formish = interactive.filter((e) => ["input", "textarea", "dropdown", "button"].includes(e.type));
+  const steps = (formish.length >= 2 ? formish : interactive).slice(0, 4);
+  if (steps.length < 2) return null;
   const narrated: string[] = [`Given the user starts on "${pageTitle}"`];
   steps.forEach((el, i) => {
     const connector = i === 0 ? "When" : "And";
@@ -614,6 +621,41 @@ export function buildNegativeAndEdgeBaselines(pageTitle: string, elements: Eleme
   return scenarios;
 }
 
+function selectHighValueScenarios(
+  scenarios: ScenarioRecord[],
+  mode: import("./types.js").CoverageMode
+): ScenarioRecord[] {
+  const cap = mode === "minimal" ? 8 : mode === "standard" ? 12 : 18;
+  const unique = Array.from(
+    new Map(
+      scenarios.map((scenario) => [
+        `${scenario.type}|${scenario.tier}|${scenario.title.toLowerCase().replace(/\s+/g, " ")}`,
+        scenario,
+      ])
+    ).values()
+  );
+  return unique
+    .map((scenario, index) => {
+      const text = `${scenario.title} ${scenario.steps.join(" ")}`.toLowerCase();
+      let risk = 0;
+      if (scenario.type === "flow" || /end-to-end|journey|crud|create.*update.*delete/.test(text)) risk += 100;
+      if (scenario.tier === "smoke") risk += 90;
+      if (/submits successfully|save|login|sign in|checkout|payment/.test(text)) risk += 80;
+      if (/required|invalid email|validation|empty/.test(text)) risk += 70;
+      if (/authorization|permission|role|forbidden/.test(text)) risk += 68;
+      if (/double submit|duplicate|rapid/.test(text)) risk += 65;
+      if (/script-like|injected|sql-like|xss/.test(text)) risk += 60;
+      if (/refresh|back button|persistence|state/.test(text)) risk += 55;
+      if (scenario.tier === "regression") risk += 40;
+      if (/clicking "[^"]+"/.test(text)) risk -= 35;
+      if (/component|renders key content/.test(text)) risk -= 15;
+      return { scenario, risk, index };
+    })
+    .sort((a, b) => b.risk - a.risk || a.index - b.index)
+    .slice(0, cap)
+    .map(({ scenario }) => scenario);
+}
+
 export function buildScenariosForPage(
   pageTitle: string,
   elements: ElementRecord[],
@@ -630,7 +672,7 @@ export function buildScenariosForPage(
     const e2e = buildIntraPageFlowScenario(pageTitle, elements);
     if (e2e) minimal.push(e2e);
     minimal.push(...buildNegativeAndEdgeBaselines(pageTitle, elements, pageUrl).slice(0, 2));
-    return minimal;
+    return selectHighValueScenarios(minimal, mode);
   }
 
   // Smoke page-load + regression health are required for every discovered page --
@@ -676,7 +718,7 @@ export function buildScenariosForPage(
   const e2e = buildIntraPageFlowScenario(pageTitle, elements);
   if (e2e) scenarios.push(e2e);
 
-  return scenarios;
+  return selectHighValueScenarios(scenarios, mode);
 }
 
 /**

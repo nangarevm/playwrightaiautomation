@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { api, BugFindingRow } from "../api.js";
+import { api, BugFindingRow, QaDashboard } from "../api.js";
 import { Pill } from "../components/Pill.js";
 
 const SEVERITY_TONE: Record<BugFindingRow["severity"], "neutral" | "good" | "bad" | "warn"> = {
@@ -15,6 +15,31 @@ const SOURCE_LABEL: Record<BugFindingRow["source"], string> = {
   regression: "Regression",
 };
 
+const EMPTY_DASHBOARD: QaDashboard = {
+  totalScenariosExecuted: 0,
+  totalWorkflowsExecuted: 0,
+  totalApiCallsAnalyzed: 0,
+  totalUiStatesAnalyzed: 0,
+  totalRealBugs: 0,
+  criticalBugs: 0,
+  highBugs: 0,
+  mediumBugs: 0,
+  lowBugs: 0,
+  automationFailures: 0,
+  environmentFailures: 0,
+  duplicateIssues: 0,
+  falsePositivesRejected: 0,
+  unknownRequiresInvestigation: 0,
+};
+
+function parseJson<T>(value: string | null | undefined, fallback: T): T {
+  try {
+    return value ? (JSON.parse(value) as T) : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
 // Bug Detection Engine UI: surfaces findings from the exploratory UI scan
 // (runs automatically after every execution run whose test case is tagged to
 // a screen with a known URL) and the on-demand API fuzz pass. Distinct from
@@ -26,18 +51,26 @@ export default function Bugs() {
   const [error, setError] = useState<string | null>(null);
   const [statusFilter, setStatusFilter] = useState<string>("");
   const [severityFilter, setSeverityFilter] = useState<string>("");
+  const [validationFilter, setValidationFilter] = useState<string>("confirmed");
+  const [dashboard, setDashboard] = useState<QaDashboard>(EMPTY_DASHBOARD);
   const [apiBaseUrl, setApiBaseUrl] = useState("");
   const [endpointsText, setEndpointsText] = useState("");
+  const [headersText, setHeadersText] = useState("");
   const [fuzzing, setFuzzing] = useState(false);
 
   async function refresh() {
     setLoading(true);
     try {
-      const rows = await api.listBugFindings({
-        status: statusFilter || undefined,
-        severity: severityFilter || undefined,
-      });
+      const [rows, summary] = await Promise.all([
+        api.listBugFindings({
+          status: statusFilter || undefined,
+          severity: severityFilter || undefined,
+          validationStatus: validationFilter || undefined,
+        }),
+        api.getQaDashboard(),
+      ]);
       setFindings(rows);
+      setDashboard(summary);
     } catch (e: any) {
       setError(e.message);
     } finally {
@@ -48,7 +81,7 @@ export default function Bugs() {
   useEffect(() => {
     refresh();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [statusFilter, severityFilter]);
+  }, [statusFilter, severityFilter, validationFilter]);
 
   async function setStatus(id: string, status: BugFindingRow["status"]) {
     try {
@@ -73,7 +106,11 @@ export default function Bugs() {
     if (!apiBaseUrl || endpoints.length === 0) return;
     setFuzzing(true);
     try {
-      await api.fuzzApiForBugs(apiBaseUrl, endpoints);
+      let headers: Record<string, string> = {};
+      if (headersText.trim()) {
+        headers = JSON.parse(headersText);
+      }
+      await api.fuzzApiForBugs(apiBaseUrl, endpoints, headers);
       await refresh();
     } catch (e: any) {
       setError(e.message);
@@ -87,13 +124,36 @@ export default function Bugs() {
       <div>
         <h2 className="font-display text-xl tracking-tight">Bug Findings</h2>
         <p className="text-sm text-ink/60">
-          Proactively discovered defects — an exploratory UI scan runs automatically after every
-          execution run (broken images, JS/console errors, server errors, stuck loading states),
-          and an API fuzz pass checks endpoints never crash with a 5xx on boundary/malformed input.
+          Evidence-gated product defects from UI, responsive, workflow and API analysis. Locator,
+          runner and environment failures are tracked separately and never counted as real bugs.
         </p>
       </div>
 
       {error && <div className="rounded-md border border-alert bg-alert/5 p-3 text-sm text-alert">{error}</div>}
+
+      <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-4 xl:grid-cols-5">
+        {[
+          ["Scenarios executed", dashboard.totalScenariosExecuted],
+          ["Workflows executed", dashboard.totalWorkflowsExecuted],
+          ["API calls analyzed", dashboard.totalApiCallsAnalyzed],
+          ["UI states analyzed", dashboard.totalUiStatesAnalyzed],
+          ["Real bugs", dashboard.totalRealBugs],
+          ["Critical / P0", dashboard.criticalBugs],
+          ["High / P1", dashboard.highBugs],
+          ["Medium / P2", dashboard.mediumBugs],
+          ["Low / P3", dashboard.lowBugs],
+          ["Automation failures", dashboard.automationFailures],
+          ["Environment failures", dashboard.environmentFailures],
+          ["Duplicates merged", dashboard.duplicateIssues],
+          ["False positives rejected", dashboard.falsePositivesRejected],
+          ["Needs investigation", dashboard.unknownRequiresInvestigation],
+        ].map(([label, value]) => (
+          <div key={String(label)} className="rounded-lg border border-line bg-white/60 px-3 py-2 shadow-panel">
+            <p className="text-[11px] uppercase tracking-wide text-ink/50">{label}</p>
+            <p className="text-xl font-semibold text-ink">{value}</p>
+          </div>
+        ))}
+      </div>
 
       <div className="rounded-lg border border-line bg-white/60 shadow-panel p-4 space-y-3">
         <p className="text-sm font-medium">Run an API fuzz pass</p>
@@ -106,10 +166,17 @@ export default function Bugs() {
           />
           <textarea
             className="rounded-md border border-line px-2 py-1.5 text-sm font-mono"
-            placeholder={"One endpoint per line, e.g.\n/api/orders/:id\n/api/users/:id"}
+            placeholder={"One endpoint per line, e.g.\nGET /api/orders/:id\nDELETE /api/users/:id"}
             rows={3}
             value={endpointsText}
             onChange={(e) => setEndpointsText(e.target.value)}
+          />
+          <textarea
+            className="rounded-md border border-line px-2 py-1.5 text-sm font-mono md:col-span-2"
+            placeholder={'Optional authenticated headers JSON, e.g. {"Authorization":"Bearer …"}. Protected endpoints are also retried without auth.'}
+            rows={2}
+            value={headersText}
+            onChange={(e) => setHeadersText(e.target.value)}
           />
         </div>
         <button
@@ -119,6 +186,10 @@ export default function Bugs() {
         >
           {fuzzing ? "Fuzzing…" : "Run fuzz pass"}
         </button>
+        <p className="text-[11px] text-ink/50">
+          GET probes run safely by default. POST/PUT/PATCH/DELETE fuzzing is disabled unless the server is explicitly
+          started with <code>ALLOW_DESTRUCTIVE_QA=1</code> in an isolated test environment.
+        </p>
       </div>
 
       <div className="flex items-center gap-3 text-sm">
@@ -135,6 +206,12 @@ export default function Bugs() {
           <option value="high">High</option>
           <option value="medium">Medium</option>
           <option value="low">Low</option>
+        </select>
+        <select className="rounded-md border border-line px-2 py-1 text-xs" value={validationFilter} onChange={(e) => setValidationFilter(e.target.value)}>
+          <option value="confirmed">Confirmed real bugs</option>
+          <option value="candidate">Needs investigation</option>
+          <option value="rejected">Rejected false positives</option>
+          <option value="">All validation states</option>
         </select>
         <span className="text-ink/50">{findings.length} finding(s)</span>
       </div>
@@ -155,19 +232,33 @@ export default function Bugs() {
                   <p className="text-xs text-ink/50">{SOURCE_LABEL[f.source]} · {new Date(f.created_at).toLocaleString()}</p>
                 </div>
                 <div className="flex items-center gap-1.5 shrink-0">
+                  <Pill tone="neutral">{f.root_cause}</Pill>
+                  <Pill tone={f.priority === "P0" || f.priority === "P1" ? "bad" : f.priority === "P2" ? "warn" : "neutral"}>{f.priority}</Pill>
                   <Pill tone={SEVERITY_TONE[f.severity]}>{f.severity}</Pill>
                   <Pill tone={f.status === "open" ? "bad" : f.status === "resolved" ? "good" : "neutral"}>{f.status}</Pill>
                 </div>
               </div>
               <p className="text-xs text-ink/70 whitespace-pre-wrap font-mono bg-ink/5 rounded p-2">{f.detail}</p>
 
+              <div className="grid gap-2 md:grid-cols-2 text-xs">
+                <div className="rounded border border-line/70 p-2">
+                  <p className="font-medium text-ink/70">Expected result</p>
+                  <p className="text-ink/60">{f.expected_result || "Not captured"}</p>
+                </div>
+                <div className="rounded border border-line/70 p-2">
+                  <p className="font-medium text-ink/70">Actual result</p>
+                  <p className="text-ink/60">{f.actual_result || f.detail}</p>
+                </div>
+              </div>
+              <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-ink/55">
+                <span>Validation: <strong>{f.validation_status}</strong></span>
+                <span>Reproduced: <strong>{f.reproduction_successes}/{f.reproduction_attempts}</strong></span>
+                <span>Occurrences: <strong>{f.occurrence_count}</strong></span>
+                <span>Environment: <strong>{Object.values(parseJson<Record<string, string>>(f.environment_json, {})).join(" · ") || "Not captured"}</strong></span>
+              </div>
+
               {(() => {
-                let steps: string[] = [];
-                try {
-                  steps = f.steps_to_reproduce ? JSON.parse(f.steps_to_reproduce) : [];
-                } catch {
-                  steps = [];
-                }
+                const steps = parseJson<string[]>(f.steps_to_reproduce, []);
                 return steps.length > 0 ? (
                   <div className="text-xs">
                     <p className="font-medium text-ink/70 mb-1">Steps to reproduce</p>

@@ -467,6 +467,25 @@ CREATE TABLE IF NOT EXISTS bug_findings (
   FOREIGN KEY (screen_id) REFERENCES screens(id),
   FOREIGN KEY (run_id) REFERENCES execution_runs(id)
 );
+
+-- Evidence-first QA scan telemetry. Unlike execution_runs (one generated
+-- script), this records exploratory UI/API work and the false-positive gate.
+CREATE TABLE IF NOT EXISTS qa_scan_runs (
+  id TEXT PRIMARY KEY,
+  site_id TEXT,
+  status TEXT NOT NULL DEFAULT 'running',
+  scenarios_executed INTEGER NOT NULL DEFAULT 0,
+  workflows_executed INTEGER NOT NULL DEFAULT 0,
+  api_calls_analyzed INTEGER NOT NULL DEFAULT 0,
+  ui_states_analyzed INTEGER NOT NULL DEFAULT 0,
+  automation_failures INTEGER NOT NULL DEFAULT 0,
+  environment_failures INTEGER NOT NULL DEFAULT 0,
+  duplicate_issues INTEGER NOT NULL DEFAULT 0,
+  false_positives_rejected INTEGER NOT NULL DEFAULT 0,
+  started_at TEXT NOT NULL,
+  completed_at TEXT,
+  FOREIGN KEY (site_id) REFERENCES crawl_sites(id)
+);
 `);
 
 function ensureColumn(tableName: string, columnName: string, columnDefinition: string) {
@@ -479,6 +498,28 @@ function ensureColumn(tableName: string, columnName: string, columnDefinition: s
 ensureColumn("bug_findings", "steps_to_reproduce", "TEXT");
 ensureColumn("bug_findings", "screenshot_url", "TEXT");
 ensureColumn("bug_findings", "video_url", "TEXT");
+ensureColumn("bug_findings", "root_cause", "TEXT NOT NULL DEFAULT 'UNKNOWN_REQUIRES_INVESTIGATION'");
+ensureColumn("bug_findings", "priority", "TEXT NOT NULL DEFAULT 'P2'");
+ensureColumn("bug_findings", "environment_json", "TEXT NOT NULL DEFAULT '{}'");
+ensureColumn("bug_findings", "preconditions_json", "TEXT NOT NULL DEFAULT '[]'");
+ensureColumn("bug_findings", "test_data_json", "TEXT NOT NULL DEFAULT '{}'");
+ensureColumn("bug_findings", "expected_result", "TEXT");
+ensureColumn("bug_findings", "actual_result", "TEXT");
+ensureColumn("bug_findings", "reproduction_attempts", "INTEGER NOT NULL DEFAULT 1");
+ensureColumn("bug_findings", "reproduction_successes", "INTEGER NOT NULL DEFAULT 1");
+ensureColumn("bug_findings", "validation_status", "TEXT NOT NULL DEFAULT 'candidate'");
+ensureColumn("bug_findings", "fingerprint", "TEXT");
+ensureColumn("bug_findings", "occurrence_count", "INTEGER NOT NULL DEFAULT 1");
+ensureColumn("bug_findings", "affected_scenarios_json", "TEXT NOT NULL DEFAULT '[]'");
+ensureColumn("bug_findings", "site_id", "TEXT");
+// Findings created before the evidence gate have no fingerprint/reproduction
+// proof. Keep them visible for investigation but never count them as real bugs.
+db.prepare(`
+  UPDATE bug_findings
+  SET validation_status = 'candidate',
+      root_cause = 'UNKNOWN_REQUIRES_INVESTIGATION'
+  WHERE fingerprint IS NULL
+`).run();
 
 ensureColumn("test_cases", "priority", "TEXT NOT NULL DEFAULT 'Medium'");
 ensureColumn("test_cases", "traceability_context", "TEXT");

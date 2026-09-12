@@ -3,7 +3,7 @@
 // and generates a comprehensive bug report for the user
 
 import { db } from "../db.js";
-import { listBugFindings, BugFindingRow } from "./bugDetectionService.js";
+import { listBugFindingsForSite, BugFindingRow } from "./bugDetectionService.js";
 import type { BugSeverity } from "./bugDetectionService.js";
 
 export interface AggregatedBug {
@@ -36,19 +36,7 @@ export interface UltrafastBugReport {
 
 // Collect bugs discovered during crawl for a site
 export function collectCrawlBugsForSite(siteId: string): BugFindingRow[] {
-  const page = db.prepare("SELECT id FROM crawl_pages WHERE site_id = ?").all(siteId) as Array<{ id: string }>;
-  const pageIds = page.map((p) => p.id);
-
-  const allBugs: BugFindingRow[] = [];
-  for (const pageId of pageIds) {
-    const bugs = db
-      .prepare(
-        "SELECT * FROM bug_findings WHERE screen_id IN (SELECT id FROM screens WHERE url_or_path IN (SELECT url FROM crawl_pages WHERE id = ?))"
-      )
-      .all(pageId) as BugFindingRow[];
-    allBugs.push(...bugs);
-  }
-  return allBugs;
+  return listBugFindingsForSite(siteId, { validationStatus: "confirmed" });
 }
 
 export interface ExecutionBug {
@@ -173,6 +161,7 @@ export function aggregateUltrafastBugs(crawlBugs: BugFindingRow[], executionBugs
 
   // Add crawl bugs
   for (const bug of crawlBugs) {
+    if (bug.validation_status !== "confirmed" || !bug.root_cause.startsWith("REAL_")) continue;
     bugs.push({
       id: bug.id,
       title: bug.title,
@@ -190,6 +179,10 @@ export function aggregateUltrafastBugs(crawlBugs: BugFindingRow[], executionBugs
   // collectTestExecutionBugs from the actual test case's steps and expected
   // result, not a generic placeholder.
   for (const bug of executionBugs) {
+    // A failed generated test is evidence to investigate, not a confirmed
+    // product defect. It enters this report only after an independent
+    // verification process explicitly marks it confirmed.
+    if (bug.validationStatus !== "confirmed") continue;
     bugs.push({
       id: bug.id,
       title: bug.title,

@@ -603,12 +603,24 @@ export const api = {
       body: JSON.stringify({ preset }),
     }),
 
-  listBugFindings: (params?: { status?: string; severity?: string; screenId?: string }): Promise<BugFindingRow[]> =>
-    req(`/bugs${params ? `?${new URLSearchParams(Object.fromEntries(Object.entries(params).filter(([, v]) => v))).toString()}` : ""}`),
+  listBugFindings: (params?: {
+    status?: string;
+    severity?: string;
+    screenId?: string;
+    siteId?: string;
+    validationStatus?: string;
+  }): Promise<BugFindingRow[]> =>
+    req(`/bugs${params ? `?${new URLSearchParams(Object.fromEntries(Object.entries(params).filter(([, v]) => v != null && v !== ""))).toString()}` : ""}`),
+  getQaDashboard: (siteId?: string): Promise<QaDashboard> =>
+    req(`/bugs/dashboard/summary${siteId ? `?siteId=${encodeURIComponent(siteId)}` : ""}`),
   scanScreenForBugs: (screenId: string): Promise<{ findings: BugFindingRow[]; count: number }> =>
     req("/bugs/scan", { method: "POST", body: JSON.stringify({ screenId }) }),
-  fuzzApiForBugs: (apiBaseUrl: string, endpoints: string[]): Promise<{ findings: BugFindingRow[]; count: number }> =>
-    req("/bugs/scan", { method: "POST", body: JSON.stringify({ apiBaseUrl, endpoints }) }),
+  fuzzApiForBugs: (
+    apiBaseUrl: string,
+    endpoints: string[],
+    headers?: Record<string, string>
+  ): Promise<{ findings: BugFindingRow[]; count: number }> =>
+    req("/bugs/scan", { method: "POST", body: JSON.stringify({ apiBaseUrl, endpoints, headers }) }),
   updateBugFindingStatus: (id: string, status: BugFindingRow["status"]): Promise<BugFindingRow> =>
     req(`/bugs/${id}`, { method: "PATCH", body: JSON.stringify({ status }) }),
   fileBugFinding: (id: string): Promise<BugFindingRow> => req(`/bugs/${id}/file`, { method: "POST" }),
@@ -797,8 +809,49 @@ export interface BugFindingRow {
   status: "open" | "acknowledged" | "resolved" | "ignored";
   filed_provider: string | null;
   filed_external_id: string | null;
+  site_id: string | null;
+  root_cause:
+    | "REAL_PRODUCT_BUG"
+    | "REAL_API_BUG"
+    | "REAL_UI_BUG"
+    | "REAL_BUSINESS_LOGIC_BUG"
+    | "REAL_SECURITY_BUG"
+    | "REAL_DATA_BUG"
+    | "REAL_PERFORMANCE_BUG"
+    | "AUTOMATION_BUG"
+    | "ENVIRONMENT_BUG"
+    | "UNKNOWN_REQUIRES_INVESTIGATION";
+  priority: "P0" | "P1" | "P2" | "P3";
+  environment_json: string;
+  preconditions_json: string;
+  test_data_json: string;
+  expected_result: string | null;
+  actual_result: string | null;
+  reproduction_attempts: number;
+  reproduction_successes: number;
+  validation_status: "candidate" | "confirmed" | "rejected";
+  fingerprint: string | null;
+  occurrence_count: number;
+  affected_scenarios_json: string;
   created_at: string;
   updated_at: string;
+}
+
+export interface QaDashboard {
+  totalScenariosExecuted: number;
+  totalWorkflowsExecuted: number;
+  totalApiCallsAnalyzed: number;
+  totalUiStatesAnalyzed: number;
+  totalRealBugs: number;
+  criticalBugs: number;
+  highBugs: number;
+  mediumBugs: number;
+  lowBugs: number;
+  automationFailures: number;
+  environmentFailures: number;
+  duplicateIssues: number;
+  falsePositivesRejected: number;
+  unknownRequiresInvestigation: number;
 }
 
 export interface EnvironmentRow {

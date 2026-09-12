@@ -43,7 +43,7 @@ reportingRouter.get("/tag-coverage", (req, res) => {
 });
 
 // Ultrafast mode bug report: comprehensive bug analysis from crawl + execution
-reportingRouter.get("/ultrafast-bug-report", (req, res) => {
+reportingRouter.get("/ultrafast-bug-report", async (req, res) => {
   try {
     const { siteId, format } = req.query as { siteId?: string; format?: "json" | "html" | "pdf" };
     
@@ -71,16 +71,34 @@ reportingRouter.get("/ultrafast-bug-report", (req, res) => {
     const executionBugs = collectTestExecutionBugs(recentRuns.map((r) => r.id));
 
     const bugReport = generateUltrafastBugReport(siteId, crawlBugs, executionBugs);
-    const formattedReport = formatBugReport(bugReport, format || "json");
-
     if (format === "html") {
       res.setHeader("Content-Type", "text/html");
-      res.send(formattedReport);
+      res.send(formatBugReport(bugReport, "html"));
     } else if (format === "pdf") {
+      const pdf = await buildBugReportPdf(
+        bugReport.allBugs.map((bug) => ({
+          title: bug.title,
+          failureClass: "possible_bug",
+          validationStatus: "confirmed",
+          rootCause:
+            bug.category === "performance"
+              ? "REAL_PERFORMANCE_BUG"
+              : ["ui", "accessibility", "navigation", "content"].includes(bug.category)
+                ? "REAL_UI_BUG"
+                : "REAL_PRODUCT_BUG",
+          severity: bug.severity,
+          priority: bug.severity === "critical" ? "P0" : bug.severity === "high" ? "P1" : bug.severity === "medium" ? "P2" : "P3",
+          failureLabel: `${bug.category} defect`,
+          errorMessage: JSON.stringify(bug.evidence),
+          reportUrl: bug.screenshot,
+          reproducibility: "confirmed",
+          evidence: bug.evidence,
+        }))
+      );
       res.setHeader("Content-Type", "application/pdf");
-      res.send(formattedReport); // Would need pdfkit integration
+      res.send(pdf);
     } else {
-      res.json(JSON.parse(formattedReport));
+      res.json(bugReport);
     }
   } catch (err: any) {
     res.status(500).json({ error: err.message });

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { api, CrawlSite, CrawlSiteDetail } from "../api.js";
+import { api, CrawlSite, CrawlSiteDetail, BugFindingRow } from "../api.js";
 import { Pill } from "../components/Pill.js";
 import { AllureReportPanel } from "../components/AllureReportPanel.js";
 import { BugReportPanel } from "../components/BugReportPanel.js";
@@ -111,6 +111,7 @@ export default function Crawler() {
     failureLabel: string | null;
   };
   const [crawlFailures, setCrawlFailures] = useState<CrawlFailure[]>([]);
+  const [crawlFindings, setCrawlFindings] = useState<BugFindingRow[]>([]);
 
   // Bumped once the "Generate + Run" batch's runs all finish, to trigger the
   // Allure panel's own generate step automatically -- so the user never has to
@@ -234,6 +235,11 @@ export default function Crawler() {
                   setImpactMsg(`Impact suite ready: ~${p.plan.estimatedTests} test(s) on changed/new pages`);
                 }
               }).catch(() => undefined);
+              const loadFindings = () =>
+                api.listBugFindings({ siteId: res.siteId, status: "open", validationStatus: "confirmed" }).then(setCrawlFindings).catch(() => undefined);
+              loadFindings();
+              window.setTimeout(loadFindings, 4000);
+              window.setTimeout(loadFindings, 12000);
             }
           }
         } catch (e: any) {
@@ -340,6 +346,7 @@ export default function Crawler() {
     setSite(s);
     const d = await api.crawlerGetSiteDetail(item.siteId);
     setDetail(d);
+    api.listBugFindings({ siteId: item.siteId, status: "open", validationStatus: "confirmed" }).then(setCrawlFindings).catch(() => undefined);
   }
 
   function toggle(id: string) {
@@ -386,6 +393,12 @@ export default function Crawler() {
     if (!site) return;
     const d = await api.crawlerGetSiteDetail(site.id);
     setDetail(d);
+    try {
+      const findings = await api.listBugFindings({ siteId: site.id, status: "open", validationStatus: "confirmed" });
+      setCrawlFindings(findings);
+    } catch {
+      /* scan may still be running */
+    }
   }
 
   async function deleteOne(id: string) {
@@ -1148,7 +1161,9 @@ export default function Crawler() {
       {(genResults || batchStartedAt) && (
         <AllureReportPanel title="Test report" sinceMs={batchStartedAt ?? undefined} autoGenerateKey={allureAutoGenKey} />
       )}
-      {crawlFailures.length > 0 && <BugReportPanel failures={crawlFailures} />}
+      {(crawlFailures.length > 0 || crawlFindings.length > 0) && (
+        <BugReportPanel failures={crawlFailures} crawlFindings={crawlFindings} />
+      )}
     </div>
   );
 }

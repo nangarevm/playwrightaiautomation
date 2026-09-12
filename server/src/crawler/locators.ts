@@ -16,6 +16,8 @@ import {
   scoreStableLocator,
   stripTransientLoadingLabel,
   isBrowserChromeLabel,
+  isBrowserChromeElement,
+  isMapChromeLabel,
 } from "./locatorQuality.js";
 
 export interface RankedLocators {
@@ -74,6 +76,7 @@ export async function extractElementLocators(page: Page, handle: Locator): Promi
                 : null);
     const id = el.id || null;
     const name = el.getAttribute("name") || null;
+    const className = typeof el.className === "string" ? el.className : "";
     // Prefer direct/own text over deep textContent so nested "Sending…" spans
     // on submit buttons are not concatenated into the accessible name.
     const ownText = Array.from(el.childNodes)
@@ -149,6 +152,7 @@ export async function extractElementLocators(page: Page, handle: Locator): Promi
       inputType: tag === "input" ? el.getAttribute("type") || "text" : null,
       closestFormLabel,
       closestSectionLabel,
+      className,
     };
   });
 
@@ -158,7 +162,18 @@ export async function extractElementLocators(page: Page, handle: Locator): Promi
   const cleanAlt = info.alt ? stripTransientLoadingLabel(info.alt) : "";
   const cleanTitle = info.title ? stripTransientLoadingLabel(info.title) : "";
 
-  if (isBrowserChromeLabel(cleanName) || isBrowserChromeLabel(cleanLabel) || isBrowserChromeLabel(cleanTitle)) {
+  if (
+    isBrowserChromeLabel(cleanName) ||
+    isBrowserChromeLabel(cleanLabel) ||
+    isBrowserChromeLabel(cleanTitle) ||
+    isMapChromeLabel(cleanName) ||
+    isBrowserChromeElement({
+      id: info.id,
+      name: info.name,
+      className: info.className,
+      label: cleanName || cleanLabel || cleanPlaceholder,
+    })
+  ) {
     return null;
   }
 

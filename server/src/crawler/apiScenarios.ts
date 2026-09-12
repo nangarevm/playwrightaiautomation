@@ -57,6 +57,8 @@ export function buildApiScenariosForSite(siteHost: string, pages: PageApiInput[]
       if (seen.has(key)) continue;
       seen.add(key);
 
+      const observedSchema = call.responseSchema || call.schema || {};
+      const observedStatus = call.status || 200;
       const scenario: ScenarioRecord = {
         id: nanoid(10),
         title: `Verify ${key} returns a successful response`,
@@ -66,7 +68,14 @@ export function buildApiScenariosForSite(siteHost: string, pages: PageApiInput[]
         steps: [
           `Given the API endpoint "${key}" was observed during the crawl (triggered by: ${call.trigger})`,
           `When a ${method} request is sent to "${pathname}"`,
-          `Then the response is successful (2xx) and matches the shape observed during the crawl`,
+          ...(call.requestExample && Object.keys(call.requestExample).length > 0
+            ? [`And the request uses the redacted observed example: ${JSON.stringify(call.requestExample)}`]
+            : []),
+          `Then the response status matches the observed HTTP ${observedStatus}`,
+          `And the response matches the observed response schema: ${JSON.stringify(observedSchema)}`,
+          ...(call.responseTimeMs
+            ? [`And the response remains within a reasonable threshold from the observed ${call.responseTimeMs}ms`]
+            : []),
         ],
         locators: [],
       };

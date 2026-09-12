@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { api } from "../api.js";
+import { api, BugFindingRow } from "../api.js";
 import { Pill } from "./Pill.js";
 
 export interface CrawlBugEntry {
@@ -10,21 +10,49 @@ export interface CrawlBugEntry {
   runId: string;
   failureClass: "automation_issue" | "environment_issue" | "possible_bug" | "unknown" | null;
   failureLabel: string | null;
+  rootCause?: string;
+  priority?: string;
+  severity?: string;
+  environment?: Record<string, unknown>;
+  expectedResult?: string | null;
+  actualResult?: string | null;
+  reproducibility?: string;
+  evidence?: Record<string, unknown>;
+  validationStatus?: "candidate" | "confirmed" | "rejected";
+  preconditions?: string[];
+  testData?: Record<string, unknown>;
 }
 
 const CLASS_META: Record<string, { badge: string; tone: "bad" | "warn" | "neutral"; blurb: string }> = {
-  possible_bug: { badge: "Product bug", tone: "bad", blurb: "The page/API returned something different from what was expected -- worth investigating as a real defect." },
+  possible_bug: { badge: "Product evidence", tone: "bad", blurb: "The page/API returned independently verifiable product evidence." },
   automation_issue: { badge: "Automation script issue", tone: "warn", blurb: "The generated test's own locator/timing didn't match this page -- not necessarily a problem with your product." },
   environment_issue: { badge: "Environment issue", tone: "warn", blurb: "The target wasn't reachable (network/DNS/connection) -- check the URL and that the target is up, not a product defect." },
   unknown: { badge: "Uncategorized", tone: "neutral", blurb: "Couldn't confidently categorize this one -- read the error detail below." },
 };
 
 function downloadBugReportCsv(failures: CrawlBugEntry[]) {
-  const header = ["Title", "Category", "Cause", "Error detail", "Failure report URL"];
+  const header = [
+    "Title", "Validation", "Root cause", "Severity", "Priority", "Category", "Cause",
+    "Expected", "Actual", "Reproducibility", "Environment", "Evidence", "Failure report URL",
+  ];
   const escapeCsv = (v: string) => `"${v.replace(/"/g, '""').replace(/\r?\n/g, " ")}"`;
   const rows = failures.map((f) => {
     const meta = CLASS_META[f.failureClass ?? "unknown"] ?? CLASS_META.unknown;
-    return [f.title, meta.badge, f.failureLabel || meta.blurb, f.errorMessage || "", f.reportUrl || ""].map(escapeCsv).join(",");
+    return [
+      f.title,
+      f.validationStatus || "candidate",
+      f.rootCause || "UNKNOWN_REQUIRES_INVESTIGATION",
+      f.severity || "",
+      f.priority || "",
+      meta.badge,
+      f.failureLabel || meta.blurb,
+      f.expectedResult || "",
+      f.actualResult || f.errorMessage || "",
+      f.reproducibility || "",
+      JSON.stringify(f.environment || {}),
+      JSON.stringify(f.evidence || {}),
+      f.reportUrl || "",
+    ].map(escapeCsv).join(",");
   });
   const csv = [header.map(escapeCsv).join(","), ...rows].join("\r\n");
   const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
@@ -43,25 +71,69 @@ function downloadBugReportCsv(failures: CrawlBugEntry[]) {
 // environment issues" (collapsed by default) so a customer isn't left
 // guessing whether a red pill means their product is broken or the AI-written
 // script itself needs fixing.
-export function BugReportPanel({ failures }: { failures: CrawlBugEntry[] }) {
+export function BugReportPanel({
+  failures,
+  crawlFindings = [],
+}: {
+  failures: CrawlBugEntry[];
+  crawlFindings?: BugFindingRow[];
+}) {
   const [showScriptIssues, setShowScriptIssues] = useState(false);
   const [pdfBusy, setPdfBusy] = useState(false);
   const [pdfError, setPdfError] = useState<string | null>(null);
-  if (failures.length === 0) return null;
 
-  const genuineBugs = failures.filter((f) => f.failureClass === "possible_bug" || f.failureClass === "unknown");
-  const scriptIssues = failures.filter((f) => f.failureClass === "automation_issue" || f.failureClass === "environment_issue");
+  const fromScan: CrawlBugEntry[] = crawlFindings.map((b) => ({
+    testCaseId: `scan-${b.id}`,
+    title: b.title,
+    errorMessage: b.detail,
+    reportUrl: b.screenshot_url,
+    runId: b.id,
+    failureClass: "possible_bug",
+    failureLabel: `${b.source === "api_fuzz" ? "API" : "UI"} scan · ${b.severity}: ${b.detail.slice(0, 180)}`,
+    rootCause: b.root_cause,
+    priority: b.priority,
+    severity: b.severity,
+    environment: (() => { try { return JSON.parse(b.environment_json || "{}"); } catch { return {}; } })(),
+    expectedResult: b.expected_result,
+    actualResult: b.actual_result,
+    reproducibility: `${b.reproduction_successes}/${b.reproduction_attempts} attempts`,
+    evidence: (() => { try { return JSON.parse(b.evidence || "{}"); } catch { return {}; } })(),
+    validationStatus: b.validation_status,
+    preconditions: (() => { try { return JSON.parse(b.preconditions_json || "[]"); } catch { return []; } })(),
+    testData: (() => { try { return JSON.parse(b.test_data_json || "{}"); } catch { return {}; } })(),
+  }));
+  const allEntries = [...fromScan, ...failures];
+  if (allEntries.length === 0) return null;
+
+  const genuineBugs = allEntries.filter((f) => f.failureClass === "possible_bug" && f.validationStatus === "confirmed");
+  const investigations = allEntries.filter(
+    (f) =>
+      (f.failureClass === "possible_bug" || f.failureClass === "unknown" || !f.failureClass) &&
+      f.validationStatus !== "confirmed"
+  );
+  const scriptIssues = allEntries.filter((f) => f.failureClass === "automation_issue" || f.failureClass === "environment_issue");
 
   async function downloadPdf() {
     setPdfBusy(true);
     setPdfError(null);
     try {
-      const entries = failures.map((f) => ({
+      const entries = allEntries.map((f) => ({
         title: f.title,
         failureClass: f.failureClass,
         failureLabel: f.failureLabel,
         errorMessage: f.errorMessage,
         reportUrl: f.reportUrl,
+        rootCause: f.rootCause,
+        priority: f.priority,
+        severity: f.severity,
+        environment: f.environment,
+        expectedResult: f.expectedResult,
+        actualResult: f.actualResult,
+        reproducibility: f.reproducibility,
+        evidence: f.evidence,
+        validationStatus: f.validationStatus || "candidate",
+        preconditions: f.preconditions,
+        testData: f.testData,
       }));
       await api.downloadBugReportPdf(entries, `bug-report-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-")}.pdf`);
     } catch (e: any) {
@@ -77,28 +149,29 @@ export function BugReportPanel({ failures }: { failures: CrawlBugEntry[] }) {
         <p className="text-xs font-semibold uppercase tracking-wide text-ink/60">Bug report (this crawl's failures)</p>
         <div className="flex items-center gap-1.5">
           {genuineBugs.length > 0 && <Pill tone="bad">{genuineBugs.length} product bug{genuineBugs.length === 1 ? "" : "s"}</Pill>}
+          {investigations.length > 0 && <Pill tone="neutral">{investigations.length} need investigation</Pill>}
           {scriptIssues.length > 0 && <Pill tone="warn">{scriptIssues.length} script/env issue{scriptIssues.length === 1 ? "" : "s"}</Pill>}
         </div>
       </div>
       <p className="text-xs text-ink/60">
-        Failures are split by likely cause: a <strong>product bug</strong> means the page/API behaved unexpectedly and is
-        worth a look; an <strong>automation script issue</strong> means the AI-generated test itself needs fixing (bad
-        locator, target unreachable), not necessarily a defect in your product.
+        Failures are split by likely cause: a <strong>product bug</strong> is a real UI/API defect
+        (HTTP 5xx, JS crash, missing validation, broken image/link, unusable control). An
+        <strong> automation script issue</strong> is hosting chrome or a generated selector problem.
       </p>
       {pdfError && <p className="text-xs text-alert">{pdfError}</p>}
       <div className="flex gap-2 flex-wrap">
         <button
           className="rounded-md border border-ink/20 text-ink/70 px-3 py-1.5 text-xs"
-          onClick={() => downloadBugReportCsv(failures)}
+          onClick={() => downloadBugReportCsv(allEntries)}
         >
-          Download bug report ({failures.length}) as CSV
+          Download bug report ({allEntries.length}) as CSV
         </button>
         <button
           className="rounded-md border border-ink/20 text-ink/70 px-3 py-1.5 text-xs disabled:opacity-40"
           disabled={pdfBusy}
           onClick={downloadPdf}
         >
-          {pdfBusy ? "Generating PDF…" : `Download bug report (${failures.length}) as PDF`}
+          {pdfBusy ? "Generating PDF…" : `Download bug report (${allEntries.length}) as PDF`}
         </button>
       </div>
 
@@ -109,7 +182,16 @@ export function BugReportPanel({ failures }: { failures: CrawlBugEntry[] }) {
           ))}
         </div>
       ) : (
-        <p className="text-xs text-ink/50 italic">No genuine product bugs found in this crawl's failures.</p>
+        <p className="text-xs text-ink/50 italic">No independently reproduced product bugs found.</p>
+      )}
+
+      {investigations.length > 0 && (
+        <div className="space-y-2 border-t border-line/70 pt-3">
+          <p className="text-xs font-medium text-ink/60">Requires application investigation (not yet a product bug)</p>
+          {investigations.map((f) => (
+            <FailureCard key={f.testCaseId} f={f} />
+          ))}
+        </div>
       )}
 
       {scriptIssues.length > 0 && (

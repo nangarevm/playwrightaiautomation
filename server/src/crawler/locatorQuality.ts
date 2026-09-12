@@ -34,12 +34,44 @@ export function hasTransientLoadingLabel(name: string): boolean {
 
 /** Browser / hosting chrome — never treat as product under test. */
 export const BROWSER_CHROME_LABEL_RE =
-  /\b(switch to (dark|light) mode|report (this )?website|report abuse|close report abuse|translate this page|not secure|always show|site settings|cookies on this site|enable javascript|captcha|cloudflare|attention required|just a moment)\b/i;
+  /\b(switch to (dark|light) mode|report (this )?website|report abuse|close report abuse|translate this page|not secure|always show|site settings|cookies on this site|enable javascript|captcha|cloudflare|attention required|just a moment|go to homepage)\b/i;
+
+/** Hosting overlay ids/names/classes (GoDaddy/etc “report this site” form). */
+export const HOST_CHROME_ATTR_RE =
+  /report-email|report-msg|report-abuse|reportthis|report-this|cf-turnstile|challenges\.cloudflare/i;
 
 export function isBrowserChromeLabel(name: string): boolean {
   const v = String(name || "").replace(/\s+/g, " ").trim();
   if (!v) return false;
   return BROWSER_CHROME_LABEL_RE.test(v);
+}
+
+export function isMapChromeLabel(name: string): boolean {
+  return /^[+\-–−×x]$/i.test(String(name || "").trim());
+}
+
+export function isBrowserChromeElement(info: {
+  id?: string | null;
+  name?: string | null;
+  className?: string | null;
+  label?: string | null;
+}): boolean {
+  const blob = [info.id, info.name, info.className, info.label].filter(Boolean).join(" ");
+  if (HOST_CHROME_ATTR_RE.test(blob)) return true;
+  if (isBrowserChromeLabel(info.label || "")) return true;
+  if (isMapChromeLabel(info.label || "")) return true;
+  return false;
+}
+
+export function isChromeLocator(expr: string): boolean {
+  return HOST_CHROME_ATTR_RE.test(expr) || isBrowserChromeLabel(expr);
+}
+
+export function isLowValueInteractiveLabel(name: string): boolean {
+  const v = String(name || "").replace(/\s+/g, " ").trim();
+  if (!v) return true;
+  if (isBrowserChromeLabel(v) || isMapChromeLabel(v)) return true;
+  return /^(home|homepage|go to homepage|menu|toggle|close|zoom in|zoom out)$/i.test(v);
 }
 
 /** Prefer double-quoted field names so contractions like "isn't" are not treated as quotes. */
@@ -56,11 +88,13 @@ export function extractQuotedFieldLabel(text: string): string | null {
 
 export function fieldLocatorFallbacks(label: string): string {
   const idle = stripTransientLoadingLabel(label).replace(/\*+$/g, "").trim();
+  const productField =
+    'form:not([id*="report"]) input:not([id*="report"]):not([name*="report"]):not(.report-email):not(.report-msg):visible, form:not([id*="report"]) textarea:not([id*="report"]):not([name*="report"]):not(.report-msg):visible';
   if (/email|e-mail/i.test(idle)) {
-    return `page.getByLabel(/e-?mail/i).or(page.getByPlaceholder(/e-?mail/i)).or(page.locator('input[type="email"], input[name*="mail" i], input[id*="mail" i]'))`;
+    return `page.locator('form:not([id*="report"]) input[type="email"]:not([id*="report"]):not([name*="report"]):not(.report-email)').or(page.getByLabel(/e-?mail/i)).or(page.getByPlaceholder(/e-?mail/i))`;
   }
   const re = idle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replace(/\\\*$/g, "");
-  return `page.getByLabel(/${re}/i).or(page.getByPlaceholder(/${re}/i)).or(page.locator('input:visible, textarea:visible').first())`;
+  return `page.getByLabel(/${re}/i).or(page.getByPlaceholder(/${re}/i)).or(page.locator('${productField}').first())`;
 }
 
 /**
