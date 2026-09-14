@@ -8,7 +8,15 @@ export interface CrawlBugEntry {
   errorMessage: string | null;
   reportUrl?: string | null;
   runId: string;
-  failureClass: "automation_issue" | "environment_issue" | "possible_bug" | "unknown" | null;
+  failureClass:
+    | "automation_issue"
+    | "environment_issue"
+    | "test_data_issue"
+    | "configuration_issue"
+    | "possible_bug"
+    | "uncertain"
+    | "unknown"
+    | null;
   failureLabel: string | null;
   rootCause?: string;
   priority?: string;
@@ -21,19 +29,37 @@ export interface CrawlBugEntry {
   validationStatus?: "candidate" | "confirmed" | "rejected";
   preconditions?: string[];
   testData?: Record<string, unknown>;
+  requirementReference?: string | null;
+  businessImpact?: string | null;
+  severityJustification?: string | null;
+  priorityJustification?: string | null;
+  suspectedRootCause?: string | null;
+  regressionRisk?: string | null;
+  regressionRiskReason?: string | null;
+  suggestedFix?: string | null;
+  aiConfidence?: number;
+  aiConfidenceReason?: string | null;
+  affectedScenarios?: string[];
+  defectClassification?: string;
+  occurrenceCount?: number;
 }
 
 const CLASS_META: Record<string, { badge: string; tone: "bad" | "warn" | "neutral"; blurb: string }> = {
   possible_bug: { badge: "Product evidence", tone: "bad", blurb: "The page/API returned independently verifiable product evidence." },
   automation_issue: { badge: "Automation script issue", tone: "warn", blurb: "The generated test's own locator/timing didn't match this page -- not necessarily a problem with your product." },
   environment_issue: { badge: "Environment issue", tone: "warn", blurb: "The target wasn't reachable (network/DNS/connection) -- check the URL and that the target is up, not a product defect." },
+  test_data_issue: { badge: "Test data issue", tone: "warn", blurb: "The supplied test data was invalid, unavailable, or expired." },
+  configuration_issue: { badge: "Configuration issue", tone: "warn", blurb: "Required execution configuration or credentials were unavailable." },
+  uncertain: { badge: "Human review required", tone: "neutral", blurb: "Available evidence is insufficient to classify this as a product defect." },
   unknown: { badge: "Uncategorized", tone: "neutral", blurb: "Couldn't confidently categorize this one -- read the error detail below." },
 };
 
 function downloadBugReportCsv(failures: CrawlBugEntry[]) {
   const header = [
     "Title", "Validation", "Root cause", "Severity", "Priority", "Category", "Cause",
-    "Expected", "Actual", "Reproducibility", "Environment", "Evidence", "Failure report URL",
+    "Expected", "Actual", "Reproducibility", "Environment", "Requirement", "Business impact",
+    "Severity justification", "Priority justification", "Suspected root cause", "Regression risk",
+    "Suggested fix", "AI confidence", "AI confidence reason", "Duplicate occurrences", "Affected scenarios", "Evidence", "Failure report URL",
   ];
   const escapeCsv = (v: string) => `"${v.replace(/"/g, '""').replace(/\r?\n/g, " ")}"`;
   const rows = failures.map((f) => {
@@ -50,9 +76,20 @@ function downloadBugReportCsv(failures: CrawlBugEntry[]) {
       f.actualResult || f.errorMessage || "",
       f.reproducibility || "",
       JSON.stringify(f.environment || {}),
+      f.requirementReference || "",
+      f.businessImpact || "",
+      f.severityJustification || "",
+      f.priorityJustification || "",
+      f.suspectedRootCause || "",
+      [f.regressionRisk, f.regressionRiskReason].filter(Boolean).join(" — "),
+      f.suggestedFix || "",
+      f.aiConfidence == null ? "" : `${f.aiConfidence}%`,
+      f.aiConfidenceReason || "",
+      Math.max(0, (f.occurrenceCount || 1) - 1),
+      (f.affectedScenarios || []).join("; "),
       JSON.stringify(f.evidence || {}),
       f.reportUrl || "",
-    ].map(escapeCsv).join(",");
+    ].map((value) => escapeCsv(String(value))).join(",");
   });
   const csv = [header.map(escapeCsv).join(","), ...rows].join("\r\n");
   const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
@@ -101,17 +138,36 @@ export function BugReportPanel({
     validationStatus: b.validation_status,
     preconditions: (() => { try { return JSON.parse(b.preconditions_json || "[]"); } catch { return []; } })(),
     testData: (() => { try { return JSON.parse(b.test_data_json || "{}"); } catch { return {}; } })(),
+    requirementReference: b.requirement_reference,
+    businessImpact: b.business_impact,
+    severityJustification: b.severity_justification,
+    priorityJustification: b.priority_justification,
+    suspectedRootCause: b.suspected_root_cause,
+    regressionRisk: b.regression_risk,
+    regressionRiskReason: b.regression_risk_reason,
+    suggestedFix: b.suggested_fix,
+    aiConfidence: b.ai_confidence,
+    aiConfidenceReason: b.ai_confidence_reason,
+    affectedScenarios: (() => { try { return JSON.parse(b.affected_scenarios_json || "[]"); } catch { return []; } })(),
+    defectClassification: b.defect_classification,
+    occurrenceCount: b.occurrence_count,
   }));
   const allEntries = [...fromScan, ...failures];
   if (allEntries.length === 0) return null;
 
-  const genuineBugs = allEntries.filter((f) => f.failureClass === "possible_bug" && f.validationStatus === "confirmed");
+  const genuineBugs = allEntries.filter(
+    (f) => f.defectClassification === "CONFIRMED_PRODUCT_BUG" && f.validationStatus === "confirmed"
+  );
   const investigations = allEntries.filter(
     (f) =>
-      (f.failureClass === "possible_bug" || f.failureClass === "unknown" || !f.failureClass) &&
-      f.validationStatus !== "confirmed"
+      (f.failureClass === "possible_bug" || f.failureClass === "uncertain" || f.failureClass === "unknown" || !f.failureClass) &&
+      f.validationStatus !== "confirmed" &&
+      f.validationStatus !== "rejected"
   );
-  const scriptIssues = allEntries.filter((f) => f.failureClass === "automation_issue" || f.failureClass === "environment_issue");
+  const rejectedFindings = allEntries.filter((f) => f.validationStatus === "rejected");
+  const scriptIssues = allEntries.filter((f) =>
+    ["automation_issue", "environment_issue", "test_data_issue", "configuration_issue"].includes(f.failureClass || "")
+  );
 
   async function downloadPdf() {
     setPdfBusy(true);
@@ -134,6 +190,19 @@ export function BugReportPanel({
         validationStatus: f.validationStatus || "candidate",
         preconditions: f.preconditions,
         testData: f.testData,
+        requirementReference: f.requirementReference,
+        businessImpact: f.businessImpact,
+        severityJustification: f.severityJustification,
+        priorityJustification: f.priorityJustification,
+        suspectedRootCause: f.suspectedRootCause,
+        regressionRisk: f.regressionRisk,
+        regressionRiskReason: f.regressionRiskReason,
+        suggestedFix: f.suggestedFix,
+        aiConfidence: f.aiConfidence,
+        aiConfidenceReason: f.aiConfidenceReason,
+        affectedScenarios: f.affectedScenarios,
+        defectClassification: f.defectClassification,
+        occurrenceCount: f.occurrenceCount,
       }));
       await api.downloadBugReportPdf(entries, `bug-report-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-")}.pdf`);
     } catch (e: any) {
@@ -151,6 +220,7 @@ export function BugReportPanel({
           {genuineBugs.length > 0 && <Pill tone="bad">{genuineBugs.length} product bug{genuineBugs.length === 1 ? "" : "s"}</Pill>}
           {investigations.length > 0 && <Pill tone="neutral">{investigations.length} need investigation</Pill>}
           {scriptIssues.length > 0 && <Pill tone="warn">{scriptIssues.length} script/env issue{scriptIssues.length === 1 ? "" : "s"}</Pill>}
+          {rejectedFindings.length > 0 && <Pill tone="neutral">{rejectedFindings.length} rejected</Pill>}
         </div>
       </div>
       <p className="text-xs text-ink/60">
@@ -200,7 +270,7 @@ export function BugReportPanel({
             className="text-xs underline text-ink/60 pt-2"
             onClick={() => setShowScriptIssues((v) => !v)}
           >
-            {showScriptIssues ? "Hide" : "Show"} {scriptIssues.length} automation/environment issue{scriptIssues.length === 1 ? "" : "s"} (not product bugs)
+            {showScriptIssues ? "Hide" : "Show"} {scriptIssues.length} automation/environment/test-data/configuration issue{scriptIssues.length === 1 ? "" : "s"} (not product bugs)
           </button>
           {showScriptIssues && (
             <div className="space-y-2 pt-2">
@@ -209,6 +279,12 @@ export function BugReportPanel({
               ))}
             </div>
           )}
+        </div>
+      )}
+      {rejectedFindings.length > 0 && (
+        <div className="space-y-2 border-t border-line/70 pt-3">
+          <p className="text-xs font-medium text-ink/60">Rejected false positives</p>
+          {rejectedFindings.map((f) => <FailureCard key={f.testCaseId} f={f} />)}
         </div>
       )}
     </div>
@@ -223,6 +299,9 @@ function FailureCard({ f }: { f: CrawlBugEntry }) {
         <div>
           <div className="flex items-center gap-2">
             <Pill tone={meta.tone}>{meta.badge}</Pill>
+            {f.severity && <Pill tone={f.severity === "blocker" || f.severity === "critical" ? "bad" : f.severity === "high" || f.severity === "medium" ? "warn" : "neutral"}>{f.severity}</Pill>}
+            {f.priority && <Pill tone="neutral">{f.priority}</Pill>}
+            {f.aiConfidence != null && <Pill tone="neutral">{f.aiConfidence}% confidence</Pill>}
           </div>
           <p className="text-sm font-medium text-ink mt-1">{f.title}</p>
         </div>
@@ -233,6 +312,12 @@ function FailureCard({ f }: { f: CrawlBugEntry }) {
         )}
       </div>
       <p className="text-xs text-ink/50">{f.failureLabel || meta.blurb}</p>
+      {f.requirementReference && <p className="text-xs text-ink/60"><strong>Requirement:</strong> {f.requirementReference}</p>}
+      {f.expectedResult && <p className="text-xs text-ink/60"><strong>Expected:</strong> {f.expectedResult}</p>}
+      {f.actualResult && <p className="text-xs text-ink/60"><strong>Actual:</strong> {f.actualResult}</p>}
+      {f.businessImpact && <p className="text-xs text-ink/60"><strong>Impact:</strong> {f.businessImpact}</p>}
+      {f.aiConfidenceReason && <p className="text-xs text-ink/60"><strong>Confidence basis:</strong> {f.aiConfidenceReason}</p>}
+      {f.reproducibility && <p className="text-xs text-ink/60"><strong>Reproducibility:</strong> {f.reproducibility}</p>}
       {f.errorMessage ? (
         <pre className="text-xs text-alert whitespace-pre-wrap font-mono bg-white/70 rounded p-2">{f.errorMessage}</pre>
       ) : (

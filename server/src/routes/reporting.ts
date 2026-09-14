@@ -80,6 +80,7 @@ reportingRouter.get("/ultrafast-bug-report", async (req, res) => {
           title: bug.title,
           failureClass: "possible_bug",
           validationStatus: "confirmed",
+          defectClassification: "CONFIRMED_PRODUCT_BUG",
           rootCause:
             bug.category === "performance"
               ? "REAL_PERFORMANCE_BUG"

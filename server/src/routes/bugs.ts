@@ -81,6 +81,11 @@ bugsRouter.patch("/:id", (req, res) => {
 bugsRouter.post("/:id/file", async (req, res) => {
   const finding = getBugFinding(req.params.id);
   if (!finding) return res.status(404).json(errBody(404, "Bug finding not found."));
+  if (finding.defect_classification !== "CONFIRMED_PRODUCT_BUG" || finding.validation_status !== "confirmed") {
+    return res.status(422).json(
+      errBody(422, "Only independently validated CONFIRMED PRODUCT BUG findings can be filed.")
+    );
+  }
 
   const result = await fileGenericBug(finding) as { filed: boolean; provider?: string; externalId?: string; reason?: string };
   if (!result?.filed) {

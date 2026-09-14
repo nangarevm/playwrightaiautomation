@@ -382,7 +382,27 @@ export async function fileGenericBug(finding: {
   steps_to_reproduce?: string | null;
   screenshot_url?: string | null;
   video_url?: string | null;
+  defect_classification?: string | null;
+  root_cause?: string | null;
+  priority?: string | null;
+  module_feature?: string | null;
+  expected_result?: string | null;
+  actual_result?: string | null;
+  requirement_reference?: string | null;
+  business_impact?: string | null;
+  severity_justification?: string | null;
+  priority_justification?: string | null;
+  regression_risk?: string | null;
+  regression_risk_reason?: string | null;
+  suspected_root_cause?: string | null;
+  suggested_fix?: string | null;
+  ai_confidence?: number | null;
+  reproduction_attempts?: number;
+  reproduction_successes?: number;
 }) {
+  if (finding.defect_classification && finding.defect_classification !== "CONFIRMED_PRODUCT_BUG") {
+    return { filed: false, reason: "only confirmed product bugs may be filed" };
+  }
   const trackers = listIntegrations().filter((i: any) => i.type === "jira" || i.type === "azure");
   if (trackers.length === 0) return { filed: false, reason: "no Jira/Azure integration configured" };
 
@@ -402,7 +422,30 @@ export async function fileGenericBug(finding: {
     finding.video_url ? `Screen recording: ${publicBaseUrl}${finding.video_url}` : null,
   ].filter(Boolean);
   const evidenceBlock = evidenceLines.length ? `\n\n${evidenceLines.join("\n")}` : "";
-  const description = `${finding.detail}${stepsBlock}${evidenceBlock}\n\nSeverity: ${finding.severity}\nFinding ID: ${finding.id}`;
+  const developerFields = [
+    `Classification: ${finding.defect_classification || "CONFIRMED_PRODUCT_BUG"}`,
+    `Severity: ${finding.severity}`,
+    finding.priority ? `Priority: ${finding.priority}` : null,
+    finding.module_feature ? `Module / feature: ${finding.module_feature}` : null,
+    finding.root_cause ? `Root-cause area: ${finding.root_cause}` : null,
+    finding.expected_result ? `Expected: ${finding.expected_result}` : null,
+    finding.actual_result ? `Actual: ${finding.actual_result}` : null,
+    finding.requirement_reference ? `Requirement / acceptance criteria: ${finding.requirement_reference}` : null,
+    finding.business_impact ? `User / business impact: ${finding.business_impact}` : null,
+    finding.severity_justification ? `Severity justification: ${finding.severity_justification}` : null,
+    finding.priority_justification ? `Priority justification: ${finding.priority_justification}` : null,
+    finding.reproduction_attempts
+      ? `Reproducibility: ${finding.reproduction_successes || 0}/${finding.reproduction_attempts}`
+      : null,
+    finding.regression_risk
+      ? `Regression risk: ${finding.regression_risk}${finding.regression_risk_reason ? ` — ${finding.regression_risk_reason}` : ""}`
+      : null,
+    finding.suspected_root_cause || null,
+    finding.suggested_fix ? `SUGGESTED FIX — NOT CONFIRMED ROOT CAUSE: ${finding.suggested_fix}` : null,
+    finding.ai_confidence != null ? `AI confidence: ${finding.ai_confidence}%` : null,
+    `Finding ID: ${finding.id}`,
+  ].filter(Boolean);
+  const description = `${finding.detail}${stepsBlock}${evidenceBlock}\n\n${developerFields.join("\n")}`;
 
   try {
     return await withRetry(

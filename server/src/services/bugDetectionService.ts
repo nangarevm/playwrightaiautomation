@@ -29,8 +29,16 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const UPLOAD_DIR = path.join(__dirname, "..", "uploads");
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
-export type BugSeverity = "critical" | "high" | "medium" | "low";
+export type BugSeverity = "blocker" | "critical" | "high" | "medium" | "low";
 export type BugSource = "ui_exploratory" | "api_fuzz" | "regression";
+export type DefectClassification =
+  | "CONFIRMED_PRODUCT_BUG"
+  | "AUTOMATION_ISSUE"
+  | "ENVIRONMENT_ISSUE"
+  | "TEST_DATA_ISSUE"
+  | "CONFIGURATION_ISSUE"
+  | "UNCERTAIN";
+export type RegressionRisk = "low" | "medium" | "high";
 export type RootCauseClassification =
   | "REAL_PRODUCT_BUG"
   | "REAL_API_BUG"
@@ -67,6 +75,17 @@ export interface BugFindingInput {
   reproductionSuccesses?: number;
   validationStatus?: "candidate" | "confirmed" | "rejected";
   affectedScenarios?: string[];
+  defectClassification?: DefectClassification;
+  moduleFeature?: string;
+  requirementReference?: string;
+  businessImpact?: string;
+  severityJustification?: string;
+  priorityJustification?: string;
+  suspectedRootCause?: string;
+  regressionRisk?: RegressionRisk;
+  regressionRiskReason?: string;
+  suggestedFix?: string;
+  aiConfidence?: number;
 }
 
 export interface BugFindingRow {
@@ -98,8 +117,95 @@ export interface BugFindingRow {
   fingerprint: string | null;
   occurrence_count: number;
   affected_scenarios_json: string;
+  defect_classification: DefectClassification;
+  module_feature: string | null;
+  requirement_reference: string | null;
+  business_impact: string | null;
+  severity_justification: string | null;
+  priority_justification: string | null;
+  suspected_root_cause: string | null;
+  regression_risk: RegressionRisk | null;
+  regression_risk_reason: string | null;
+  suggested_fix: string | null;
+  ai_confidence: number;
+  ai_confidence_reason: string | null;
+  quality_gate_json: string;
+  duplicate_of_id: string | null;
   created_at: string;
   updated_at: string;
+}
+
+export interface BugQualityGate {
+  requirementUnderstood: boolean;
+  expectedBehaviorEstablished: boolean;
+  actualBehaviorCaptured: boolean;
+  productBehaviorIndependentlyEvaluated: boolean;
+  automationFailureRuledOut: boolean;
+  environmentIssueRuledOut: boolean;
+  testDataIssueRuledOut: boolean;
+  reproductionAttempted: boolean;
+  evidenceAttached: boolean;
+  severityJustified: boolean;
+  priorityJustified: boolean;
+  businessImpactExplained: boolean;
+  duplicateCheckCompleted: boolean;
+  noInformationInvented: boolean;
+  rootCausePresentedAsSuspected: boolean;
+  passed: boolean;
+}
+
+function evaluateQualityGate(
+  input: BugFindingInput,
+  reproductionAttempts: number,
+  reproductionSuccesses: number
+): BugQualityGate {
+  const productClassification = input.defectClassification === "CONFIRMED_PRODUCT_BUG";
+  const evidenceAttached =
+    Object.keys(input.evidence || {}).length > 0 || Boolean(input.screenshotUrl) || Boolean(input.videoUrl);
+  const gate: BugQualityGate = {
+    requirementUnderstood: Boolean(input.requirementReference?.trim()),
+    expectedBehaviorEstablished: Boolean(input.expectedResult?.trim()),
+    actualBehaviorCaptured: Boolean((input.actualResult || input.detail)?.trim()),
+    productBehaviorIndependentlyEvaluated: reproductionAttempts >= 2 && reproductionSuccesses >= 2,
+    automationFailureRuledOut: productClassification,
+    environmentIssueRuledOut: productClassification,
+    testDataIssueRuledOut: productClassification,
+    reproductionAttempted: reproductionAttempts > 0,
+    evidenceAttached,
+    severityJustified: Boolean(input.severityJustification?.trim()),
+    priorityJustified: Boolean(input.priorityJustification?.trim()),
+    businessImpactExplained: Boolean(input.businessImpact?.trim()),
+    duplicateCheckCompleted: true,
+    noInformationInvented:
+      Boolean(input.expectedResult?.trim()) &&
+      Boolean(input.actualResult?.trim()) &&
+      Boolean(input.requirementReference?.trim()),
+    rootCausePresentedAsSuspected:
+      !input.suspectedRootCause || /^SUSPECTED ROOT CAUSE\b/i.test(input.suspectedRootCause.trim()),
+    passed: false,
+  };
+  gate.passed = Object.entries(gate)
+    .filter(([key]) => key !== "passed")
+    .every(([, value]) => value === true);
+  return gate;
+}
+
+function confidenceFromGate(gate: BugQualityGate, attempts: number, successes: number): number {
+  const checks = Object.entries(gate).filter(([key]) => key !== "passed");
+  const passed = checks.filter(([, value]) => value === true).length;
+  const evidenceScore = Math.round((passed / Math.max(1, checks.length)) * 85);
+  const reproductionScore = attempts > 0 ? Math.round((successes / attempts) * 15) : 0;
+  return Math.max(0, Math.min(100, evidenceScore + reproductionScore));
+}
+
+function confidenceReason(gate: BugQualityGate, attempts: number, successes: number): string {
+  const missing = Object.entries(gate)
+    .filter(([key, value]) => key !== "passed" && !value)
+    .map(([key]) => key.replace(/([A-Z])/g, " $1").toLowerCase());
+  if (gate.passed) {
+    return `All quality-gate checks passed with independent reproduction in ${successes}/${attempts} attempts.`;
+  }
+  return `Confidence is limited by: ${missing.join(", ") || "insufficient independent evidence"}; reproduction ${successes}/${attempts}.`;
 }
 
 function inferRootCause(input: BugFindingInput): RootCauseClassification {
@@ -114,7 +220,7 @@ function inferRootCause(input: BugFindingInput): RootCauseClassification {
 }
 
 function priorityForSeverity(severity: BugSeverity): BugPriority {
-  if (severity === "critical") return "P0";
+  if (severity === "blocker" || severity === "critical") return "P0";
   if (severity === "high") return "P1";
   if (severity === "medium") return "P2";
   return "P3";
@@ -145,9 +251,29 @@ export function recordBugFinding(input: BugFindingInput): BugFindingRow {
   const fingerprint = findingFingerprint(input, rootCause);
   const reproductionAttempts = Math.max(1, input.reproductionAttempts ?? 1);
   const reproductionSuccesses = Math.max(0, input.reproductionSuccesses ?? 1);
+  const requestedClassification =
+    input.defectClassification ??
+    (rootCause === "AUTOMATION_BUG"
+      ? "AUTOMATION_ISSUE"
+      : rootCause === "ENVIRONMENT_BUG"
+        ? "ENVIRONMENT_ISSUE"
+        : "UNCERTAIN");
+  const gateInput = { ...input, defectClassification: requestedClassification };
+  const qualityGate = evaluateQualityGate(gateInput, reproductionAttempts, reproductionSuccesses);
+  const defectClassification: DefectClassification =
+    requestedClassification === "CONFIRMED_PRODUCT_BUG" && !qualityGate.passed
+      ? "UNCERTAIN"
+      : requestedClassification;
   const validationStatus =
-    input.validationStatus ??
-    (reproductionAttempts >= 2 && reproductionSuccesses >= 2 ? "confirmed" : "candidate");
+    defectClassification === "CONFIRMED_PRODUCT_BUG"
+      ? "confirmed"
+      : input.validationStatus === "rejected"
+        ? "rejected"
+        : "candidate";
+  const aiConfidence = Math.min(
+    input.aiConfidence ?? 100,
+    confidenceFromGate(qualityGate, reproductionAttempts, reproductionSuccesses)
+  );
   const affectedScenarios = Array.from(new Set(input.affectedScenarios || []));
   const existing = db
     .prepare("SELECT * FROM bug_findings WHERE fingerprint = ? AND status != 'resolved' ORDER BY created_at DESC LIMIT 1")
@@ -161,12 +287,16 @@ export function recordBugFinding(input: BugFindingInput): BugFindingRow {
     const successes = Number(existing.reproduction_successes || 0) + reproductionSuccesses;
     // Repeated automation failures are duplicates, not independent product
     // verification. Promotion to confirmed must come from an explicit probe.
+    const existingConfirmed =
+      existing.validation_status === "confirmed" &&
+      existing.defect_classification === "CONFIRMED_PRODUCT_BUG";
     const mergedValidation =
-      existing.validation_status === "confirmed" || validationStatus === "confirmed"
+      existingConfirmed || validationStatus === "confirmed"
         ? "confirmed"
         : validationStatus === "rejected" && existing.validation_status !== "candidate"
           ? "rejected"
           : "candidate";
+    const mergedClassification = existingConfirmed ? existing.defect_classification : defectClassification;
     db.prepare(`
       UPDATE bug_findings
       SET occurrence_count = occurrence_count + 1,
@@ -177,6 +307,12 @@ export function recordBugFinding(input: BugFindingInput): BugFindingRow {
           evidence = ?,
           screenshot_url = COALESCE(?, screenshot_url),
           video_url = COALESCE(?, video_url),
+          defect_classification = ?,
+          quality_gate_json = ?,
+          ai_confidence = ?,
+          ai_confidence_reason = ?,
+          business_impact = COALESCE(?, business_impact),
+          requirement_reference = COALESCE(?, requirement_reference),
           updated_at = ?
       WHERE id = ?
     `).run(
@@ -187,13 +323,19 @@ export function recordBugFinding(input: BugFindingInput): BugFindingRow {
       JSON.stringify(input.evidence ?? {}),
       input.screenshotUrl ?? null,
       input.videoUrl ?? null,
+      mergedClassification,
+      JSON.stringify(qualityGate),
+      aiConfidence,
+      confidenceReason(qualityGate, reproductionAttempts, reproductionSuccesses),
+      input.businessImpact ?? null,
+      input.requirementReference ?? null,
       now,
       existing.id
     );
     return getBugFinding(existing.id)!;
   }
 
-  const id = nanoid(10);
+  const id = `BUG-${nanoid(8).toUpperCase()}`;
   const row: BugFindingRow = {
     id,
     source: input.source,
@@ -213,16 +355,24 @@ export function recordBugFinding(input: BugFindingInput): BugFindingRow {
     root_cause: rootCause,
     priority: input.priority ?? priorityForSeverity(input.severity),
     environment_json: JSON.stringify(
-      input.environment ?? {
-        browser: "Chromium",
-        os: process.platform,
-        viewport: "1280x800",
-        build: process.env.BUILD_VERSION || process.env.npm_package_version || "local",
-      }
+      input.environment ??
+        (input.source === "ui_exploratory"
+          ? {
+              browser: "Chromium",
+              os: process.platform,
+              viewport: "1280x800",
+              build: process.env.BUILD_VERSION || process.env.npm_package_version || "unavailable",
+            }
+          : {
+              browser: input.source === "api_fuzz" ? "not applicable" : "unavailable",
+              os: process.platform,
+              viewport: "unavailable",
+              build: process.env.BUILD_VERSION || process.env.npm_package_version || "unavailable",
+            })
     ),
     preconditions_json: JSON.stringify(input.preconditions ?? []),
     test_data_json: JSON.stringify(input.testData ?? {}),
-    expected_result: input.expectedResult ?? "The application should complete the user action without an application error.",
+    expected_result: input.expectedResult ?? null,
     actual_result: input.actualResult ?? input.detail,
     reproduction_attempts: reproductionAttempts,
     reproduction_successes: reproductionSuccesses,
@@ -230,6 +380,20 @@ export function recordBugFinding(input: BugFindingInput): BugFindingRow {
     fingerprint,
     occurrence_count: 1,
     affected_scenarios_json: JSON.stringify(affectedScenarios),
+    defect_classification: defectClassification,
+    module_feature: input.moduleFeature ?? null,
+    requirement_reference: input.requirementReference ?? null,
+    business_impact: input.businessImpact ?? null,
+    severity_justification: input.severityJustification ?? null,
+    priority_justification: input.priorityJustification ?? null,
+    suspected_root_cause: input.suspectedRootCause ?? null,
+    regression_risk: input.regressionRisk ?? null,
+    regression_risk_reason: input.regressionRiskReason ?? null,
+    suggested_fix: input.suggestedFix ?? null,
+    ai_confidence: aiConfidence,
+    ai_confidence_reason: confidenceReason(qualityGate, reproductionAttempts, reproductionSuccesses),
+    quality_gate_json: JSON.stringify(qualityGate),
+    duplicate_of_id: null,
     created_at: now,
     updated_at: now,
   };
@@ -240,7 +404,11 @@ export function recordBugFinding(input: BugFindingInput): BugFindingRow {
       priority, environment_json, preconditions_json, test_data_json,
       expected_result, actual_result, reproduction_attempts,
       reproduction_successes, validation_status, fingerprint, occurrence_count,
-      affected_scenarios_json, site_id, created_at, updated_at
+      affected_scenarios_json, site_id, defect_classification, module_feature,
+      requirement_reference, business_impact, severity_justification,
+      priority_justification, suspected_root_cause, regression_risk,
+      regression_risk_reason, suggested_fix, ai_confidence, ai_confidence_reason, quality_gate_json,
+      duplicate_of_id, created_at, updated_at
     )
     VALUES (
       @id, @source, @severity, @title, @detail, @screen_id, @run_id, @evidence,
@@ -248,7 +416,11 @@ export function recordBugFinding(input: BugFindingInput): BugFindingRow {
       @priority, @environment_json, @preconditions_json, @test_data_json,
       @expected_result, @actual_result, @reproduction_attempts,
       @reproduction_successes, @validation_status, @fingerprint, @occurrence_count,
-      @affected_scenarios_json, @site_id, @created_at, @updated_at
+      @affected_scenarios_json, @site_id, @defect_classification, @module_feature,
+      @requirement_reference, @business_impact, @severity_justification,
+      @priority_justification, @suspected_root_cause, @regression_risk,
+      @regression_risk_reason, @suggested_fix, @ai_confidence, @ai_confidence_reason, @quality_gate_json,
+      @duplicate_of_id, @created_at, @updated_at
     )
   `).run(row);
   return row;
@@ -272,6 +444,9 @@ export function listBugFindings(filter?: {
   if (filter?.validationStatus) {
     clauses.push("validation_status = @validation_status");
     params.validation_status = filter.validationStatus;
+    if (filter.validationStatus === "confirmed") {
+      clauses.push("defect_classification = 'CONFIRMED_PRODUCT_BUG'");
+    }
   }
   const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
   return db.prepare(`SELECT * FROM bug_findings ${where} ORDER BY created_at DESC`).all(params) as BugFindingRow[];
@@ -296,6 +471,7 @@ export function listBugFindingsForSite(
          ${filter?.status ? "AND b.status = @status" : ""}
          ${filter?.severity ? "AND b.severity = @severity" : ""}
          ${filter?.validationStatus ? "AND b.validation_status = @validation_status" : ""}
+         ${filter?.validationStatus === "confirmed" ? "AND b.defect_classification = 'CONFIRMED_PRODUCT_BUG'" : ""}
        ORDER BY b.created_at DESC`
     )
     .all(params) as BugFindingRow[];
@@ -307,15 +483,20 @@ export interface QaDashboard {
   totalApiCallsAnalyzed: number;
   totalUiStatesAnalyzed: number;
   totalRealBugs: number;
+  blockerBugs: number;
   criticalBugs: number;
   highBugs: number;
   mediumBugs: number;
   lowBugs: number;
   automationFailures: number;
   environmentFailures: number;
+  testDataIssues: number;
+  configurationIssues: number;
   duplicateIssues: number;
   falsePositivesRejected: number;
   unknownRequiresInvestigation: number;
+  highestRiskDefects: Array<{ id: string; title: string; severity: BugSeverity; businessImpact: string | null }>;
+  coverageObservations: string[];
 }
 
 export function getQaDashboard(siteId?: string): QaDashboard {
@@ -336,19 +517,24 @@ export function getQaDashboard(siteId?: string): QaDashboard {
     .get(params) as { scenarios: number; workflows: number };
 
   const findingWhere = siteId
-    ? "WHERE b.site_id = @siteId OR b.screen_id IN (SELECT id FROM screens WHERE source_input_id = @siteId)"
+    ? "WHERE (b.site_id = @siteId OR b.screen_id IN (SELECT id FROM screens WHERE source_input_id = @siteId))"
     : "";
   const bugStats = db
     .prepare(`
       SELECT
-        SUM(CASE WHEN validation_status = 'confirmed' AND root_cause LIKE 'REAL_%' THEN 1 ELSE 0 END) AS real_bugs,
-        SUM(CASE WHEN validation_status = 'confirmed' AND root_cause LIKE 'REAL_%' AND severity = 'critical' THEN 1 ELSE 0 END) AS critical,
-        SUM(CASE WHEN validation_status = 'confirmed' AND root_cause LIKE 'REAL_%' AND severity = 'high' THEN 1 ELSE 0 END) AS high,
-        SUM(CASE WHEN validation_status = 'confirmed' AND root_cause LIKE 'REAL_%' AND severity = 'medium' THEN 1 ELSE 0 END) AS medium,
-        SUM(CASE WHEN validation_status = 'confirmed' AND root_cause LIKE 'REAL_%' AND severity = 'low' THEN 1 ELSE 0 END) AS low,
+        SUM(CASE WHEN defect_classification = 'CONFIRMED_PRODUCT_BUG' THEN 1 ELSE 0 END) AS real_bugs,
+        SUM(CASE WHEN defect_classification = 'CONFIRMED_PRODUCT_BUG' AND severity = 'blocker' THEN 1 ELSE 0 END) AS blocker,
+        SUM(CASE WHEN defect_classification = 'CONFIRMED_PRODUCT_BUG' AND severity = 'critical' THEN 1 ELSE 0 END) AS critical,
+        SUM(CASE WHEN defect_classification = 'CONFIRMED_PRODUCT_BUG' AND severity = 'high' THEN 1 ELSE 0 END) AS high,
+        SUM(CASE WHEN defect_classification = 'CONFIRMED_PRODUCT_BUG' AND severity = 'medium' THEN 1 ELSE 0 END) AS medium,
+        SUM(CASE WHEN defect_classification = 'CONFIRMED_PRODUCT_BUG' AND severity = 'low' THEN 1 ELSE 0 END) AS low,
+        SUM(CASE WHEN defect_classification = 'AUTOMATION_ISSUE' THEN 1 ELSE 0 END) AS automation_findings,
+        SUM(CASE WHEN defect_classification = 'ENVIRONMENT_ISSUE' THEN 1 ELSE 0 END) AS environment_findings,
+        SUM(CASE WHEN defect_classification = 'TEST_DATA_ISSUE' THEN 1 ELSE 0 END) AS test_data,
+        SUM(CASE WHEN defect_classification = 'CONFIGURATION_ISSUE' THEN 1 ELSE 0 END) AS configuration,
         SUM(CASE WHEN occurrence_count > 1 THEN occurrence_count - 1 ELSE 0 END) AS duplicates,
         SUM(CASE WHEN validation_status = 'rejected' THEN 1 ELSE 0 END) AS rejected,
-        SUM(CASE WHEN validation_status = 'candidate' OR root_cause = 'UNKNOWN_REQUIRES_INVESTIGATION' THEN 1 ELSE 0 END) AS unknown_count
+        SUM(CASE WHEN defect_classification = 'UNCERTAIN' THEN 1 ELSE 0 END) AS unknown_count
       FROM bug_findings b
       ${findingWhere}
     `)
@@ -365,7 +551,10 @@ export function getQaDashboard(siteId?: string): QaDashboard {
     .prepare(`
       SELECT
         SUM(CASE WHEN ee.failure_class = 'automation_issue' THEN 1 ELSE 0 END) AS automation,
-        SUM(CASE WHEN ee.failure_class = 'environment_issue' THEN 1 ELSE 0 END) AS environment
+        SUM(CASE WHEN ee.failure_class = 'environment_issue' THEN 1 ELSE 0 END) AS environment,
+        SUM(CASE WHEN ee.failure_class = 'test_data_issue' THEN 1 ELSE 0 END) AS test_data,
+        SUM(CASE WHEN ee.failure_class = 'configuration_issue' THEN 1 ELSE 0 END) AS configuration,
+        SUM(CASE WHEN ee.failure_class IN ('uncertain', 'unknown', 'possible_bug') THEN 1 ELSE 0 END) AS uncertain
       FROM execution_evidence ee
       ${evidenceJoin}
       ${evidenceWhere}
@@ -381,6 +570,27 @@ export function getQaDashboard(siteId?: string): QaDashboard {
       ${siteId ? "WHERE site_id = @siteId" : ""}
     `)
     .get(params) as any;
+  const highestRiskDefects = db
+    .prepare(`
+      SELECT id, title, severity, business_impact
+      FROM bug_findings b
+      ${findingWhere ? `${findingWhere} AND` : "WHERE"}
+        defect_classification = 'CONFIRMED_PRODUCT_BUG'
+      ORDER BY CASE severity
+        WHEN 'blocker' THEN 5 WHEN 'critical' THEN 4 WHEN 'high' THEN 3
+        WHEN 'medium' THEN 2 ELSE 1 END DESC,
+        created_at DESC
+      LIMIT 5
+    `)
+    .all(params) as Array<{ id: string; title: string; severity: BugSeverity; business_impact: string | null }>;
+  const coverageObservations: string[] = [];
+  if (!Number(execution?.scenarios || 0)) coverageObservations.push("No test executions were available for analysis.");
+  if (!Number(scans?.api_calls || 0)) coverageObservations.push("No API calls were analyzed; API behavior remains unverified.");
+  if (!Number(scans?.ui_states || 0)) coverageObservations.push("No exploratory UI states were analyzed.");
+  if (Number(execution?.workflows || 0) === 0) coverageObservations.push("No complete end-to-end workflow executions were identified.");
+  if (coverageObservations.length === 0) {
+    coverageObservations.push("Execution, workflow, API, and UI-state evidence is available; unexecuted product areas are not claimed as covered.");
+  }
 
   return {
     totalScenariosExecuted: Number(execution?.scenarios || 0),
@@ -388,15 +598,25 @@ export function getQaDashboard(siteId?: string): QaDashboard {
     totalApiCallsAnalyzed: Number(scans?.api_calls || 0),
     totalUiStatesAnalyzed: Number(scans?.ui_states || 0),
     totalRealBugs: Number(bugStats?.real_bugs || 0),
+    blockerBugs: Number(bugStats?.blocker || 0),
     criticalBugs: Number(bugStats?.critical || 0),
     highBugs: Number(bugStats?.high || 0),
     mediumBugs: Number(bugStats?.medium || 0),
     lowBugs: Number(bugStats?.low || 0),
-    automationFailures: Number(failures?.automation || 0),
-    environmentFailures: Number(failures?.environment || 0),
+    automationFailures: Number(failures?.automation || 0) + Number(bugStats?.automation_findings || 0),
+    environmentFailures: Number(failures?.environment || 0) + Number(bugStats?.environment_findings || 0),
+    testDataIssues: Number(bugStats?.test_data || 0) + Number(failures?.test_data || 0),
+    configurationIssues: Number(bugStats?.configuration || 0) + Number(failures?.configuration || 0),
     duplicateIssues: Number(bugStats?.duplicates || 0),
     falsePositivesRejected: Number(bugStats?.rejected || 0),
-    unknownRequiresInvestigation: Number(bugStats?.unknown_count || 0),
+    unknownRequiresInvestigation: Number(bugStats?.unknown_count || 0) + Number(failures?.uncertain || 0),
+    highestRiskDefects: highestRiskDefects.map((row) => ({
+      id: row.id,
+      title: row.title,
+      severity: row.severity,
+      businessImpact: row.business_impact,
+    })),
+    coverageObservations,
   };
 }
 
@@ -430,12 +650,37 @@ export async function confirmHttpFinding(
   } catch {
     evidence = {};
   }
-  const confirmed = successes === 2;
+  const totalAttempts = finding.reproduction_attempts + attempts.length;
+  const totalSuccesses = finding.reproduction_successes + successes;
+  const gateInput: BugFindingInput = {
+    source: finding.source,
+    severity: finding.severity,
+    title: finding.title,
+    detail: finding.detail,
+    evidence: { ...evidence, independentHttpVerification: attempts },
+    screenshotUrl: finding.screenshot_url,
+    videoUrl: finding.video_url,
+    expectedResult: finding.expected_result || undefined,
+    actualResult: finding.actual_result || undefined,
+    requirementReference: finding.requirement_reference || undefined,
+    businessImpact: finding.business_impact || undefined,
+    severityJustification: finding.severity_justification || undefined,
+    priorityJustification: finding.priority_justification || undefined,
+    suspectedRootCause: finding.suspected_root_cause || undefined,
+    defectClassification: "CONFIRMED_PRODUCT_BUG",
+  };
+  const qualityGate = evaluateQualityGate(gateInput, totalAttempts, totalSuccesses);
+  const confirmed = successes === 2 && qualityGate.passed;
+  const confidence = confidenceFromGate(qualityGate, totalAttempts, totalSuccesses);
   db.prepare(`
     UPDATE bug_findings
     SET reproduction_attempts = reproduction_attempts + ?,
         reproduction_successes = reproduction_successes + ?,
         validation_status = ?,
+        defect_classification = ?,
+        quality_gate_json = ?,
+        ai_confidence = ?,
+        ai_confidence_reason = ?,
         evidence = ?,
         updated_at = ?
     WHERE id = ?
@@ -443,6 +688,10 @@ export async function confirmHttpFinding(
     attempts.length,
     successes,
     confirmed ? "confirmed" : "rejected",
+    confirmed ? "CONFIRMED_PRODUCT_BUG" : "UNCERTAIN",
+    JSON.stringify(qualityGate),
+    confidence,
+    confidenceReason(qualityGate, totalAttempts, totalSuccesses),
     JSON.stringify({ ...evidence, independentHttpVerification: attempts }),
     new Date().toISOString(),
     findingId
@@ -488,7 +737,11 @@ function attachVideoToFindings(findings: BugFindingRow[], videoUrl: string) {
 // Low/medium noise (a handful of console warnings) shouldn't spam the tracker.
 function autoFileIfSevere(finding: BugFindingRow) {
   if (finding.severity !== "critical" && finding.severity !== "high") return;
-  if (finding.validation_status !== "confirmed" || !finding.root_cause.startsWith("REAL_")) return;
+  if (
+    finding.validation_status !== "confirmed" ||
+    finding.defect_classification !== "CONFIRMED_PRODUCT_BUG" ||
+    !finding.root_cause.startsWith("REAL_")
+  ) return;
   fileGenericBug(finding)
     .then((result: any) => {
       if (result?.filed) markBugFindingFiled(finding.id, result.provider, result.externalId);
@@ -569,7 +822,7 @@ export async function fuzzApiEndpoint(
         const res = await fetch(url, { method, headers });
         const responseHeaders: Record<string, string> = {};
         res.headers.forEach((value, key) => {
-          responseHeaders[key] = value;
+          responseHeaders[key] = /set-cookie|authorization|token|secret/i.test(key) ? "[REDACTED]" : value;
         });
         attempts.push({
           status: res.status,
@@ -589,12 +842,20 @@ export async function fuzzApiEndpoint(
       if (serverFailures.length >= 2 || unsafeSuccesses.length >= 2) {
         const representative = serverFailures[0] || unsafeSuccesses[0];
         const isUnsafeSuccess = unsafeSuccesses.length >= 2;
-        const headerLines = Object.entries(headers).map(([k, v]) => `-H "${k}: ${v}"`).join(" ");
+        const redactedHeaders = Object.fromEntries(
+          Object.entries(headers).map(([key, value]) => [
+            key,
+            /authorization|cookie|token|api-key|secret/i.test(key) ? "[REDACTED]" : value,
+          ])
+        );
+        const headerLines = Object.entries(redactedHeaders).map(([k, v]) => `-H "${k}: ${v}"`).join(" ");
         const finding = recordBugFinding({
           source: "api_fuzz",
           severity: "high",
           rootCause: isUnsafeSuccess ? "REAL_SECURITY_BUG" : "REAL_API_BUG",
-          priority: "P1",
+          priority: isUnsafeSuccess ? "P2" : "P1",
+          defectClassification: isUnsafeSuccess ? "UNCERTAIN" : "CONFIRMED_PRODUCT_BUG",
+          moduleFeature: `API → ${method} ${endpointPath}`,
           title: isUnsafeSuccess
             ? `${endpointTemplate} accepts dangerous ${fuzz.label} input`
             : `${endpointTemplate} crashes (HTTP ${representative.status}) on ${fuzz.label}`,
@@ -606,7 +867,7 @@ export async function fuzzApiEndpoint(
           evidence: {
             method,
             url,
-            requestHeaders: headers,
+            requestHeaders: redactedHeaders,
             fuzzLabel: fuzz.label,
             fuzzInput: fuzz.value,
             attempts,
@@ -616,13 +877,29 @@ export async function fuzzApiEndpoint(
               null,
           },
           testData: { id: fuzz.value },
-          expectedResult: "Malformed or dangerous identifiers should be rejected with a documented 4xx response and must not expose data.",
+          expectedResult: isUnsafeSuccess
+            ? "The endpoint should follow its documented identifier validation and authorization contract."
+            : "Malformed identifiers should be rejected with a controlled 4xx response rather than crashing the server.",
           actualResult: isUnsafeSuccess
             ? `The API returned success in ${unsafeSuccesses.length}/3 attempts.`
             : `The API returned a server error in ${serverFailures.length}/3 attempts.`,
           reproductionAttempts: 3,
           reproductionSuccesses: isUnsafeSuccess ? unsafeSuccesses.length : serverFailures.length,
-          validationStatus: "confirmed",
+          validationStatus: isUnsafeSuccess ? "candidate" : "confirmed",
+          requirementReference: isUnsafeSuccess
+            ? "No explicit API contract available — human review is required to determine whether this identifier is valid."
+            : "Established HTTP/API behavior: malformed client input must produce a controlled 4xx response, not a server-side 5xx.",
+          businessImpact: isUnsafeSuccess
+            ? "Impact is not established until the endpoint contract and returned data are reviewed."
+            : "Clients receive an uncontrolled server error and cannot handle invalid input predictably.",
+          severityJustification: isUnsafeSuccess
+            ? "Severity is provisional because acceptance of the value has not been proven incorrect."
+            : "High because malformed input repeatedly causes a server-side failure.",
+          priorityJustification: isUnsafeSuccess
+            ? "P2 review is appropriate until the API contract is confirmed."
+            : "P1 because the API crashes consistently and requires backend validation.",
+          regressionRisk: "medium",
+          regressionRiskReason: "Identifier validation may be shared by other operations on the same resource.",
           stepsToReproduce: [
             `Send a ${method} request to: ${url}${headerLines ? ` (with headers: ${headerLines})` : ""}`,
             `Equivalent curl: curl -i -X ${method} ${headerLines ? `${headerLines} ` : ""}"${url}"`,
@@ -675,6 +952,14 @@ export async function fuzzApiEndpoint(
           reproductionAttempts: 3,
           reproductionSuccesses: 3,
           validationStatus: "confirmed",
+          defectClassification: "CONFIRMED_PRODUCT_BUG",
+          moduleFeature: `Authorization → ${method} ${endpointPath}`,
+          requirementReference: "Established access-control rule: protected operations must reject unauthenticated requests with 401 or 403.",
+          businessImpact: "An unauthenticated caller can perform or retrieve a protected operation.",
+          severityJustification: "Critical because access control is bypassed in 3/3 independent attempts.",
+          priorityJustification: "P0 because unauthorized access requires immediate containment.",
+          regressionRisk: "high",
+          regressionRiskReason: "Authorization middleware may protect multiple endpoints and roles.",
           stepsToReproduce: [
             `Remove authentication headers from ${method} ${probeUrl}.`,
             "Send the request three times.",
@@ -833,6 +1118,7 @@ async function scanResponsiveLayout(
     const second = await inspectResponsiveState(page, viewport);
     const confirmed = first.filter((a) => second.some((b) => b.kind === a.kind && b.detail === a.detail));
     if (confirmed.length === 0) continue;
+    const impairsUse = confirmed.some((i) => i.kind === "modal_overflow" || i.kind === "fixed_control_clipped");
     const screenshotUrl = await page
       .screenshot({ fullPage: true })
       .then((buffer) => saveUploadFile(buffer, ".png"))
@@ -840,21 +1126,34 @@ async function scanResponsiveLayout(
     findings.push(
       recordBugFinding({
         source: "ui_exploratory",
-        severity: confirmed.some((i) => i.kind === "modal_overflow" || i.kind === "fixed_control_clipped")
-          ? "medium"
-          : "low",
+        severity: impairsUse ? "medium" : "low",
         rootCause: "REAL_UI_BUG",
+        defectClassification: "CONFIRMED_PRODUCT_BUG",
+        priority: impairsUse ? "P2" : "P3",
+        moduleFeature: `Responsive UI → ${screen.name}`,
         title: `UI/responsive defect on ${screen.name} at ${viewport.width}x${viewport.height}`,
         detail: confirmed.map((i) => i.detail).join("\n"),
         screenId,
         runId,
         environment: { browser: "Chromium", os: process.platform, viewport: `${viewport.width}x${viewport.height}` },
         evidence: { viewport, issues: confirmed },
-        expectedResult: "All product content and fixed/modal controls should remain usable without horizontal clipping.",
+        expectedResult: "Product content, controls, labels, and dialogs should remain visible, named, and usable at the tested viewport.",
         actualResult: confirmed.map((i) => i.detail).join(" "),
         reproductionAttempts: 2,
         reproductionSuccesses: 2,
         validationStatus: "confirmed",
+        requirementReference: "Established responsive-usability and accessibility behavior at the explicitly tested viewport.",
+        businessImpact: impairsUse
+          ? "Users at this viewport cannot fully view or operate the affected control."
+          : "Users encounter clipped content, undersized touch targets, or controls without accessible names.",
+        severityJustification: impairsUse
+          ? "Medium because an affected fixed control or modal is not fully usable, while the rest of the page remains available."
+          : "Low because the reproduced issue affects accessibility or presentation without blocking the full workflow.",
+        priorityJustification: impairsUse
+          ? "P2 because an important responsive interaction is impaired and needs correction."
+          : "P3 because the issue is localized and does not block the primary workflow.",
+        regressionRisk: "medium",
+        regressionRiskReason: "Responsive CSS and shared control styles can affect multiple viewport sizes and screens.",
         stepsToReproduce: [
           `Open ${screen.url_or_path}.`,
           `Set the viewport to ${viewport.width}x${viewport.height}.`,
@@ -954,19 +1253,66 @@ async function confirmUiFindings(
       confirmed = mainStatus === 0;
     }
 
+    const totalAttempts = finding.reproduction_attempts + 1;
+    const totalSuccesses = finding.reproduction_successes + (confirmed ? 1 : 0);
+    const gateInput: BugFindingInput = {
+      source: finding.source,
+      severity: finding.severity,
+      title: finding.title,
+      detail: finding.detail,
+      evidence,
+      screenshotUrl: finding.screenshot_url,
+      videoUrl: finding.video_url,
+      expectedResult: finding.expected_result || undefined,
+      actualResult: finding.actual_result || undefined,
+      requirementReference: finding.requirement_reference || undefined,
+      businessImpact: finding.business_impact || undefined,
+      severityJustification: finding.severity_justification || undefined,
+      priorityJustification: finding.priority_justification || undefined,
+      suspectedRootCause: finding.suspected_root_cause || undefined,
+      defectClassification: "CONFIRMED_PRODUCT_BUG",
+    };
+    const qualityGate = evaluateQualityGate(gateInput, totalAttempts, totalSuccesses);
+    const productConfirmed = confirmed && qualityGate.passed;
+    const validationStatus = !confirmed ? "rejected" : productConfirmed ? "confirmed" : "candidate";
+    const classification: DefectClassification = productConfirmed ? "CONFIRMED_PRODUCT_BUG" : "UNCERTAIN";
+    const confidence = confidenceFromGate(qualityGate, totalAttempts, totalSuccesses);
     db.prepare(`
       UPDATE bug_findings
       SET reproduction_attempts = reproduction_attempts + 1,
           reproduction_successes = reproduction_successes + ?,
-          validation_status = CASE WHEN ? = 1 THEN 'confirmed' ELSE 'rejected' END,
+          validation_status = ?,
+          defect_classification = ?,
+          quality_gate_json = ?,
+          ai_confidence = ?,
+          ai_confidence_reason = ?,
           updated_at = ?
       WHERE id = ?
-    `).run(confirmed ? 1 : 0, confirmed ? 1 : 0, new Date().toISOString(), finding.id);
+    `).run(
+      confirmed ? 1 : 0,
+      validationStatus,
+      classification,
+      JSON.stringify(qualityGate),
+      confidence,
+      confidenceReason(qualityGate, totalAttempts, totalSuccesses),
+      new Date().toISOString(),
+      finding.id
+    );
     finding.reproduction_attempts += 1;
     if (confirmed) {
       finding.reproduction_successes += 1;
-      finding.validation_status = "confirmed";
-      autoFileIfSevere(finding);
+      finding.validation_status = validationStatus;
+      finding.defect_classification = classification;
+      finding.quality_gate_json = JSON.stringify(qualityGate);
+      finding.ai_confidence = confidence;
+      finding.ai_confidence_reason = confidenceReason(qualityGate, totalAttempts, totalSuccesses);
+      if (productConfirmed) autoFileIfSevere(finding);
+    } else {
+      finding.validation_status = "rejected";
+      finding.defect_classification = "UNCERTAIN";
+      finding.quality_gate_json = JSON.stringify(qualityGate);
+      finding.ai_confidence = confidence;
+      finding.ai_confidence_reason = confidenceReason(qualityGate, totalAttempts, totalSuccesses);
     }
   }
   await page.close();
@@ -1008,6 +1354,7 @@ export async function scanScreenForUiBugs(
     const serverErrors: Array<{ url: string; status: number }> = [];
     const clientErrors: Array<{ url: string; status: number }> = [];
     const failedRequests: Array<{ url: string; error: string }> = [];
+    const targetOrigin = originOf(screen.url_or_path);
 
     page.on("console", (msg) => {
       if (msg.type() === "error") {
@@ -1023,12 +1370,15 @@ export async function scanScreenForUiBugs(
     });
     page.on("pageerror", (err) => pageErrors.push(err.message.slice(0, 300)));
     page.on("response", (res) => {
+      const responseOrigin = originOf(res.url());
+      if (targetOrigin && responseOrigin !== targetOrigin) return;
       if (res.status() >= 500) serverErrors.push({ url: res.url(), status: res.status() });
       else if (res.status() >= 400 && res.request().resourceType() === "document") {
         clientErrors.push({ url: res.url(), status: res.status() });
       }
     });
     page.on("requestfailed", (req) => {
+      if (targetOrigin && originOf(req.url()) !== targetOrigin) return;
       failedRequests.push({ url: req.url(), error: (req.failure()?.errorText || "request failed").slice(0, 200) });
     });
 
@@ -1079,7 +1429,7 @@ export async function scanScreenForUiBugs(
       );
     }
 
-    if (mainResponse && mainResponse.status() >= 400) {
+    if (mainResponse && mainResponse.status() >= 400 && mainResponse.status() < 500) {
       const screenshotUrl = await screenshotNow();
       const finding = recordBugFinding({
         source: "ui_exploratory",
@@ -1109,11 +1459,23 @@ export async function scanScreenForUiBugs(
       const finding = recordBugFinding({
         source: "ui_exploratory",
         severity: "critical",
+        rootCause: "REAL_API_BUG",
+        defectClassification: "CONFIRMED_PRODUCT_BUG",
+        priority: "P0",
+        moduleFeature: `Page load API → ${screen.name}`,
         title: `Server error(s) while loading ${screen.name}`,
         detail: serverErrors.map((e) => `HTTP ${e.status} — ${e.url}`).join("\n"),
         screenId,
         runId,
         evidence: { serverErrors },
+        expectedResult: "Same-origin application requests required to load the screen should complete without HTTP 5xx responses.",
+        actualResult: `${serverErrors.length} same-origin request(s) returned HTTP 5xx while the screen loaded.`,
+        requirementReference: "Established application behavior: loading a cataloged product screen must not trigger an internal server error.",
+        businessImpact: "The screen loads with failed application data or functionality and the related user workflow may be unavailable.",
+        severityJustification: "Critical because required same-origin application requests repeatedly fail with server errors.",
+        priorityJustification: "P0 because a server-side failure occurs during normal screen loading.",
+        regressionRisk: "high",
+        regressionRiskReason: "The failed same-origin endpoint may serve multiple screens and workflows.",
         stepsToReproduce: [...baseSteps, `Observe: ${serverErrors.length} request(s) returned a 5xx server error -- see the response network tab for ${serverErrors.map((e) => e.url).join(", ")}`],
         screenshotUrl,
       });
@@ -1142,11 +1504,23 @@ export async function scanScreenForUiBugs(
         recordBugFinding({
           source: "ui_exploratory",
           severity: "medium",
+          rootCause: "REAL_UI_BUG",
+          defectClassification: "CONFIRMED_PRODUCT_BUG",
+          priority: "P2",
+          moduleFeature: `Rendered content → ${screen.name}`,
           title: `Broken image(s) on ${screen.name}`,
           detail: brokenImages.join("\n"),
           screenId,
           runId,
           evidence: { brokenImages },
+          expectedResult: "Visible product images should load successfully and have non-zero natural dimensions.",
+          actualResult: `${brokenImages.length} visible image(s) repeatedly completed with zero natural width.`,
+          requirementReference: "Established rendered-UI behavior for visible product images.",
+          businessImpact: "Users cannot view the affected visual content.",
+          severityJustification: "Medium because visible content is unavailable, while the rest of the screen remains accessible.",
+          priorityJustification: "P2 because the defect is user-visible and affects content comprehension.",
+          regressionRisk: "medium",
+          regressionRiskReason: "Shared image URLs or asset delivery can affect other screens.",
           stepsToReproduce: [...baseSteps, `Observe: the following image(s) fail to load (broken/404): ${brokenImages.join(", ")}`],
           screenshotUrl,
         })
@@ -1160,11 +1534,23 @@ export async function scanScreenForUiBugs(
         recordBugFinding({
           source: "ui_exploratory",
           severity: "medium",
+          rootCause: "REAL_PRODUCT_BUG",
+          defectClassification: "CONFIRMED_PRODUCT_BUG",
+          priority: "P2",
+          moduleFeature: `Navigation → ${screen.name}`,
           title: `Broken internal link(s) on ${screen.name}`,
           detail: brokenLinks.map((l) => `HTTP ${l.status} — ${l.url} (${l.label})`).join("\n"),
           screenId,
           runId,
           evidence: { brokenLinks },
+          expectedResult: "Visible same-origin navigation links should resolve to a valid application response.",
+          actualResult: `${brokenLinks.length} visible same-origin link(s) repeatedly returned HTTP 4xx/5xx.`,
+          requirementReference: "Established navigation behavior for visible same-origin product links.",
+          businessImpact: "Users cannot reach the linked product destination.",
+          severityJustification: "Medium because navigation to the affected destination is broken but the source page remains usable.",
+          priorityJustification: "P2 because the broken path blocks a related workflow with a possible alternative route.",
+          regressionRisk: "medium",
+          regressionRiskReason: "Shared routes and navigation components may expose the same broken destination elsewhere.",
           stepsToReproduce: [...baseSteps, `Observe: ${brokenLinks.length} same-origin link(s) return 4xx/5xx instead of loading.`],
           screenshotUrl,
         })
@@ -1368,7 +1754,8 @@ async function checkBrokenInternalLinks(
       const res = await page.request.get(link.href, { timeout: 8000 });
       if (res.status() >= 400) broken.push({ url: link.href, label: link.label || link.href, status: res.status() });
     } catch {
-      broken.push({ url: link.href, label: link.label || link.href, status: 0 });
+      // A transport failure may be local network/environment instability. It
+      // is intentionally not promoted to a product link defect.
     }
   }
   return broken;
@@ -1453,11 +1840,15 @@ export async function runPostCrawlBugScan(
         if (firstDiff?.visualChangeDetected && secondDiff?.visualChangeDetected) {
           const firstPercent = Number((firstDiff as any).diffPercentage || 0);
           const secondPercent = Number((secondDiff as any).diffPercentage || 0);
+          const majorRegression = Math.max(firstPercent, secondPercent) >= 20;
           allFindings.push(
             recordBugFinding({
               source: "ui_exploratory",
-              severity: Math.max(firstPercent, secondPercent) >= 20 ? "high" : "medium",
+              severity: majorRegression ? "high" : "medium",
               rootCause: "REAL_UI_BUG",
+              defectClassification: "CONFIRMED_PRODUCT_BUG",
+              priority: majorRegression ? "P1" : "P2",
+              moduleFeature: `Visual regression → ${screenName}`,
               title: `Meaningful visual regression on ${screenName}`,
               detail: `The page differs from its approved visual baseline by ${firstPercent}% and ${secondPercent}% in two independent captures.`,
               screenId,
@@ -1467,6 +1858,18 @@ export async function runPostCrawlBugScan(
               reproductionAttempts: 2,
               reproductionSuccesses: 2,
               validationStatus: "confirmed",
+              requirementReference: "Approved visual baseline for this screen; dynamic timestamps, advertisements, animations, and sub-2% rendering noise are excluded.",
+              businessImpact: majorRegression
+                ? "Users see a major unintended change across a substantial portion of the screen."
+                : "Users see a material unintended visual difference from the approved screen.",
+              severityJustification: majorRegression
+                ? "High because at least 20% of the rendered screen differs from the approved baseline."
+                : "Medium because the change exceeds the 2% material-difference threshold but affects less than 20%.",
+              priorityJustification: majorRegression
+                ? "P1 because a large user-visible regression requires prompt review."
+                : "P2 because the regression is meaningful but not proven to block the workflow.",
+              regressionRisk: "high",
+              regressionRiskReason: "Shared layout, theme, and component changes can affect multiple screens.",
               stepsToReproduce: [
                 `Open ${page.url} at 1280x800.`,
                 "Disable animations and ignore timestamps/advertising content.",

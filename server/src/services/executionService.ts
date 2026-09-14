@@ -6,7 +6,12 @@ import { fileURLToPath } from "url";
 import { db } from "../db.js";
 import { recordTimeBreakdownForRun, updateFlakyFlagForScript } from "./reportingService.js";
 import { autoFileBugOnRegression, notifyAllOnRunComplete } from "./integrationsService.js";
-import { runBugScanForScreen, recordBugFinding, publishFailureEvidence } from "./bugDetectionService.js";
+import {
+  confirmHttpFinding,
+  runBugScanForScreen,
+  recordBugFinding,
+  publishFailureEvidence,
+} from "./bugDetectionService.js";
 import { decryptSecret } from "./secretsService.js";
 import { getEnvironment, preflightHealthCheck } from "./environmentsService.js";
 import { logAudit } from "./adminService.js";
@@ -975,6 +980,12 @@ export function runExecution(scriptId: string, targetUrl: string, input: any = {
           if (/net::err_|err_connection_refused|err_name_not_resolved|err_connection_timed_out|err_connection_reset|err_internet_disconnected/.test(m)) {
             return { failureClass: "environment_issue", failureLabel: "Target unreachable (network/environment issue, not a product defect)", failureCategory: "NETWORK_FAILURE" };
           }
+          if (/missing.*(?:env|credential|secret|token|baseurl)|no execution profile|browser executable.*not found|configuration/.test(m)) {
+            return { failureClass: "configuration_issue", failureLabel: "Required test configuration or credentials are unavailable", failureCategory: "CONFIGURATION_FAILURE" };
+          }
+          if (/invalid test data|fixture.*missing|test data.*(?:missing|invalid|expired)|record.*not found.*test/.test(m)) {
+            return { failureClass: "test_data_issue", failureLabel: "The supplied test data is invalid, unavailable, or expired", failureCategory: "TEST_DATA_FAILURE" };
+          }
           if (/401|403|unauthorized|forbidden|login required|session expired|not authenticated/.test(m) && /expect|status|goto|navigation/.test(m)) {
             return { failureClass: "environment_issue", failureLabel: "Authentication/session failure — not a locator issue", failureCategory: "AUTHENTICATION_FAILURE" };
           }
@@ -991,7 +1002,7 @@ export function runExecution(scriptId: string, targetUrl: string, input: any = {
             return { failureClass: "possible_bug", failureLabel: "Product bug — page showed an unexpected dialog (possible XSS or unhandled alert)", failureCategory: "JAVASCRIPT_ERROR" };
           }
           if (/expect\(.*\)\.|tohavetitle|tobevisible|tohavelength|assert/.test(m)) {
-            return { failureClass: "possible_bug", failureLabel: "Potential product defect — an application-state assertion failed and requires reproduction", failureCategory: "ASSERTION_FAILURE" };
+            return { failureClass: "uncertain", failureLabel: "Assertion mismatch — human or independent product validation is required", failureCategory: "ASSERTION_FAILURE" };
           }
           if (/outside of the viewport/.test(m)) {
             return { failureClass: "automation_issue", failureLabel: "Automation actionability failure — verify layout independently before reporting a UI defect", failureCategory: "LOCATOR_FAILURE" };
@@ -1111,7 +1122,7 @@ export function runExecution(scriptId: string, targetUrl: string, input: any = {
                   `Actual result: ${ft.failureLabel} -- ${ft.errorMessage || "no further error detail captured"}`,
                 ];
 
-                recordBugFinding({
+                const candidate = recordBugFinding({
                   source: "regression",
                   severity: "high",
                   rootCause:
@@ -1122,6 +1133,7 @@ export function runExecution(scriptId: string, targetUrl: string, input: any = {
                         : "REAL_PRODUCT_BUG",
                   priority: "P1",
                   validationStatus: "candidate",
+                  defectClassification: "UNCERTAIN",
                   title: `Requires product investigation: ${ft.title}`,
                   detail: ft.errorMessage || ft.failureLabel,
                   screenId: testCase?.screen_id ?? null,
@@ -1134,7 +1146,30 @@ export function runExecution(scriptId: string, targetUrl: string, input: any = {
                     browserSet,
                     expectedResult: testCase?.expected_result ?? null,
                   },
-                  stepsToReproduce: reproSteps,
+                  environment: {
+                    browser: browserSet,
+                    os: process.platform,
+                    viewport: "configured Playwright viewport",
+                    speedMode,
+                  },
+                  expectedResult: testCase?.expected_result || "The workflow should complete with the expected UI and API state.",
+                  actualResult: ft.errorMessage || ft.failureLabel,
+                  moduleFeature: testCase?.category ? `${testCase.category} → ${testCase.title}` : testCase?.title,
+                  requirementReference: testCase?.expected_result
+                    ? `Test case acceptance criterion: ${testCase.expected_result}`
+                    : "No explicit requirement available — evaluated against established product behavior that user workflows must not produce HTTP 5xx or uncaught JavaScript errors.",
+                  businessImpact: `The tested workflow "${ft.title}" did not reach its expected outcome in this execution.`,
+                  severityJustification: "High because the observed failure interrupted the tested workflow; confirmation is still pending.",
+                  priorityJustification: "P1 candidate pending independent validation because the workflow did not complete.",
+                  regressionRisk: "medium",
+                  regressionRiskReason: "The affected workflow may share UI and API components with related scenarios.",
+                  reproductionAttempts: 1,
+                  reproductionSuccesses: 1,
+                  affectedScenarios: [ft.title],
+                  stepsToReproduce: [
+                    ...reproSteps,
+                    "Reproduce manually or with an independent UI/API probe before promoting this candidate to a product defect.",
+                  ],
                   screenshotUrl,
                   videoUrl,
                 });

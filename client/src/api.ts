@@ -788,7 +788,15 @@ export interface ExecutionEvidenceRow {
   // Heuristic "why did this fail" bucket: 'automation_issue' (the script's own
   // locator/timeout), 'environment_issue' (target unreachable), 'possible_bug'
   // (a real content/behavior mismatch), or 'unknown'.
-  failure_class: "automation_issue" | "environment_issue" | "possible_bug" | "unknown" | null;
+  failure_class:
+    | "automation_issue"
+    | "environment_issue"
+    | "test_data_issue"
+    | "configuration_issue"
+    | "possible_bug"
+    | "uncertain"
+    | "unknown"
+    | null;
   failure_label: string | null;
   failure_category?: string | null;
   created_at: string;
@@ -797,7 +805,7 @@ export interface ExecutionEvidenceRow {
 export interface BugFindingRow {
   id: string;
   source: "ui_exploratory" | "api_fuzz" | "regression";
-  severity: "critical" | "high" | "medium" | "low";
+  severity: "blocker" | "critical" | "high" | "medium" | "low";
   title: string;
   detail: string;
   screen_id: string | null;
@@ -833,6 +841,26 @@ export interface BugFindingRow {
   fingerprint: string | null;
   occurrence_count: number;
   affected_scenarios_json: string;
+  defect_classification:
+    | "CONFIRMED_PRODUCT_BUG"
+    | "AUTOMATION_ISSUE"
+    | "ENVIRONMENT_ISSUE"
+    | "TEST_DATA_ISSUE"
+    | "CONFIGURATION_ISSUE"
+    | "UNCERTAIN";
+  module_feature: string | null;
+  requirement_reference: string | null;
+  business_impact: string | null;
+  severity_justification: string | null;
+  priority_justification: string | null;
+  suspected_root_cause: string | null;
+  regression_risk: "low" | "medium" | "high" | null;
+  regression_risk_reason: string | null;
+  suggested_fix: string | null;
+  ai_confidence: number;
+  ai_confidence_reason: string | null;
+  quality_gate_json: string;
+  duplicate_of_id: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -843,15 +871,25 @@ export interface QaDashboard {
   totalApiCallsAnalyzed: number;
   totalUiStatesAnalyzed: number;
   totalRealBugs: number;
+  blockerBugs: number;
   criticalBugs: number;
   highBugs: number;
   mediumBugs: number;
   lowBugs: number;
   automationFailures: number;
   environmentFailures: number;
+  testDataIssues: number;
+  configurationIssues: number;
   duplicateIssues: number;
   falsePositivesRejected: number;
   unknownRequiresInvestigation: number;
+  highestRiskDefects: Array<{
+    id: string;
+    title: string;
+    severity: BugFindingRow["severity"];
+    businessImpact: string | null;
+  }>;
+  coverageObservations: string[];
 }
 
 export interface EnvironmentRow {

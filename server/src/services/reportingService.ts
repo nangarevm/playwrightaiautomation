@@ -473,12 +473,28 @@ export interface BugReportPdfEntry {
   validationStatus?: "candidate" | "confirmed" | "rejected" | null;
   preconditions?: string[] | null;
   testData?: Record<string, unknown> | null;
+  defectClassification?: string | null;
+  requirementReference?: string | null;
+  businessImpact?: string | null;
+  severityJustification?: string | null;
+  priorityJustification?: string | null;
+  suspectedRootCause?: string | null;
+  regressionRisk?: string | null;
+  regressionRiskReason?: string | null;
+  suggestedFix?: string | null;
+  aiConfidence?: number | null;
+  aiConfidenceReason?: string | null;
+  affectedScenarios?: string[] | null;
+  occurrenceCount?: number | null;
 }
 
 const FAILURE_CLASS_BADGE: Record<string, string> = {
   possible_bug: "Product bug",
   automation_issue: "Automation script issue",
   environment_issue: "Environment issue",
+  test_data_issue: "Test data issue",
+  configuration_issue: "Configuration issue",
+  uncertain: "Uncertain — human review required",
   unknown: "Uncategorized",
 };
 
@@ -497,21 +513,28 @@ export function buildBugReportPdf(entries: BugReportPdfEntry[]): Promise<Buffer>
     doc.on("error", reject);
 
     const genuineBugs = entries.filter(
-      (e) => e.failureClass === "possible_bug" && e.validationStatus === "confirmed"
+      (e) => e.defectClassification === "CONFIRMED_PRODUCT_BUG" && e.validationStatus === "confirmed"
     );
     const investigations = entries.filter(
       (e) =>
-        (e.failureClass === "possible_bug" || e.failureClass === "unknown" || !e.failureClass) &&
-        e.validationStatus !== "confirmed"
+        (["possible_bug", "uncertain", "unknown"].includes(e.failureClass || "") || !e.failureClass) &&
+        e.validationStatus !== "confirmed" &&
+        e.validationStatus !== "rejected"
     );
-    const scriptIssues = entries.filter((e) => e.failureClass === "automation_issue" || e.failureClass === "environment_issue");
+    const falsePositives = entries.filter((e) => e.validationStatus === "rejected");
+    const automationIssues = entries.filter((e) => e.failureClass === "automation_issue");
+    const environmentIssues = entries.filter((e) => e.failureClass === "environment_issue");
+    const testDataIssues = entries.filter((e) => e.failureClass === "test_data_issue");
+    const configurationIssues = entries.filter((e) => e.failureClass === "configuration_issue");
+    const scriptIssues = [...automationIssues, ...environmentIssues, ...testDataIssues, ...configurationIssues];
+    const duplicateFindings = entries.reduce((sum, entry) => sum + Math.max(0, Number(entry.occurrenceCount || 1) - 1), 0);
 
     doc.fontSize(18).fillColor("#000").text("AI Test Automation Platform — Bug Report");
     doc.moveDown(0.3);
     doc.fontSize(10).fillColor("#555").text(`Generated ${new Date().toISOString()}`);
     doc.moveDown();
     doc.fontSize(11).fillColor("#000").text(
-      `${entries.length} issue(s): ${genuineBugs.length} confirmed product bug(s), ${investigations.length} requiring investigation, ${scriptIssues.length} automation/environment issue(s).`
+      `Tests/findings analyzed: ${entries.length} | Confirmed product bugs: ${genuineBugs.length} | Automation: ${automationIssues.length} | Environment: ${environmentIssues.length} | Test data: ${testDataIssues.length} | Configuration: ${configurationIssues.length} | Uncertain: ${investigations.length} | Duplicates merged: ${duplicateFindings} | False positives rejected: ${falsePositives.length}.`
     );
     doc.moveDown();
 
@@ -519,6 +542,7 @@ export function buildBugReportPdf(entries: BugReportPdfEntry[]): Promise<Buffer>
       doc.fontSize(12).fillColor("#000").text(e.title, { continued: false });
       const badge = FAILURE_CLASS_BADGE[e.failureClass ?? "unknown"] ?? "Uncategorized";
       doc.fontSize(9).fillColor("#b91c1c").text(badge);
+      if (e.defectClassification) doc.fontSize(9).fillColor("#333").text(`Classification: ${e.defectClassification}`);
       if (e.rootCause || e.priority || e.severity) {
         doc
           .fontSize(9)
@@ -536,8 +560,20 @@ export function buildBugReportPdf(entries: BugReportPdfEntry[]): Promise<Buffer>
         doc.fontSize(8).fillColor("#555").text(`Test data: ${JSON.stringify(e.testData)}`);
       }
       if (e.reproducibility) doc.fontSize(8).fillColor("#555").text(`Reproducibility: ${e.reproducibility}`);
+      if (e.aiConfidence != null) doc.fontSize(8).fillColor("#555").text(`AI confidence: ${e.aiConfidence}%`);
+      if (e.aiConfidenceReason) doc.fontSize(8).fillColor("#555").text(`Confidence basis: ${e.aiConfidenceReason}`);
+      if (e.requirementReference) doc.fontSize(9).fillColor("#333").text(`Requirement / acceptance criteria: ${e.requirementReference}`);
       if (e.expectedResult) doc.fontSize(9).fillColor("#166534").text(`Expected: ${e.expectedResult}`);
       if (e.actualResult) doc.fontSize(9).fillColor("#991b1b").text(`Actual: ${e.actualResult}`);
+      if (e.businessImpact) doc.fontSize(9).fillColor("#333").text(`User / business impact: ${e.businessImpact}`);
+      if (e.severityJustification) doc.fontSize(8).fillColor("#555").text(`Severity justification: ${e.severityJustification}`);
+      if (e.priorityJustification) doc.fontSize(8).fillColor("#555").text(`Priority justification: ${e.priorityJustification}`);
+      if (e.regressionRisk) {
+        doc.fontSize(8).fillColor("#555").text(`Regression risk: ${e.regressionRisk}${e.regressionRiskReason ? ` — ${e.regressionRiskReason}` : ""}`);
+      }
+      if (e.suspectedRootCause) doc.fontSize(8).fillColor("#555").text(e.suspectedRootCause);
+      if (e.suggestedFix) doc.fontSize(8).fillColor("#555").text(`SUGGESTED FIX — NOT CONFIRMED ROOT CAUSE: ${e.suggestedFix}`);
+      if (e.affectedScenarios?.length) doc.fontSize(8).fillColor("#555").text(`Affected scenarios: ${e.affectedScenarios.join("; ")}`);
       if (e.errorMessage) {
         doc.fontSize(8).fillColor("#7f1d1d").font("Courier").text(e.errorMessage.slice(0, 1000));
         doc.font("Helvetica");
@@ -569,10 +605,38 @@ export function buildBugReportPdf(entries: BugReportPdfEntry[]): Promise<Buffer>
 
     if (scriptIssues.length > 0) {
       doc.moveDown(0.4);
-      doc.fontSize(14).fillColor("#000").text("Automation / environment issues (not product bugs)");
+      doc.fontSize(14).fillColor("#000").text("Automation / environment / test-data / configuration issues (not product bugs)");
       doc.moveDown(0.3);
       scriptIssues.forEach(renderEntry);
     }
+
+    if (falsePositives.length > 0) {
+      doc.moveDown(0.4);
+      doc.fontSize(14).fillColor("#000").text("Rejected false positives");
+      doc.moveDown(0.3);
+      falsePositives.forEach(renderEntry);
+    }
+
+    if (genuineBugs.length > 0) {
+      const severityRank: Record<string, number> = { blocker: 5, critical: 4, high: 3, medium: 2, low: 1 };
+      const highestRisk = [...genuineBugs]
+        .sort((a, b) => (severityRank[b.severity || ""] || 0) - (severityRank[a.severity || ""] || 0))
+        .slice(0, 5);
+      doc.moveDown(0.4);
+      doc.fontSize(14).fillColor("#000").text("Highest-Risk Defects");
+      highestRisk.forEach((entry) =>
+        doc.fontSize(9).fillColor("#333").text(`• ${entry.title} — ${entry.severity || "unrated"}; ${entry.businessImpact || "impact not captured"}`)
+      );
+    }
+
+    doc.moveDown(0.4);
+    doc.fontSize(14).fillColor("#000").text("Coverage Observations");
+    doc
+      .fontSize(9)
+      .fillColor("#555")
+      .text(
+        `This report covers only the ${entries.length} supplied execution finding(s). Areas without execution or evidence are not claimed as tested. ${investigations.length} finding(s) require additional product-level validation.`
+      );
 
     doc.end();
   });
