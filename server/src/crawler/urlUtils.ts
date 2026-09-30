@@ -13,6 +13,16 @@ export function normalizeUrl(raw: string): string {
   return /^https?:\/\//i.test(raw) ? raw : `https://${raw}`;
 }
 
+/** Hash fragments that represent a real screen (hash-router or section page), not skip-to-content. */
+export function meaningfulPageHash(hash: string): string {
+  if (!hash || hash === "#") return "";
+  if (hash.startsWith("#/")) return hash.toLowerCase();
+  const h = hash.replace(/^#/, "").toLowerCase();
+  if (!h || /^(top|content|main|skip|header|footer|app|root)$/i.test(h)) return "";
+  if (/^[a-z][a-z0-9/_-]{1,80}$/i.test(h)) return `#${h}`;
+  return "";
+}
+
 export function dedupeKey(rawUrl: string): string {
   try {
     const u = new URL(rawUrl);
@@ -27,7 +37,8 @@ export function dedupeKey(rawUrl: string): string {
     params.sort();
     const search = params.toString();
     const pathname = u.pathname.replace(/\/+$/, "") || "/";
-    return `${u.origin}${pathname}${search ? `?${search}` : ""}`;
+    const hash = meaningfulPageHash(u.hash);
+    return `${u.origin}${pathname}${search ? `?${search}` : ""}${hash}`;
   } catch {
     return rawUrl;
   }
@@ -57,6 +68,21 @@ export function sameOrigin(a: string, b: string): boolean {
   } catch {
     return false;
   }
+}
+
+function hostWithoutWww(raw: string): string {
+  try {
+    return new URL(raw).hostname.replace(/^www\./i, "").toLowerCase();
+  } catch {
+    return "";
+  }
+}
+
+/** www and apex are the same site so nav links on either host are followed. */
+export function sameSite(a: string, b: string): boolean {
+  const ha = hostWithoutWww(a);
+  const hb = hostWithoutWww(b);
+  return Boolean(ha && hb && ha === hb);
 }
 
 export function originOf(rawUrl: string): string | null {

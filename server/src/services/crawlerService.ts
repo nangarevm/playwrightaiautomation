@@ -10,14 +10,17 @@ import { db } from "../db.js";
 import { runCrawl, type CrawlRunOutput } from "../crawler/index.js";
 import { KNOWN_COMPONENT_KINDS } from "../crawler/componentInventory.js";
 import { buildConsolidatedComponentScenario, buildScenariosForPage } from "../crawler/scenarios.js";
-import type { CoverageMode, ElementRecord } from "../crawler/types.js";
-import { scenarioFingerprint } from "../crawler/scenarioDedup.js";
+import { buildApiScenariosForSite } from "../crawler/apiScenarios.js";
+import type { ApiCallRecord, CoverageMode, ElementRecord, LiveDiscoveredPage } from "../crawler/types.js";
+import { scenarioFingerprint, dedupeScenariosFuzzy } from "../crawler/scenarioDedup.js";
 import { dedupeKey, normalizeUrl } from "../crawler/urlUtils.js";
 import { catalogScreen } from "./screensService.js";
 import { generateAutomationScript } from "./codegenService.js";
 import { logAudit, type CurrentUser } from "./adminService.js";
 import { runPostCrawlBugScan } from "./bugDetectionService.js";
 import { computePageFingerprint, getTestCaseFromCache, cacheTestCase, isCacheEnabled } from "./cacheService.js";
+import { hashElements } from "../crawler/diff.js";
+import { collectPageSpellingIssues } from "../crawler/spellcheck.js";
 import {
   isIncrementalCrawlEnabled,
   recordIncrementalCrawlCompletion,
@@ -134,7 +137,7 @@ function upsertSiteRow(url: string, captureApi: boolean, mode: "incremental" | "
       throw new Error("A crawl is already running for this site. Wait for it to finish or retry later.");
     }
     db.prepare(
-      "UPDATE crawl_sites SET status = 'running', current_page = NULL, error = NULL, is_rerun = 1, capture_api = ?, crawl_mode = ? WHERE id = ?"
+      "UPDATE crawl_sites SET status = 'running', current_page = NULL, error = NULL, is_rerun = 1, capture_api = ?, crawl_mode = ?, pages_discovered = 0, forms_discovered = 0, scenarios_discovered = 0 WHERE id = ?"
     ).run(captureApi ? 1 : 0, mode, existing.id);
     return { site: getSite(existing.id), isRerun: true };
   }
@@ -189,6 +192,99 @@ function siteInventoryCounts(siteId: string): {
   return { pages: rows.length, forms, scenarios, spellingIssues };
 }
 
+function persistLiveDiscoveredPage(siteId: string, discovered: LiveDiscoveredPage, coverageMode: CoverageMode) {
+  if (discovered.errorCategory === "CONTENT_TYPE_UNSUPPORTED") return;
+  if (
+    discovered.httpStatus === 429 ||
+    discovered.httpStatus === 403 ||
+    /too many requests/i.test(discovered.title || "")
+  ) {
+    return;
+  }
+  const now = new Date().toISOString();
+  const hash = hashElements(discovered.elements || []);
+  const existingPage = findPageByUrl(siteId, discovered.url);
+  const pageId = existingPage?.id || nanoid(10);
+  const formCount = discovered.formCount || 0;
+  const scenarios = dedupeScenariosFuzzy(
+    buildScenariosForPage(
+      discovered.title,
+      discovered.elements || [],
+      formCount,
+      discovered.url,
+      discovered.componentInventory || [],
+      coverageMode
+    )
+  );
+  const spelling = collectPageSpellingIssues(discovered.title, discovered.elements || []);
+  const tx = db.transaction(() => {
+    if (existingPage) {
+      db.prepare(
+        `UPDATE crawl_pages SET title = ?, dom_hash = ?, elements_json = ?, apis_json = ?, change_status = ?, spelling_issues_json = ?, component_inventory_json = ?, links_json = ?, last_seen_at = ?, updated_at = ?,
+         etag = COALESCE(?, etag), last_modified = COALESCE(?, last_modified), a11y_hash = COALESCE(?, a11y_hash), screenshot_hash = COALESCE(?, screenshot_hash), http_status = COALESCE(?, http_status)
+         WHERE id = ?`
+      ).run(
+        discovered.title,
+        hash,
+        JSON.stringify(discovered.elements || []),
+        JSON.stringify(discovered.apis || []),
+        discovered.reusedBaseline ? "unchanged" : "changed",
+        JSON.stringify(spelling),
+        JSON.stringify(discovered.componentInventory || []),
+        JSON.stringify(discovered.links || []),
+        now,
+        now,
+        discovered.etag ?? null,
+        discovered.lastModified ?? null,
+        discovered.a11yHash ?? null,
+        discovered.screenshotHash ?? null,
+        discovered.httpStatus ?? null,
+        pageId
+      );
+    } else {
+      db.prepare(
+        `INSERT INTO crawl_pages (id, site_id, url, title, dom_hash, screenshot_hash, elements_json, apis_json, change_status, diff_json, spelling_issues_json, component_inventory_json, links_json, last_seen_at, created_at, updated_at, etag, last_modified, a11y_hash, change_signals_json, http_status)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ).run(
+        pageId,
+        siteId,
+        discovered.url,
+        discovered.title,
+        hash,
+        discovered.screenshotHash ?? null,
+        JSON.stringify(discovered.elements || []),
+        JSON.stringify(discovered.apis || []),
+        "new",
+        JSON.stringify(spelling),
+        JSON.stringify(discovered.componentInventory || []),
+        JSON.stringify(discovered.links || []),
+        now,
+        now,
+        now,
+        discovered.etag ?? null,
+        discovered.lastModified ?? null,
+        discovered.a11yHash ?? null,
+        JSON.stringify(discovered.snapshot ? { snapshot: discovered.snapshot } : {}),
+        discovered.httpStatus ?? null
+      );
+    }
+    if (scenarios.length && !discovered.reusedBaseline) {
+      mergeScenariosForPage(siteId, pageId, scenarios, loadSiteScenarioFingerprints(siteId), now);
+    }
+    const inventory = siteInventoryCounts(siteId);
+    db.prepare(
+      "UPDATE crawl_sites SET pages_discovered = ?, forms_discovered = ?, scenarios_discovered = ?, current_page = ? WHERE id = ?"
+    ).run(inventory.pages, inventory.forms, inventory.scenarios, discovered.url, siteId);
+  });
+  tx();
+}
+
+export function failInterruptedCrawls() {
+  db.prepare(
+    "UPDATE crawl_sites SET status = 'failed', error = 'Server restarted during crawl' WHERE status = 'running'"
+  ).run();
+}
+
 // Runs the crawl to completion and persists everything. Callers (the route)
 // invoke this without awaiting so progress can be polled via getSite() while
 // it runs -- crawl_sites.status/current_page/*_discovered are updated live via
@@ -207,7 +303,7 @@ export async function startCrawl(params: {
 }): Promise<{ siteId: string; isRerun: boolean; mode: "incremental" | "full"; modeReason: string }> {
   const existing = findSiteByUrl(params.url);
   const { mode, reason: modeReason } = resolveRecrawlMode(existing, params.mode);
-  const { site, isRerun } = upsertSiteRow(params.url, Boolean(params.captureApi), mode);
+  const { site, isRerun } = upsertSiteRow(params.url, params.captureApi !== false, mode);
   const siteId = site.id;
   const knownUrls = isRerun ? knownUrlsForSite(siteId) : [];
 
@@ -257,6 +353,7 @@ export async function startCrawl(params: {
     };
   };
 
+  const coverageMode = params.coverageMode || (process.env.CRAWL_COVERAGE_MODE as CoverageMode) || "full";
   const startedAt = Date.now();
   console.info(
     `[crawler] start site=${siteId} mode=${mode} (${modeReason}) isRerun=${isRerun} maxPages=${effectiveMaxPages} known=${knownUrls.length}`
@@ -268,17 +365,26 @@ export async function startCrawl(params: {
       username: params.username,
       password: params.password,
       maxPages: effectiveMaxPages,
-      captureApi: params.captureApi,
+      captureApi: params.captureApi !== false,
       concurrency: params.concurrency,
       mode,
-      coverageMode: params.coverageMode || (process.env.CRAWL_COVERAGE_MODE as CoverageMode) || "full",
+      coverageMode,
       knownUrls,
+      onDiscoveredPage: (page) => {
+        try {
+          persistLiveDiscoveredPage(siteId, page, coverageMode);
+        } catch (err: any) {
+          console.warn(`[crawler] live scenario persist failed for ${page.url}: ${err?.message || err}`);
+        }
+      },
       onProgress: (p) => {
+        const inventory = siteInventoryCounts(siteId);
         db.prepare(
-          "UPDATE crawl_sites SET pages_discovered = ?, forms_discovered = ?, current_page = ?, last_progress_json = ? WHERE id = ?"
+          "UPDATE crawl_sites SET pages_discovered = ?, forms_discovered = ?, scenarios_discovered = ?, current_page = ?, last_progress_json = ? WHERE id = ?"
         ).run(
-          p.pagesDiscovered,
-          p.formsDiscovered,
+          Math.max(p.pagesDiscovered, inventory.pages),
+          Math.max(p.formsDiscovered, inventory.forms),
+          inventory.scenarios,
           p.currentPage,
           JSON.stringify({
             skippedHttp: p.skippedHttp ?? 0,
@@ -664,22 +770,168 @@ function persistCrawlResult(
     return summary;
   });
 
-  return tx();
+    const summary = tx();
+    try {
+      ensureApiCoverageScenarios(siteId);
+    } catch (err: any) {
+      console.warn(`[crawler] API scenario ensure skipped: ${err?.message || err}`);
+    }
+    return summary;
+}
+
+function synthesizeApiCallsFromPage(pageUrl: string, siteHost: string, page: { apis_json?: string; links_json?: string }): ApiCallRecord[] {
+  const captured = (() => {
+    try {
+      return JSON.parse(page.apis_json || "[]") as ApiCallRecord[];
+    } catch {
+      return [];
+    }
+  })();
+  if (captured.length > 0) return captured;
+
+  const synthesized: ApiCallRecord[] = [];
+  const seen = new Set<string>();
+  const add = (method: string, rawUrl: string, trigger: string) => {
+    try {
+      const parsed = new URL(rawUrl, pageUrl);
+      if (parsed.host !== siteHost) return;
+      const pathname = parsed.pathname || "/";
+      if (!/\/api\/|\/v\d+\/|\/graphql|\/rest\/|\/_api\/|\.json$/i.test(pathname)) return;
+      const key = `${method} ${pathname}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      synthesized.push({
+        trigger,
+        method,
+        endpoint: pathname,
+        host: siteHost,
+        schema: {},
+        status: 200,
+      });
+    } catch {
+      /* ignore unparseable hrefs */
+    }
+  };
+
+  add("GET", pageUrl, "page load");
+  try {
+    const links = JSON.parse(page.links_json || "[]") as Array<{ href?: string; url?: string }>;
+    for (const link of links.slice(0, 40)) {
+      add("GET", String(link.href || link.url || ""), "same-origin link");
+    }
+  } catch {
+    /* ignore */
+  }
+  if (synthesized.length === 0) {
+    try {
+      const parsed = new URL(pageUrl);
+      synthesized.push({
+        trigger: "page HTTP health",
+        method: "GET",
+        endpoint: parsed.pathname || "/",
+        host: siteHost,
+        schema: {},
+        status: 200,
+      });
+    } catch {
+      /* ignore */
+    }
+  }
+  return synthesized;
+}
+
+/** Persist API scenarios from captured XHR/fetch (and API-looking links) so Generate+Run is not UI-only. */
+export function ensureApiCoverageScenarios(siteId: string): { added: number } {
+  const site = getSite(siteId);
+  if (!site) return { added: 0 };
+  let siteHost = "";
+  try {
+    siteHost = new URL(normalizeUrl(site.url)).host;
+  } catch {
+    return { added: 0 };
+  }
+
+  const pages = db
+    .prepare("SELECT * FROM crawl_pages WHERE site_id = ? AND change_status != 'removed'")
+    .all(siteId) as any[];
+  const apiInput = pages.map((page) => ({
+    url: page.url,
+    apis: synthesizeApiCallsFromPage(page.url, siteHost, page),
+  }));
+  const byPage = buildApiScenariosForSite(siteHost, apiInput);
+  if (byPage.size === 0) {
+    for (const page of pages) {
+      try {
+        const pathname = new URL(page.url).pathname || "/";
+        const key = `GET ${pathname}`;
+        byPage.set(page.url, [
+          {
+            id: nanoid(10),
+            title: `Verify ${key} returns a successful HTTP response`,
+            type: "api",
+            tier: "functional",
+            flowGroup: key,
+            steps: [
+              `Given the API endpoint "${key}" was observed during the crawl (triggered by: page HTTP health)`,
+              `When a GET request is sent to "${pathname}"`,
+              "Then the response status matches the observed HTTP 200",
+              "And the response matches the observed response schema: {}",
+            ],
+            locators: [],
+          },
+        ]);
+      } catch {
+        /* skip */
+      }
+    }
+  }
+  if (byPage.size === 0) return { added: 0 };
+
+  const now = new Date().toISOString();
+  let added = 0;
+  const tx = db.transaction(() => {
+    const siteFingerprints = loadSiteScenarioFingerprints(siteId);
+    for (const page of pages) {
+      const incoming = byPage.get(page.url);
+      if (!incoming?.length) continue;
+      const existing = db
+        .prepare("SELECT * FROM crawl_scenarios WHERE page_id = ? AND status = 'active'")
+        .all(page.id) as any[];
+      const existingRecords = existing.map((row) => ({
+        id: row.id,
+        title: row.title,
+        type: row.type,
+        tier: row.tier || "functional",
+        flowGroup: row.flow_group,
+        steps: JSON.parse(row.steps_json),
+        locators: JSON.parse(row.locators_json || "[]"),
+      }));
+      const before = existingRecords.filter((row) => row.type === "api").length;
+      mergeScenariosForPage(siteId, page.id, [...existingRecords, ...incoming], siteFingerprints, now);
+      const after = (
+        db
+          .prepare("SELECT COUNT(*) as c FROM crawl_scenarios WHERE page_id = ? AND status = 'active' AND type = 'api'")
+          .get(page.id) as { c: number }
+      ).c;
+      added += Math.max(0, after - before);
+    }
+    const totalScenarios = (
+      db.prepare("SELECT COUNT(*) as c FROM crawl_scenarios WHERE site_id = ? AND status = 'active'").get(siteId) as { c: number }
+    ).c;
+    db.prepare("UPDATE crawl_sites SET scenarios_discovered = ? WHERE id = ?").run(totalScenarios, siteId);
+  });
+  tx();
+  return { added };
 }
 
 const SYSTEM_CRAWLER_ACTOR: CurrentUser = { id: "crawler-system", name: "Crawler System", role: "QA Lead" };
 
-/** After crawl: generate only smoke + flow scripts by default (token-efficient). */
-export async function autoGenerateRegressionTests(siteId: string, limit = 60): Promise<{ generated: number; skipped: number }> {
+/** After crawl: generate every active scenario so the UI can run the full suite. */
+export async function autoGenerateRegressionTests(siteId: string, limit = 80): Promise<{ generated: number; skipped: number }> {
   const scenarios = db
     .prepare(
       `SELECT id FROM crawl_scenarios
        WHERE site_id = ? AND status = 'active' AND generated_test_case_id IS NULL
-         AND (
-           tier = 'smoke'
-           OR type = 'flow'
-           OR (tier = 'regression' AND type = 'positive')
-         )
        ORDER BY CASE
          WHEN tier = 'smoke' THEN 0
          WHEN type = 'flow' THEN 1
@@ -920,6 +1172,7 @@ export function rebuildCoverageScenarios(siteId: string, coverageMode: CoverageM
         if (desiredFps.has(fp)) continue;
         // Keep a small set of existing flows (nav graph isn't rebuilt here).
         if (row.type === "flow" && flowKeepIds.has(row.id)) continue;
+        if (row.type === "api") continue;
         db.prepare(
           "UPDATE crawl_scenarios SET status = 'soft_deleted', deleted_at = ?, updated_at = ? WHERE id = ?"
         ).run(now, now, row.id);
@@ -968,8 +1221,8 @@ export function rebuildCoverageScenarios(siteId: string, coverageMode: CoverageM
     db.prepare("UPDATE crawl_sites SET scenarios_discovered = ? WHERE id = ?").run(totalScenarios, siteId);
   });
   tx();
-
-  return { siteId, coverageMode, added, retired, pagesUpdated };
+  const apiAdded = ensureApiCoverageScenarios(siteId).added;
+  return { siteId, coverageMode, added: added + apiAdded, retired, pagesUpdated };
 }
 
 function parseScenarioRow(row: any) {
@@ -1074,8 +1327,27 @@ function scenarioCategoryFor(scenario: { type: string; tier?: string }): string 
 // end-to-end rather than building a parallel one.
 export async function generateTestsFromScenarios(scenarioIds: string[], actorUser: any) {
   const results: Array<{ scenarioId: string; ok: boolean; testCaseId?: string; scriptFile?: string; error?: string }> = [];
+  const first = scenarioIds
+    .map((id) => db.prepare("SELECT site_id FROM crawl_scenarios WHERE id = ?").get(id) as { site_id: string } | undefined)
+    .find(Boolean);
+  const idsToGenerate = [...scenarioIds];
+  if (first?.site_id) {
+    try {
+      ensureApiCoverageScenarios(first.site_id);
+      const extraApi = db
+        .prepare(
+          "SELECT id FROM crawl_scenarios WHERE site_id = ? AND type = 'api' AND status = 'active' AND generated_test_case_id IS NULL"
+        )
+        .all(first.site_id) as Array<{ id: string }>;
+      for (const row of extraApi) {
+        if (!idsToGenerate.includes(row.id)) idsToGenerate.push(row.id);
+      }
+    } catch {
+      /* generation still proceeds with existing scenarios */
+    }
+  }
 
-  for (const scenarioId of scenarioIds) {
+  for (const scenarioId of idsToGenerate) {
     const scenario = db.prepare("SELECT * FROM crawl_scenarios WHERE id = ? AND status = 'active'").get(scenarioId) as any;
     if (!scenario) {
       results.push({ scenarioId, ok: false, error: "Scenario not found or already deleted" });

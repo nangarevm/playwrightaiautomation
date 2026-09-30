@@ -32,7 +32,7 @@ export default function Crawler() {
   const [multiUrls, setMultiUrls] = useState("");
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
-  const [captureApi, setCaptureApi] = useState(false);
+  const [captureApi, setCaptureApi] = useState(true);
   /** auto = server decides (diff on re-crawl); incremental/full = force */
   const [crawlMode, setCrawlMode] = useState<"auto" | "incremental" | "full">("auto");
   /** minimal = few scenarios/page covering load + components + primary flow (saves LLM tokens) */
@@ -152,6 +152,30 @@ export default function Crawler() {
     }, 400);
     return () => clearTimeout(handle);
   }, [url]);
+
+  // If this URL was already crawled, load every discovered page and test so
+  // the list is visible without requiring another crawl.
+  useEffect(() => {
+    const existing = knownSite?.site;
+    if (!knownSite?.known || !existing?.id || existing.status !== "completed") return;
+    if (site?.id === existing.id && detail) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const s = await api.crawlerGetSite(existing.id);
+        const d = await api.crawlerGetSiteDetail(existing.id);
+        if (cancelled) return;
+        setSite(s);
+        setDetail(d);
+        setDiscoveredPages((d.pages || []).map((p) => ({ url: p.url, title: p.title || p.url })));
+      } catch {
+        /* keep the form usable if history lookup fails */
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [knownSite?.site?.id, knownSite?.site?.status]);
 
   function stopPolling() {
     if (pollRef.current) {
@@ -378,18 +402,14 @@ export default function Crawler() {
   // the user has filtered out of view.
   function selectAll() {
     if (!detail) return;
-    const ids = detail.pages.flatMap((p) =>
-      p.scenarios.filter((s) => !s.generated_test_case_id && scenarioVisible(s)).map((s) => s.id)
-    );
+    const ids = detail.pages.flatMap((p) => p.scenarios.filter(scenarioVisible).map((s) => s.id));
     setSelected(new Set(ids));
   }
 
   // Select all scenarios from all pages (convenience for full crawl testing)
   function selectAllPages() {
     if (!detail) return;
-    const ids = detail.pages.flatMap((p) =>
-      p.scenarios.filter((s) => !s.generated_test_case_id).map((s) => s.id)
-    );
+    const ids = detail.pages.flatMap((p) => p.scenarios.map((s) => s.id));
     setSelected(new Set(ids));
   }
 
@@ -524,7 +544,10 @@ export default function Crawler() {
   }
 
   async function generateRunAndReport() {
-    if (selected.size === 0) return;
+    const idsToRun = (detail?.pages.flatMap((p) => p.scenarios.map((s) => s.id)) ?? []).filter(Boolean);
+    const runIds = idsToRun.length > 0 ? idsToRun : Array.from(selected);
+    if (runIds.length === 0) return;
+    setSelected(new Set(runIds));
     setBusy("generate-run-report");
     setGenResults(null);
     setRunStatuses({});
@@ -535,61 +558,85 @@ export default function Crawler() {
     const startedAt = Date.now() - 5000;
     setBatchStartedAt(startedAt);
     try {
-      setProgressMessage(`Generating ${selected.size} test script(s)…`);
-      const { results } = await api.crawlerGenerateTests(Array.from(selected));
+      setProgressMessage(`Generating ${runIds.length} test script(s)…`);
+      const { results } = await api.crawlerGenerateTests(runIds);
       setGenResults(results);
       setDownloadSelected(new Set(results.filter((r: any) => r.ok && r.testCaseId).map((r: any) => r.testCaseId)));
       await refreshDetail();
 
       const runnable = results.filter((r: any) => r.ok && r.testCaseId);
-      let completed = 0;
-      for (const r of runnable) {
-        setProgressMessage(`Running test ${completed + 1} of ${runnable.length}: ${r.scriptFile || r.testCaseId}…`);
+      const workerCount = Math.max(2, Math.min(5, runnable.length || 2));
+      setProgressMessage(`Running ${runnable.length} test(s) with ${workerCount} workers; failed tests retry once before a hard fail…`);
+
+      const recordFailure = async (testCaseId: string, scriptFile: string | undefined, runResult: any) => {
+        try {
+          const evidence = await api.getExecutionEvidence(runResult.run.id);
+          const first = evidence[0];
+          const rawClass = first?.failure_class ?? null;
+          const failureClass =
+            rawClass === "uncertain" || rawClass === "unknown" || !rawClass
+              ? /locator|timeout|selector|waiting for/i.test(first?.error_message || "")
+                ? "automation_issue"
+                : "possible_bug"
+              : rawClass;
+          setCrawlFailures((prev) => [
+            ...prev.filter((f) => f.testCaseId !== testCaseId),
+            {
+              testCaseId,
+              title: first?.test_title || scriptFile || testCaseId,
+              errorMessage: first?.error_message ?? null,
+              reportUrl: runResult.reportUrl,
+              runId: runResult.run.id,
+              failureClass,
+              failureLabel: first?.failure_label ?? null,
+            },
+          ]);
+        } catch {
+          // Evidence lookup is best-effort -- the pass/fail pill above already reflects the outcome.
+        }
+      };
+
+      const runOne = async (r: any) => {
         setRunStatuses((prev) => ({ ...prev, [r.testCaseId]: { state: "running" } }));
         try {
           const runResult = await triggerUltrafastWithRetry(r.testCaseId, url.trim());
           if (!runResult.run) {
-            // FR-4.26: a critical-path case routed to second-reviewer sign-off, or
-            // below the confidence threshold -- genuinely not run yet, not a failure.
             setRunStatuses((prev) => ({ ...prev, [r.testCaseId]: { state: "needs_review" } }));
-          } else {
-            const status = runResult.run.status as string;
-            const state = status === "passed" ? "passed" : status === "failed" ? "failed" : "error";
-            setRunStatuses((prev) => ({
-              ...prev,
-              [r.testCaseId]: {
-                state,
-                durationMs: runResult.run.durationMs,
-                reportUrl: runResult.reportUrl,
-                runId: runResult.run.id,
-              },
-            }));
-            if (state === "failed" || state === "error") {
-              try {
-                const evidence = await api.getExecutionEvidence(runResult.run.id);
-                const first = evidence[0];
-                setCrawlFailures((prev) => [
-                  ...prev,
-                  {
-                    testCaseId: r.testCaseId,
-                    title: first?.test_title || r.scriptFile || r.testCaseId,
-                    errorMessage: first?.error_message ?? null,
-                    reportUrl: runResult.reportUrl,
-                    runId: runResult.run.id,
-                    failureClass: first?.failure_class ?? null,
-                    failureLabel: first?.failure_label ?? null,
-                  },
-                ]);
-              } catch {
-                // Evidence lookup is best-effort -- the pass/fail pill above already reflects the outcome.
-              }
-            }
+            return;
           }
+          const status = runResult.run.status as string;
+          const state = status === "passed" ? "passed" : status === "failed" ? "failed" : "error";
+          setRunStatuses((prev) => ({
+            ...prev,
+            [r.testCaseId]: {
+              state,
+              durationMs: runResult.run.durationMs,
+              reportUrl: runResult.reportUrl,
+              runId: runResult.run.id,
+            },
+          }));
+          if (state === "passed") {
+            setCrawlFailures((prev) => prev.filter((f) => f.testCaseId !== r.testCaseId));
+            return;
+          }
+          await recordFailure(r.testCaseId, r.scriptFile, runResult);
         } catch (runErr: any) {
           setRunStatuses((prev) => ({ ...prev, [r.testCaseId]: { state: "trigger_failed", error: runErr.message } }));
         }
-        completed++;
-      }
+      };
+
+      let cursor = 0;
+      const workers = Array.from({ length: Math.min(workerCount, runnable.length) }, async () => {
+        while (cursor < runnable.length) {
+          const index = cursor++;
+          const item = runnable[index];
+          setProgressMessage(
+            `Running ${index + 1}/${runnable.length} · ${item.scriptFile || item.testCaseId} (${workerCount} workers; failed tests retry once)`
+          );
+          await runOne(item);
+        }
+      });
+      await Promise.all(workers);
 
       // Last step: build the Allure report for this crawl automatically -- no
       // separate click required. AllureReportPanel does the actual generate
@@ -641,18 +688,15 @@ export default function Crawler() {
     }
   }
 
-  // First-time friendly: after a crawl finishes, pre-select every new scenario so
-  // "Run all tests" works without manual checkbox hunting.
+  // After a crawl finishes, select every scenario (including already generated)
+  // so "Run all tests" covers the full suite, not only smoke leftovers.
   useEffect(() => {
     if (site?.status !== "completed" || !detail) return;
-    const ids = detail.pages.flatMap((p) =>
-      p.scenarios.filter((s) => !s.generated_test_case_id).map((s) => s.id)
-    );
+    const ids = detail.pages.flatMap((p) => p.scenarios.map((s) => s.id));
     if (ids.length === 0) return;
-    setSelected((prev) => (prev.size === 0 ? new Set(ids) : prev));
-    // Collapse every page card — keeps the list scannable until the user expands one.
-    setCollapsedPageIds(new Set(detail.pages.map((p) => p.id)));
-  }, [site?.status, detail?.pages.length]);
+    setSelected(new Set(ids));
+    setDiscoveredPages(detail.pages.map((p) => ({ url: p.url, title: p.title || p.url })));
+  }, [site?.status, detail?.pages.length, detail?.pages.reduce((n, p) => n + p.scenarios.length, 0)]);
 
   const allScenarios = detail?.pages.flatMap((p) => p.scenarios) ?? [];
   const uiScenarioCount = allScenarios.filter((s) => s.type !== "api").length;
@@ -756,7 +800,7 @@ export default function Crawler() {
             </div>
             <label className="flex items-center gap-2 text-ink/70">
               <input type="checkbox" checked={captureApi} onChange={(e) => setCaptureApi(e.target.checked)} />
-              Also test API calls (slower crawl)
+              Capture and generate API tests (recommended)
             </label>
             <div className="flex flex-wrap items-center gap-2">
               <span className="text-ink/60">Re-crawl:</span>
@@ -867,10 +911,10 @@ export default function Crawler() {
                 <button
                   type="button"
                   className="rounded-md bg-ink text-paper px-4 py-2 text-sm font-medium disabled:opacity-40"
-                  disabled={selected.size === 0 || busy === "generate-run-report"}
+                  disabled={allScenarios.length === 0 || busy === "generate-run-report"}
                   onClick={generateRunAndReport}
                 >
-                  {busy === "generate-run-report" ? "Running tests…" : `Run all tests (${selected.size})`}
+                  {busy === "generate-run-report" ? "Running tests…" : `Run all tests (${allScenarios.length})`}
                 </button>
               </div>
             )}
@@ -902,6 +946,29 @@ export default function Crawler() {
                 ? ` · sitemap +${detail.site.recrawl_summary.sitemapAdded ?? 0}/-${detail.site.recrawl_summary.sitemapRemoved ?? 0}`
                 : ""}
             </p>
+          )}
+          {(detail?.pages.length || discoveredPages.length) > 0 && (
+            <div className="pt-2 space-y-1.5">
+              <p className="text-xs font-medium text-ink/70">
+                Discovered pages ({detail?.pages.length || discoveredPages.length})
+              </p>
+              <ul className="space-y-1 max-h-56 overflow-auto">
+                {(detail?.pages?.length ? detail.pages : discoveredPages.map((p, i) => ({ id: String(i), ...p, scenarios: [] as { id: string }[] }))).map((p) => (
+                  <li
+                    key={p.id || p.url}
+                    className="flex items-center justify-between gap-2 rounded-md border border-line/70 bg-white/70 px-2.5 py-1.5 text-xs"
+                  >
+                    <span className="min-w-0">
+                      <span className="block truncate font-medium" title={p.url}>{p.title || p.url}</span>
+                      <span className="block truncate text-ink/40" title={p.url}>{p.url}</span>
+                    </span>
+                    <span className="text-ink/45 shrink-0">
+                      {"scenarios" in p && Array.isArray(p.scenarios) ? `${p.scenarios.length} tests` : ""}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            </div>
           )}
           {site.status === "completed" && detail && (
             <div className="flex flex-wrap items-center gap-2 pt-1">
@@ -943,7 +1010,7 @@ export default function Crawler() {
         <div className="rounded-lg border border-line bg-white/60 shadow-panel p-3 space-y-3">
           <div className="flex items-center justify-between flex-wrap gap-2">
             <p className="text-sm font-medium">
-              {selected.size} of {allScenarios.filter((s) => !s.generated_test_case_id).length} tests selected
+              {selected.size} of {allScenarios.length} tests selected
             </p>
             <div className="flex gap-2 flex-wrap text-xs">
               <button className="rounded-md border border-ink/20 text-ink/70 px-2.5 py-1" onClick={selectAllPages}>
@@ -1037,7 +1104,7 @@ export default function Crawler() {
                         {visibleScenarios.map((s) => (
                           <li key={s.id} className="flex items-center justify-between gap-2 rounded border border-line/70 px-2 py-1.5 text-xs">
                             <label className="flex items-center gap-2 min-w-0 flex-1">
-                              <input type="checkbox" checked={selected.has(s.id)} onChange={() => toggle(s.id)} disabled={Boolean(s.generated_test_case_id)} />
+                              <input type="checkbox" checked={selected.has(s.id)} onChange={() => toggle(s.id)} />
                               <span className="truncate font-medium" title={s.title}>{s.title}</span>
                               {s.generated_test_case_id && <Pill tone="neutral">done</Pill>}
                             </label>

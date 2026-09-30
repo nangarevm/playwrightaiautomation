@@ -27,6 +27,26 @@ export interface CrawlOptions {
   /** Baseline lookup used during discovery for early unchanged short-circuit (incremental mode). */
   getBaseline?: (url: string) => PageBaselineMeta | null;
   onProgress?: (progress: CrawlProgress) => void;
+  /** Persist a page (and its scenarios) as soon as it is scanned so the UI is not stuck at 0 tests. */
+  onDiscoveredPage?: (page: LiveDiscoveredPage) => void | Promise<void>;
+}
+
+export interface LiveDiscoveredPage {
+  url: string;
+  title: string;
+  elements: ElementRecord[];
+  apis?: ApiCallRecord[];
+  formCount: number;
+  componentInventory?: ComponentInventoryItem[];
+  reusedBaseline?: boolean;
+  screenshotHash?: string | null;
+  etag?: string | null;
+  lastModified?: string | null;
+  a11yHash?: string | null;
+  links?: Array<{ url: string; label: string }>;
+  snapshot?: PageSnapshot;
+  httpStatus?: number | null;
+  errorCategory?: string | null;
 }
 
 /** How many scenarios the crawler should emit per page / site. */

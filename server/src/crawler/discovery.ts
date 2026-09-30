@@ -11,12 +11,12 @@ import { loginIfCredentialsProvided } from "./auth.js";
 import { discoverPageInteractions } from "./interaction.js";
 import { collectComponentInventory } from "./componentInventory.js";
 import { attachNetworkCapture } from "./network.js";
-import { dedupeKey, isHtmlDocumentUrl, isPaginationUrl, normalizeUrl, originOf, sameOrigin } from "./urlUtils.js";
+import { dedupeKey, isHtmlDocumentUrl, isPaginationUrl, meaningfulPageHash, normalizeUrl, originOf, sameSite } from "./urlUtils.js";
 import { structureMatches, hashA11yTree, hashScreenshotBuffer } from "./diff.js";
 import { decideCheapSkip, fetchRobotsDisallows, fetchSitemapEntries, isRobotsDisallowed, probeHttpCache } from "./cheapChangeDetection.js";
 import { loadPageWithOptimizedStrategy } from "../services/timeoutOptimizationService.js";
 
-export { dedupeKey, normalizeUrl, sameOrigin } from "./urlUtils.js";
+export { dedupeKey, normalizeUrl, sameOrigin, sameSite } from "./urlUtils.js";
 
 export interface DiscoveredPage {
   url: string;
@@ -72,11 +72,21 @@ async function extractLinks(page: import("playwright").Page, baseUrl: string): P
         if (!href) return;
         out.push({ href, label: label.replace(/\s+/g, " ").trim().slice(0, 80), method });
       };
-      for (const el of Array.from(document.querySelectorAll("a[href], area[href], [role='link'][href]"))) {
+      for (const el of Array.from(document.querySelectorAll("a, area, [role='link'], nav a, header a, [role='navigation'] a"))) {
         const a = el as HTMLAnchorElement;
+        const href =
+          a.getAttribute("href") ||
+          a.getAttribute("data-href") ||
+          a.getAttribute("data-url") ||
+          a.getAttribute("data-to") ||
+          a.href ||
+          "";
+        if (!href && !a.id) continue;
         const rel = (a.getAttribute("rel") || "").toLowerCase();
-        const method = rel.includes("next") ? "pagination" : "html_link";
-        push(a.href, a.getAttribute("aria-label") || a.textContent || "", method);
+        const inNav = Boolean(a.closest("nav, header, [role='navigation']"));
+        const method = rel.includes("next") ? "pagination" : inNav ? "nav_link" : "html_link";
+        const label = a.getAttribute("aria-label") || a.textContent || a.id || "";
+        push(href || `#${a.id}`, `${label}`.trim(), method);
       }
       for (const el of Array.from(document.querySelectorAll("link[rel='canonical'][href]"))) {
         push((el as HTMLLinkElement).href, "canonical", "canonical");
@@ -101,7 +111,7 @@ async function extractLinks(page: import("playwright").Page, baseUrl: string): P
     try {
       if (/^(mailto|tel|javascript|data):/i.test(href)) continue;
       const url = new URL(href, baseUrl);
-      if (url.hash && !url.hash.startsWith("#/")) url.hash = "";
+      if (url.hash && !meaningfulPageHash(url.hash)) url.hash = "";
       if (/\.xml$/i.test(url.pathname) || /sitemap/i.test(url.pathname)) continue;
       if (!isHtmlDocumentUrl(url.toString())) continue;
       const key = dedupeKey(url.toString());
@@ -120,6 +130,124 @@ export interface ExtractedLink {
   url: string;
   label: string;
   method?: string;
+}
+
+const SKIP_NAV_LABEL = /^(skip to content|skip|search|close|menu|open menu|previous slide|next slide)$/i;
+
+function navSlug(label: string): string {
+  return (label || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-|-$/g, "");
+}
+
+function inferredNavUrls(baseUrl: string, label: string, elementId = ""): string[] {
+  try {
+    const origin = new URL(baseUrl).origin;
+    const idHandle = elementId.match(/HeaderMenu-(.+)$/i)?.[1];
+    if (idHandle && !/^(home|homepage)$/i.test(idHandle)) {
+      return [`${origin}/pages/${idHandle.toLowerCase()}`];
+    }
+    const slug = navSlug(label);
+    if (!slug || slug.length < 3 || SKIP_NAV_LABEL.test(slug) || slug === "home" || slug === "homepage") return [];
+    if (/^\d[\d-]*$/.test(slug)) return [];
+    return [`${origin}/pages/${slug}`];
+  } catch {
+    return [];
+  }
+}
+
+async function extractLinksViaLocators(page: import("playwright").Page, baseUrl: string): Promise<ExtractedLink[]> {
+  const rows = await page
+    .locator("a, area, [role='link'], nav a, header a, [role='navigation'] a")
+    .evaluateAll((els) =>
+      els.slice(0, 250).map((el) => ({
+        href:
+          el.getAttribute("href") ||
+          el.getAttribute("data-href") ||
+          el.getAttribute("data-url") ||
+          el.getAttribute("data-to") ||
+          (el as HTMLAnchorElement).href ||
+          "",
+        label: (el.getAttribute("aria-label") || (el as HTMLElement).innerText || el.id || "").replace(/\s+/g, " ").trim().slice(0, 80),
+        id: el.id || "",
+        method: el.closest("nav, header, [role='navigation']") ? "nav_link" : "html_link",
+      }))
+    )
+    .catch(() => [] as Array<{ href: string; label: string; id: string; method: string }>);
+
+  const resolved: ExtractedLink[] = [];
+  const seen = new Set<string>();
+  for (const row of rows) {
+    if (SKIP_NAV_LABEL.test(row.label)) continue;
+    const candidates = [row.href, ...inferredNavUrls(baseUrl, row.label, row.id)].filter(Boolean);
+    for (const raw of candidates) {
+      try {
+        if (/^(mailto|tel|javascript|data):/i.test(raw)) continue;
+        const url = new URL(raw, baseUrl);
+        if (url.hash && !meaningfulPageHash(url.hash)) url.hash = "";
+        if (!isHtmlDocumentUrl(url.toString())) continue;
+        const key = dedupeKey(url.toString());
+        if (seen.has(key)) continue;
+        seen.add(key);
+        resolved.push({
+          url: url.toString(),
+          label: row.label || url.pathname,
+          method: raw === row.href ? row.method : "nav_infer",
+        });
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+  return resolved;
+}
+
+async function discoverNavDestinations(page: import("playwright").Page, startUrl: string): Promise<ExtractedLink[]> {
+  const found: ExtractedLink[] = [];
+  const seen = new Set<string>([dedupeKey(startUrl)]);
+  const nav = page.locator("nav a, header a, [role='navigation'] a, a[id^='HeaderMenu-']");
+  const count = Math.min(await nav.count().catch(() => 0), 12);
+  for (let i = 0; i < count; i++) {
+    const el = nav.nth(i);
+    const label = ((await el.innerText().catch(() => "")) || (await el.getAttribute("aria-label").catch(() => "")) || "")
+      .replace(/\s+/g, " ")
+      .trim();
+    if (!label || SKIP_NAV_LABEL.test(label)) continue;
+    const before = page.url();
+    await el.click({ timeout: 2500 }).catch(() => undefined);
+    await page.waitForLoadState("domcontentloaded").catch(() => undefined);
+    await page.waitForTimeout(350);
+    const after = page.url();
+    if (after && sameSite(after, startUrl)) {
+      const key = dedupeKey(after);
+      if (!seen.has(key)) {
+        seen.add(key);
+        found.push({ url: after, label, method: "nav_click" });
+      }
+    }
+    if (dedupeKey(page.url()) !== dedupeKey(startUrl)) {
+      await page.goto(startUrl, { waitUntil: "domcontentloaded", timeout: 15000 }).catch(() => undefined);
+      await page.waitForTimeout(200);
+    } else if (before !== after) {
+      await page.goto(startUrl, { waitUntil: "domcontentloaded", timeout: 15000 }).catch(() => undefined);
+    }
+  }
+  return found;
+}
+
+function mergeExtractedLinks(...groups: ExtractedLink[][]): ExtractedLink[] {
+  const seen = new Set<string>();
+  const out: ExtractedLink[] = [];
+  for (const group of groups) {
+    for (const link of group) {
+      const key = dedupeKey(link.url);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(link);
+    }
+  }
+  return out;
 }
 
 async function dismissConsentOverlays(page: import("playwright").Page): Promise<void> {
@@ -312,7 +440,7 @@ export async function runDiscoveryCrawl(options: CrawlOptions): Promise<{
     const enqueue = (rawUrl: string, parent: string | null, method: string) => {
       try {
         if (!isHtmlDocumentUrl(rawUrl)) return;
-        if (!sameOrigin(rawUrl, normalizedUrl)) {
+        if (!sameSite(rawUrl, normalizedUrl)) {
           externalLinkCount += 1;
           return;
         }
@@ -386,6 +514,16 @@ export async function runDiscoveryCrawl(options: CrawlOptions): Promise<{
       });
     };
 
+    const recordPage = async (page: DiscoveredPage) => {
+      results.push(page);
+      try {
+        await options.onDiscoveredPage?.(page);
+      } catch (err: any) {
+        console.warn(`[crawler] live persist failed for ${page.url}: ${err?.message || err}`);
+      }
+      emitProgress(page.url);
+    };
+
     while (queue.length > 0 && results.length < maxPages) {
       const batch: string[] = [];
       while (queue.length > 0 && batch.length < concurrency && results.length + batch.length < maxPages) {
@@ -433,7 +571,7 @@ export async function runDiscoveryCrawl(options: CrawlOptions): Promise<{
             sitemapLastmod: sitemapLastmod.get(key) ?? null,
             priorLastSeen: baseline.lastSeenAt ?? null,
           });
-          if (decision.skip) {
+          if (decision.skip && (baseline.links?.length ?? 0) > 0) {
             skippedHttp++;
             reusedBaselines++;
             // No navigation happened, so replay the stored adjacency: the flow
@@ -450,7 +588,7 @@ export async function runDiscoveryCrawl(options: CrawlOptions): Promise<{
               ? 1
               : 0;
             formsDiscoveredTotal += formCount;
-            results.push({
+            await recordPage({
               url: targetUrl,
               title: baseline.title || targetUrl,
               elements: baseline.elements,
@@ -473,7 +611,7 @@ export async function runDiscoveryCrawl(options: CrawlOptions): Promise<{
               scanMode: "http-skip",
               links: storedLinks,
             });
-            emitProgress(targetUrl);
+            return;
             return;
           }
         }
@@ -512,7 +650,7 @@ export async function runDiscoveryCrawl(options: CrawlOptions): Promise<{
           contentType = contentType || (await page.evaluate(() => document.contentType).catch(() => null));
           if (httpStatus != null) statusCounts[String(httpStatus)] = (statusCounts[String(httpStatus)] || 0) + 1;
           if (contentType && !isHtmlContentType(contentType)) {
-            results.push({
+            await recordPage({
               url: targetUrl,
               title: `(skipped non-HTML: ${contentType})`,
               elements: [],
@@ -527,13 +665,22 @@ export async function runDiscoveryCrawl(options: CrawlOptions): Promise<{
               discoveryMethod: methodOf.get(pageKey),
               errorCategory: "CONTENT_TYPE_UNSUPPORTED",
             });
-            emitProgress(targetUrl);
             return;
           }
 
           await dismissConsentOverlays(page);
 
           const title = (await page.title().catch(() => "")) || new URL(targetUrl).pathname || targetUrl;
+          const discoveryMethod = methodOf.get(pageKey);
+          const looksMissing =
+            httpStatus === 404 ||
+            httpStatus === 410 ||
+            /^(404|page not found|not found)$/i.test(title.trim()) ||
+            /page not found|this page (could not be found|doesn't exist)/i.test(title);
+          if (looksMissing && (discoveryMethod === "nav_infer" || discoveryMethod === "nav_seed")) {
+            emitProgress(targetUrl);
+            return;
+          }
           emitProgress(targetUrl);
 
           let elements: ElementRecord[];
@@ -635,20 +782,29 @@ export async function runDiscoveryCrawl(options: CrawlOptions): Promise<{
             }
           }
 
-          const links = await extractLinks(page, normalizedUrl);
+          const evaluateLinks = await extractLinks(page, normalizedUrl);
+          const locatorLinks = await extractLinksViaLocators(page, targetUrl || normalizedUrl);
+          let links = mergeExtractedLinks(evaluateLinks, locatorLinks);
+          const outbound = links.filter(
+            (l) => sameSite(l.url, normalizedUrl) && dedupeKey(l.url) !== dedupeKey(targetUrl)
+          );
+          if (outbound.length < 2) {
+            const clicked = await discoverNavDestinations(page, page.url() || targetUrl);
+            links = mergeExtractedLinks(links, clicked);
+          }
           elements = mergeLinkElements(elements, links);
 
           formsDiscoveredTotal += formCount;
 
           const currentUrl = page.url();
           const canonicalUrl = links.find((l) => l.method === "canonical")?.url ?? null;
-          if (currentUrl !== targetUrl && sameOrigin(currentUrl, normalizedUrl) && !visited.has(dedupeKey(currentUrl))) {
+          if (currentUrl !== targetUrl && sameSite(currentUrl, normalizedUrl) && !visited.has(dedupeKey(currentUrl))) {
             noteLink({ url: currentUrl, label: "navigation", method: "javascript_navigation" }, targetUrl);
             edges.push({ from: targetUrl, to: currentUrl, via: "navigation" });
           }
 
           for (const link of links) {
-            if (!sameOrigin(link.url, normalizedUrl)) {
+            if (!sameSite(link.url, normalizedUrl)) {
               externalLinkCount += 1;
               continue;
             }
@@ -663,7 +819,7 @@ export async function runDiscoveryCrawl(options: CrawlOptions): Promise<{
             title,
           });
 
-          results.push({
+          await recordPage({
             url: targetUrl,
             title,
             elements,
@@ -677,7 +833,7 @@ export async function runDiscoveryCrawl(options: CrawlOptions): Promise<{
             screenshotHash,
             changeSignals,
             scanMode,
-            links: links.filter((l) => sameOrigin(l.url, normalizedUrl)),
+            links: links.filter((l) => sameSite(l.url, normalizedUrl)),
             httpStatus,
             contentType,
             canonicalUrl,
@@ -687,11 +843,10 @@ export async function runDiscoveryCrawl(options: CrawlOptions): Promise<{
             discoveryMethod: methodOf.get(pageKey),
             snapshot,
           });
-          emitProgress(targetUrl);
         } catch (err: any) {
           const cat = classifyNavError(err);
           statusCounts[cat] = (statusCounts[cat] || 0) + 1;
-          results.push({
+          await recordPage({
             url: targetUrl,
             title: `(failed to load: ${err.message})`,
             elements: [],

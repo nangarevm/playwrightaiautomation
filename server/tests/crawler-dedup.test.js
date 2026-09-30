@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { structureFingerprint, structureMatches } from '../src/crawler/diff.ts';
-import { dedupeKey, fetchSitemapUrls } from '../src/crawler/urlUtils.ts';
+import { dedupeKey, fetchSitemapUrls, sameSite, meaningfulPageHash } from '../src/crawler/urlUtils.ts';
 import { dedupeScenarios, dedupeScenariosFuzzy, scenarioFingerprint } from '../src/crawler/scenarioDedup.ts';
 import { buildBaselineCoverageScenarios } from '../src/crawler/scenarios.ts';
 
@@ -9,6 +9,20 @@ test('dedupeKey collapses tracking params and trailing slashes', () => {
   const a = dedupeKey('https://example.com/forum?utm_source=nav');
   const b = dedupeKey('https://example.com/forum/');
   assert.equal(a, b);
+});
+
+test('sameSite treats www and apex as the same site', () => {
+  assert.equal(sameSite('https://www.example.com/about', 'https://example.com/contact'), true);
+  assert.equal(sameSite('https://example.com/a', 'https://other.com/a'), false);
+});
+
+test('dedupeKey keeps meaningful page hashes so section pages stay distinct', () => {
+  assert.equal(meaningfulPageHash('#about'), '#about');
+  assert.equal(meaningfulPageHash('#top'), '');
+  assert.notEqual(
+    dedupeKey('https://example.com/#about'),
+    dedupeKey('https://example.com/#contact')
+  );
 });
 
 test('scenarioFingerprint treats identical scenarios as duplicates', () => {

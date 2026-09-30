@@ -22,7 +22,7 @@ import { adminRouter } from "./routes/admin.js";
 import { screensRouter } from "./routes/screens.js";
 import { environmentsRouter } from "./routes/environments.js";
 import { crawlerRouter } from "./routes/crawler.js";
-import { tickWatchedSites } from "./services/crawlerService.js";
+import { tickWatchedSites, failInterruptedCrawls } from "./services/crawlerService.js";
 import { allureRouter } from "./routes/allure.js";
 import { bugsRouter } from "./routes/bugs.js";
 import { optimizationRouter } from "./routes/optimization.js";
@@ -233,6 +233,11 @@ process.on("unhandledRejection", (err) => {
 });
 
 const server = app.listen(PORT, () => {
+  try {
+    failInterruptedCrawls();
+  } catch {
+    /* ignore */
+  }
   console.log(`AI Test Automation Platform server listening on http://localhost:${PORT}`);
   console.log(`Demo app-under-test available at http://localhost:${PORT}/demo/login.html`);
 });

@@ -625,7 +625,7 @@ function selectHighValueScenarios(
   scenarios: ScenarioRecord[],
   mode: import("./types.js").CoverageMode
 ): ScenarioRecord[] {
-  const cap = mode === "minimal" ? 8 : mode === "standard" ? 12 : 18;
+  const cap = mode === "minimal" ? 8 : mode === "standard" ? 14 : 24;
   const unique = Array.from(
     new Map(
       scenarios.map((scenario) => [
@@ -645,6 +645,7 @@ function selectHighValueScenarios(
       if (/authorization|permission|role|forbidden/.test(text)) risk += 68;
       if (/double submit|duplicate|rapid/.test(text)) risk += 65;
       if (/script-like|injected|sql-like|xss/.test(text)) risk += 60;
+      if (/mobile viewport|tablet viewport|webkit|firefox|overflow|clip|usable/.test(text)) risk += 72;
       if (/refresh|back button|persistence|state/.test(text)) risk += 55;
       if (scenario.tier === "regression") risk += 40;
       if (/clicking "[^"]+"/.test(text)) risk -= 35;
@@ -718,7 +719,79 @@ export function buildScenariosForPage(
   const e2e = buildIntraPageFlowScenario(pageTitle, elements);
   if (e2e) scenarios.push(e2e);
 
+  if (mode === "full") {
+    scenarios.push(...buildQualityCoverageScenarios(pageTitle, elements, pageUrl));
+  }
+
   return selectHighValueScenarios(scenarios, mode);
+}
+
+/** Functional + usability + UI/UX + responsive + cross-browser coverage for every page. */
+export function buildQualityCoverageScenarios(
+  pageTitle: string,
+  elements: ElementRecord[],
+  pageUrl?: string
+): ScenarioRecord[] {
+  const label = pageDisplayName(pageTitle, pageUrl);
+  const locators = elements.slice(0, 5);
+  return [
+    makeScenario(
+      `Verify ${label} remains usable on a mobile viewport`,
+      "positive",
+      label,
+      [
+        `Given the user opens "${label}" at a 375x812 mobile viewport`,
+        "Then primary content and navigation remain visible and usable without horizontal overflow",
+      ],
+      locators,
+      "functional"
+    ),
+    makeScenario(
+      `Verify ${label} remains usable on a tablet viewport`,
+      "positive",
+      label,
+      [
+        `Given the user opens "${label}" at a 768x1024 tablet viewport`,
+        "Then layout, images, and controls stay aligned and readable",
+      ],
+      locators,
+      "functional"
+    ),
+    makeScenario(
+      `Verify ${label} navigation, headings, and primary actions are usable`,
+      "positive",
+      label,
+      [
+        `Given the user is on "${label}"`,
+        "Then the page has a visible heading, working navigation, and an obvious primary action",
+      ],
+      locators,
+      "smoke"
+    ),
+    makeScenario(
+      `Verify ${label} UI does not clip, overlap, or overflow key content`,
+      "positive",
+      label,
+      [
+        `Given the user is on "${label}"`,
+        "Then text, images, and buttons are fully visible without overlap or cutoff",
+      ],
+      locators,
+      "functional"
+    ),
+    makeScenario(
+      `Verify ${label} renders consistently in Chromium, Firefox, and WebKit`,
+      "positive",
+      label,
+      [
+        `Given the user opens "${label}" in Chromium`,
+        "When the same URL is opened in Firefox and WebKit",
+        "Then the page loads, the main heading is visible, and no browser-specific blank or broken layout appears",
+      ],
+      locators,
+      "regression"
+    ),
+  ];
 }
 
 /**
