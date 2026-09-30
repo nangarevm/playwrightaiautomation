@@ -634,19 +634,47 @@ export async function runDiscoveryCrawl(options: CrawlOptions): Promise<{
               /* ignore */
             }
           });
-          for (let attempt = 1; attempt <= 3; attempt++) {
+          for (let attempt = 1; attempt <= 5; attempt++) {
             try {
               await loadPageWithOptimizedStrategy(page, targetUrl);
               navError = null;
-              break;
             } catch (err) {
               navError = err;
               await page.waitForTimeout(300 * attempt * attempt);
+              continue;
             }
+            const titleHint = await page.title().catch(() => "");
+            const rateLimited =
+              httpStatus === 429 ||
+              httpStatus === 503 ||
+              /too many requests|access denied/i.test(titleHint);
+            if (rateLimited && attempt < 5) {
+              const waitMs = Math.min(45000, 6000 * attempt * attempt);
+              console.warn(`[crawler] HTTP ${httpStatus || 429} on ${targetUrl}; waiting ${waitMs}ms (attempt ${attempt}/5)`);
+              await page.waitForTimeout(waitMs);
+              httpStatus = null;
+              continue;
+            }
+            break;
           }
           if (navError) throw navError;
 
           const finalUrl = page.url();
+          const rateLimitedTitle = await page.title().catch(() => "");
+          const stillRateLimited =
+            httpStatus === 429 ||
+            httpStatus === 503 ||
+            /too many requests/i.test(rateLimitedTitle);
+          if (stillRateLimited) {
+            const isStart = dedupeKey(targetUrl) === dedupeKey(normalizedUrl);
+            if (isStart) {
+              throw new Error(
+                `The site returned HTTP ${httpStatus || 429} Too Many Requests. Wait a few minutes, then recrawl with Standard depth.`
+              );
+            }
+            emitProgress(targetUrl);
+            return;
+          }
           contentType = contentType || (await page.evaluate(() => document.contentType).catch(() => null));
           if (httpStatus != null) statusCounts[String(httpStatus)] = (statusCounts[String(httpStatus)] || 0) + 1;
           if (contentType && !isHtmlContentType(contentType)) {
